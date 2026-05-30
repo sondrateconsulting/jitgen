@@ -1,0 +1,8 @@
+# Bzlmod is the default in Bazel 7+, but be explicit (req. 15).
+common --enable_bzlmod
+
+# Show failing test logs inline.
+test --test_output=errors
+
+# Don't let the local Cargo target/ dir leak into the action environment.
+build --incompatible_strict_action_env

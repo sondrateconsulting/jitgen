@@ -7,8 +7,8 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 
 | Phase | Description | Status | Commit | Review protocol |
 |-------|-------------|--------|--------|-----------------|
-| F0 | Research, architecture, plan, ADRs, security & resume docs | ✅ complete | _(this commit)_ | T1·S1·T2·T3 ✅ |
-| F1 | Monorepo scaffold (Bazel Bzlmod + Rust workspace + skeletons) | ⬜ | — | — |
+| F0 | Research, architecture, plan, ADRs, security & resume docs | ✅ complete | `c9cd845` | T1·S1·T2·T3 ✅ |
+| F1 | Monorepo scaffold (Bazel Bzlmod + Rust workspace + skeletons) | ✅ complete | _(this commit)_ | T1·S1·T2·T3 ✅ |
 | F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | ⬜ | — | — |
 | F3 | Git intake & diff analysis (overlay, path safety) | ⬜ | — | — |
 | F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ⬜ | — | — |
@@ -62,3 +62,11 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 - 2026-05-30: F0 Codex review **Round 4 (T3, traditional sign-off)** — 1×P3 + 1×P4, fixed
   (build-status wording in plan/status/progress; `JITGEN_*` env vars declared trusted).
   [reviews/F0/round-4.md](reviews/F0/round-4.md). **F0 review protocol complete; F0 done.**
+- 2026-05-30: **F1 complete** — Cargo workspace + Bazel (Bzlmod, rules_rust 0.70.0) building; 12 crate
+  skeletons (`#![forbid(unsafe_code)]`); `scripts/check.sh`; `jitgen --version` identical under Cargo
+  & Bazel ("jitgen 0.1.0 (data-contract v1)"); 12/12 tests pass both build systems. bazelisk
+  provisioned; Bazel 7.4.1 pinned; lockfiles committed. Codex review **T1** (3 P3+: check.sh bazel
+  exit-code bug, version drift, lockfile ignored), **S1** (1 P3 + P4s; supply chain confirmed clean),
+  **T2** (bazelisk-runner fallback), **T3** (redacted accidental third-party payloads from
+  transcripts). All P3+ resolved. Artifacts: [reviews/F1/](reviews/F1/). Recorded P4s for F10:
+  explicit Bazel↔Cargo toolchain version pin; checksum-pinned bazelisk.

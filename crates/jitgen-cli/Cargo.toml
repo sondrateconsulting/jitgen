@@ -1,0 +1,15 @@
+[package]
+name = "jitgen-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "jitgen command-line interface (pipeline layer 1: CLI / presentation)."
+
+[[bin]]
+name = "jitgen"
+path = "src/main.rs"
+
+[dependencies]
+jitgen-core.workspace = true
+# jitgen-orchestrator and arg-parsing (clap) are wired in F2/F9; F1 keeps the CLI std-only.

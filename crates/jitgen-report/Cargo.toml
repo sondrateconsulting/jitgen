@@ -1,0 +1,10 @@
+[package]
+name = "jitgen-report"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reporting & export (patch/JSON/Markdown/JUnit/SARIF). Pipeline layer 10."
+
+[dependencies]
+jitgen-core.workspace = true

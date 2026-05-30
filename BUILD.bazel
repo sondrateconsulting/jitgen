@@ -1,0 +1,7 @@
+"""Root package. Convenience alias so `bazel run //:jitgen -- --version` works."""
+
+alias(
+    name = "jitgen",
+    actual = "//crates/jitgen-cli:jitgen",
+    visibility = ["//visibility:public"],
+)

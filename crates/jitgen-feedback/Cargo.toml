@@ -1,0 +1,10 @@
+[package]
+name = "jitgen-feedback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Repair / minimization / flake-filter / assessors. Pipeline layer 9."
+
+[dependencies]
+jitgen-core.workspace = true

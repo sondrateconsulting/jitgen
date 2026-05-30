@@ -1,0 +1,10 @@
+[package]
+name = "jitgen-materialize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Candidate test materialization, overlay-confined. Pipeline layer 7."
+
+[dependencies]
+jitgen-core.workspace = true

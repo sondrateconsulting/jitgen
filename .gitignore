@@ -2,9 +2,8 @@
 /target/
 **/target/
 *.rs.bk
-# Bazel
+# Bazel (symlinks only; MODULE.bazel.lock IS committed for reproducible canonical builds)
 /bazel-*
-MODULE.bazel.lock
 # jitgen runtime state (never commit run state / overlays)
 .jitgen/
 # OS / editor
@@ -17,7 +16,16 @@ MODULE.bazel.lock
 .env.*
 *.pem
 *.key
+*.p12
+*.pfx
+*.keystore
 id_rsa*
+id_ed25519*
+.netrc
+.npmrc
+.pypirc
+.cargo/credentials*
+credentials*.json
 # Scratch
 /tmp/
 *.log

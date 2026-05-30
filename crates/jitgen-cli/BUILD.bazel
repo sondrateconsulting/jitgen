@@ -1,0 +1,6 @@
+load("//bazel:defs.bzl", "jitgen_rust_binary")
+
+jitgen_rust_binary(
+    name = "jitgen",
+    deps = ["//crates/jitgen-core"],
+)

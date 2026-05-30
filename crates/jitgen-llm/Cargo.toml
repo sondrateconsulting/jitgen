@@ -1,0 +1,10 @@
+[package]
+name = "jitgen-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LLM provider abstraction with a deterministic mock. Pipeline layer 6."
+
+[dependencies]
+jitgen-core.workspace = true

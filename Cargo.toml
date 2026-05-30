@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+description = "jitgen — Just-in-Time test generation for changed code in a git repository"
+repository = "https://example.invalid/jitgen"
+
+# Intra-workspace dependencies (path-based). External crates are introduced from F2 onward;
+# F1 skeletons are std-only so the first build is hermetic and fast.
+[workspace.dependencies]
+jitgen-core = { path = "crates/jitgen-core" }
+jitgen-state = { path = "crates/jitgen-state" }
+jitgen-gitintake = { path = "crates/jitgen-gitintake" }
+jitgen-adapters = { path = "crates/jitgen-adapters" }
+jitgen-context = { path = "crates/jitgen-context" }
+jitgen-llm = { path = "crates/jitgen-llm" }
+jitgen-materialize = { path = "crates/jitgen-materialize" }
+jitgen-sandbox = { path = "crates/jitgen-sandbox" }
+jitgen-feedback = { path = "crates/jitgen-feedback" }
+jitgen-report = { path = "crates/jitgen-report" }
+jitgen-orchestrator = { path = "crates/jitgen-orchestrator" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

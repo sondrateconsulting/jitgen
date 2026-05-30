@@ -1,0 +1,6 @@
+load("//bazel:defs.bzl", "jitgen_rust_library")
+
+jitgen_rust_library(
+    name = "jitgen-gitintake",
+    deps = ["//crates/jitgen-core"],
+)

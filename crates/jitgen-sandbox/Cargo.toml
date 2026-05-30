@@ -1,0 +1,10 @@
+[package]
+name = "jitgen-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Fail-closed sandboxed test execution. Pipeline layer 8."
+
+[dependencies]
+jitgen-core.workspace = true

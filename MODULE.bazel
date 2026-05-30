@@ -1,0 +1,19 @@
+"""jitgen — Just-in-Time test generation. Canonical build is Bazel (Bzlmod); a Cargo workspace is
+maintained in parallel for dev ergonomics (ADR-0001)."""
+
+module(
+    name = "jitgen",
+    version = "0.1.0",
+)
+
+# Rust rules. F1 crates are std-only, so no external crate registry (crate_universe) is needed yet;
+# it is introduced in F2 when third-party crates (clap, serde, rusqlite, git2, tree-sitter, …) land.
+bazel_dep(name = "rules_rust", version = "0.70.0")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+# Omit an explicit version to use the rules_rust default toolchain (guaranteed integrity hashes).
+# The dev/cargo build pins 1.95.0 (rust-toolchain.toml); both compile the same edition-2021 code.
+rust.toolchain(edition = "2021")
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")

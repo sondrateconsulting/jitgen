@@ -2,10 +2,10 @@
   "schema_version": 1,
   "project": "jitgen",
   "updated_at": "2026-05-30",
-  "current_phase": "F1",
+  "current_phase": "F2",
   "phases": [
-    { "id": "F0", "title": "Research, architecture, plan, ADRs, security & resume docs", "status": "complete", "commit": "this-commit", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
-    { "id": "F1", "title": "Monorepo scaffold (Bazel Bzlmod + Rust workspace + crate skeletons)", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F0", "title": "Research, architecture, plan, ADRs, security & resume docs", "status": "complete", "commit": "c9cd845", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
+    { "id": "F1", "title": "Monorepo scaffold (Bazel Bzlmod + Rust workspace + crate skeletons)", "status": "complete", "commit": "pending", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
     { "id": "F2", "title": "Core domain, config (.jitgen.yaml), SQLite durable state, doctor", "status": "not_started", "commit": null, "review_protocol": null },
     { "id": "F3", "title": "Git intake & diff analysis (overlay, path safety)", "status": "not_started", "commit": null, "review_protocol": null },
     { "id": "F4", "title": "Language discovery & adapters (TS/Java/Python/Rust + generic)", "status": "not_started", "commit": null, "review_protocol": null },
