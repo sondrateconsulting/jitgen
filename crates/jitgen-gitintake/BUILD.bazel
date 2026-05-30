@@ -1,6 +1,14 @@
 load("//bazel:defs.bzl", "jitgen_rust_library")
 
+# NOTE: `libz-sys` (static feature) is declared in Cargo.toml only to pin the transitive zlib used by
+# libgit2-sys to a vendored/static build (F3/S1 review #5). It is NOT a source dependency of this
+# crate, so it is intentionally absent from `deps` here; crate_universe still resolves it (with the
+# static feature) from Cargo.toml/Cargo.lock for the Bazel build.
 jitgen_rust_library(
     name = "jitgen-gitintake",
-    deps = ["//crates/jitgen-core"],
+    deps = [
+        "//crates/jitgen-core",
+        "@crates//:git2",
+        "@crates//:thiserror",
+    ],
 )

@@ -1,26 +1,17 @@
 #![forbid(unsafe_code)]
-//! `jitgen-gitintake` — Git repository intake & diff analysis. Pipeline layer 3.
+//! `jitgen-gitintake` — git repository intake & diff analysis (pipeline layer 3, ADR-0006).
 //!
-//! Skeleton established in F1; functionality is implemented in later foundational phases.
-//! See `docs/architecture.md` and `docs/implementation-plan.md`.
+//! Opens an arbitrary repo via libgit2, peels `base`/`head` to immutable commit OIDs, and computes a
+//! filtered [`jitgen_core::ChangeSet`] from a tree-to-tree diff. All reads go through git objects
+//! (never the working tree), so no filters/hooks run. Vendored/build-output and secret-bearing paths
+//! are excluded. See `docs/architecture.md` and `docs/security.md`.
 
-/// Stable identifier for this pipeline layer/crate.
-pub fn layer_id() -> &'static str {
-    "jitgen-gitintake"
-}
+mod error;
+mod filter;
+mod intake;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layer_id_matches_crate_name() {
-        assert_eq!(layer_id(), "jitgen-gitintake");
-    }
-
-    #[test]
-    fn links_against_core_contract() {
-        // Proves the intra-workspace dependency on jitgen-core compiles & links.
-        assert!(!jitgen_core::version().is_empty());
-    }
-}
+pub use error::{GitError, Result};
+pub use filter::{is_ignored, is_secret_like, is_vendored};
+pub use intake::{
+    diff_revisions, open_repo, read_blob_at, reject_unsafe_rel, resolve_commit, OverlayPlan,
+};

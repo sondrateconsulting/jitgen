@@ -9,8 +9,8 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 |-------|-------------|--------|--------|-----------------|
 | F0 | Research, architecture, plan, ADRs, security & resume docs | ✅ complete | `c9cd845` | T1·S1·T2·T3 ✅ |
 | F1 | Monorepo scaffold (Bazel Bzlmod + Rust workspace + skeletons) | ✅ complete | `2a10058` | T1·S1·T2·T3 ✅ |
-| F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | ✅ complete | _(this commit)_ | T1·S1·T2·T3·T4·T5 ✅ |
-| F3 | Git intake & diff analysis (overlay, path safety) | ⬜ | — | — |
+| F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | ✅ complete | `11aaaae` | T1·S1·T2·T3·T4·T5 ✅ |
+| F3 | Git intake & diff analysis (overlay, path safety) | ✅ complete | _(this commit)_ | T1·S1·T2·T3·T4·T5 ✅ |
 | F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ⬜ | — | — |
 | F5 | LLM provider abstraction + context packager | ⬜ | — | — |
 | F6 | Candidate materialization & rendering (overlay-confined) | ⬜ | — | — |
@@ -87,3 +87,12 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   review **T1**(5)·**S1**(6)·**T2**(1)·**T3**(5)·**T4**(1)·**T5**(0, clean): **18 P3+ resolved**
   incl. the P1 doctor-execute-from-hostile-CWD. cargo ~76 tests + bazel 12 targets green;
   clippy/fmt clean. Artifacts: [reviews/F2/](reviews/F2/).
+- 2026-05-30: **F3 complete.** `jitgen-gitintake` (libgit2 via `git2`, vendored, no ssh/https): open
+  arbitrary repo (`open_ext NO_SEARCH` + gitdir/commondir/objects/alternates boundary verification),
+  peel base/head to immutable OIDs, tree-to-tree diff → filtered `ChangeSet` (vendor/secret excluded,
+  case-insensitive; renames via `find_similar`), blob reads from trees (no working-tree/symlink
+  follow, ODB-header size cap), `OverlayPlan` + `reject_unsafe_rel`, pre-sandbox DoS bounds. `libz-sys`
+  pinned static (vendored zlib). Codex review **T1**(3)·**S1**(5)·**T2**(3)·**T3**(1)·**T4**(1)·**T5**
+  (0, clean): **13 P3+ resolved** incl. P1-class hostile-repo vectors (.git-file/alternates/commondir
+  boundary escapes, case-fold filter bypass, pre-sandbox DoS). cargo ~91 tests + bazel 12 targets
+  green. Artifacts: [reviews/F3/](reviews/F3/).

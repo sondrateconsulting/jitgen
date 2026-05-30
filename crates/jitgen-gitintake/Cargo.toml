@@ -8,3 +8,8 @@ description = "Git repository intake & diff analysis. Pipeline layer 3."
 
 [dependencies]
 jitgen-core.workspace = true
+git2.workspace = true
+thiserror.workspace = true
+# Pins zlib to a static/vendored build for the libgit2-sys transitive dep (feature unification);
+# not used directly. See root Cargo.toml (F3/S1 review #5).
+libz-sys.workspace = true

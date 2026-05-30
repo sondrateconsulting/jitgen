@@ -162,6 +162,14 @@ These MUST exist and pass before the relevant phase is complete (built security-
 
 ## Residual risks
 
+- **Git intake boundary (F3):** `open_repo` opens exactly the requested root (`NO_SEARCH`) and
+  verifies the gitdir, commondir, object store are under it, **refuses object alternates** entirely,
+  and **rejects symlinked critical git-storage entries** (`objects`/`refs`/`packed-refs`/`HEAD`).
+  Exhaustively mirroring every internal path libgit2 may traverse (e.g. a symlink inside an individual
+  loose-object fanout dir) is **not** fully validated at `open()`. Bounded because intake is
+  **read-only** — it reads git objects only, never executes hooks/filters/commands (verified in
+  F3/S1) — so the worst case is reading git objects already present on the host; code execution is
+  contained by the F7 sandbox.
 - `--unsafe-local-execution` exists for hosts without any sandbox; it is **off by default**, loud,
   and recorded. macOS `sandbox-exec` is Apple-deprecated though functional. Redaction is heuristic
   (minimize context + exclude secret files; cannot guarantee zero leakage of novel secret formats).
