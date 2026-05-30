@@ -5,8 +5,8 @@
   "current_phase": "F2",
   "phases": [
     { "id": "F0", "title": "Research, architecture, plan, ADRs, security & resume docs", "status": "complete", "commit": "c9cd845", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
-    { "id": "F1", "title": "Monorepo scaffold (Bazel Bzlmod + Rust workspace + crate skeletons)", "status": "complete", "commit": "pending", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
-    { "id": "F2", "title": "Core domain, config (.jitgen.yaml), SQLite durable state, doctor", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F1", "title": "Monorepo scaffold (Bazel Bzlmod + Rust workspace + crate skeletons)", "status": "complete", "commit": "2a10058", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
+    { "id": "F2", "title": "Core domain, config (.jitgen.yaml), SQLite durable state, doctor", "status": "in_progress", "commit": null, "review_protocol": "pending (after F2 code complete)", "done": "core domain model in jitgen-core + serde/thiserror wired into cargo & bazel crate_universe", "remaining": ".jitgen.yaml config + trust split, rusqlite run-state, jitgen doctor, F2 review protocol" },
     { "id": "F3", "title": "Git intake & diff analysis (overlay, path safety)", "status": "not_started", "commit": null, "review_protocol": null },
     { "id": "F4", "title": "Language discovery & adapters (TS/Java/Python/Rust + generic)", "status": "not_started", "commit": null, "review_protocol": null },
     { "id": "F5", "title": "LLM provider abstraction + context packager", "status": "not_started", "commit": null, "review_protocol": null },

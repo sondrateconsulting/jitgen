@@ -10,9 +10,14 @@ license = "Apache-2.0"
 description = "jitgen — Just-in-Time test generation for changed code in a git repository"
 repository = "https://example.invalid/jitgen"
 
-# Intra-workspace dependencies (path-based). External crates are introduced from F2 onward;
-# F1 skeletons are std-only so the first build is hermetic and fast.
+# Intra-workspace dependencies (path-based) + pinned external crates (introduced in F2).
 [workspace.dependencies]
+# External (third-party). Pure-Rust, no build scripts — friendly to Bazel crate_universe.
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
+thiserror = "2.0.11"
+
+# Intra-workspace (path-based).
 jitgen-core = { path = "crates/jitgen-core" }
 jitgen-state = { path = "crates/jitgen-state" }
 jitgen-gitintake = { path = "crates/jitgen-gitintake" }

@@ -8,8 +8,8 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | Phase | Description | Status | Commit | Review protocol |
 |-------|-------------|--------|--------|-----------------|
 | F0 | Research, architecture, plan, ADRs, security & resume docs | ✅ complete | `c9cd845` | T1·S1·T2·T3 ✅ |
-| F1 | Monorepo scaffold (Bazel Bzlmod + Rust workspace + skeletons) | ✅ complete | _(this commit)_ | T1·S1·T2·T3 ✅ |
-| F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | ⬜ | — | — |
+| F1 | Monorepo scaffold (Bazel Bzlmod + Rust workspace + skeletons) | ✅ complete | `2a10058` | T1·S1·T2·T3 ✅ |
+| F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | 🟦 in_progress | — | pending (after F2 code complete) |
 | F3 | Git intake & diff analysis (overlay, path safety) | ⬜ | — | — |
 | F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ⬜ | — | — |
 | F5 | LLM provider abstraction + context packager | ⬜ | — | — |
@@ -70,3 +70,12 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   **T2** (bazelisk-runner fallback), **T3** (redacted accidental third-party payloads from
   transcripts). All P3+ resolved. Artifacts: [reviews/F1/](reviews/F1/). Recorded P4s for F10:
   explicit Bazel↔Cargo toolchain version pin; checksum-pinned bazelisk.
+- 2026-05-30: **F2 in progress** — landed the **core domain model** in `jitgen-core` (modules: ids,
+  mode, change, target, context, candidate, execution, classify, mutant, error) — the serde data
+  contract with `SCHEMA_VERSION`, incl. `CatchClass`/`WeakCatchAssessment` and the
+  observed-vs-assessed split. Wired the first external deps (serde/serde_json/thiserror) into **both**
+  builds: Bazel `crate_universe` (`@crates//…`) now resolves third-party crates (de-risks all future
+  deps). cargo: 46 tests pass, clippy `-D warnings` clean; bazel: 12 test targets pass; version parity
+  holds. **Remaining in F2:** `.jitgen.yaml` config + typed trust split (`TrustedConfig`/`RepoConfig`),
+  rusqlite durable run-state (global run index, atomic publish), `jitgen doctor`, then the full F2
+  Codex review protocol before marking F2 complete.

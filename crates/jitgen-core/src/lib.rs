@@ -2,13 +2,35 @@
 //! `jitgen-core` — core domain types and the stable, versioned data contract.
 //!
 //! This crate is the hub of the jitgen pipeline: every other crate depends on it for shared types.
-//! In F1 it is a skeleton exposing the schema version and a build-info helper; the full domain model
-//! (`ChangeSet`, `Target`, `ContextBundle`, `TestCandidate`, `MaterializedTest`, `ExecutionResult`,
-//! `CatchClass`, `WeakCatchAssessment`, `Mode`, `Strategy`, …) lands in F2. See
-//! [`docs/architecture.md`](https://example.invalid/jitgen/docs/architecture.md).
+//! Types are `serde`-(de)serializable and carry a [`SCHEMA_VERSION`] so persisted artifacts and run
+//! state can be migrated (ADR-0004 / ADR-0005). See `docs/architecture.md`.
+
+mod candidate;
+mod change;
+mod classify;
+mod context;
+mod error;
+mod execution;
+mod ids;
+mod mode;
+mod mutant;
+mod target;
+
+pub use candidate::{MaterializedTest, TestCandidate};
+pub use change::{ChangeKind, ChangeSet, FileChange, LineRange};
+pub use classify::{
+    AssessorSignal, CatchClass, CatchDecision, ClassifiedResult, TpBucket, WeakCatchAssessment,
+};
+pub use context::{ContextBudget, ContextBundle, ContextItem, ContextItemKind};
+pub use error::{CoreError, Result};
+pub use execution::{CatchExecution, ExecOutcome, ExecutionResult};
+pub use ids::{AdapterId, RevisionId, RunId, TargetId};
+pub use mode::{Mode, Strategy};
+pub use mutant::{Mutant, MutantStatus};
+pub use target::{RiskScore, SymbolKind, Target};
 
 /// Version of the on-disk / interchange data contract (artifacts, run state). Bump on breaking
-/// changes; persisted alongside data so older runs can be migrated. See ADR-0004 / ADR-0005.
+/// changes; persisted alongside data so older runs can be migrated.
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The crate (and binary) semantic version, taken from Cargo at build time.

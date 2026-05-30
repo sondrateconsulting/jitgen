@@ -1,3 +1,10 @@
 load("//bazel:defs.bzl", "jitgen_rust_library")
 
-jitgen_rust_library(name = "jitgen-core")
+jitgen_rust_library(
+    name = "jitgen-core",
+    deps = [
+        "@crates//:serde",
+        "@crates//:serde_json",
+        "@crates//:thiserror",
+    ],
+)
