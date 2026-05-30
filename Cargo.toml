@@ -15,7 +15,13 @@ repository = "https://example.invalid/jitgen"
 # External (third-party). Pure-Rust, no build scripts — friendly to Bazel crate_universe.
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
+# serde_yaml 0.9.34 is archived-but-stable & de-facto standard; we parse only SIZE-CAPPED untrusted
+# `.jitgen.yaml` with it (DoS-bounded). Revisit a maintained fork in F10 hardening.
+serde_yaml = "0.9.34"
 thiserror = "2.0.11"
+# rusqlite with bundled libsqlite3 (ADR-0005): no system SQLite dependency; compiles C via cc.
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+sha2 = "0.10.8"
 
 # Intra-workspace (path-based).
 jitgen-core = { path = "crates/jitgen-core" }

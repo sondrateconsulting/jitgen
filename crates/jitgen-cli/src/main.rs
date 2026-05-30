@@ -50,7 +50,8 @@ fn dispatch(args: &[String]) -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        "run" | "analyze" | "resume" | "report" | "doctor" => not_implemented(command),
+        "doctor" => run_doctor_cmd(&args[1..]),
+        "run" | "analyze" | "resume" | "report" => not_implemented(command),
         other => {
             eprintln!("jitgen: unknown command '{other}'\n");
             eprint!("{USAGE}");
@@ -63,7 +64,6 @@ fn dispatch(args: &[String]) -> ExitCode {
 /// Honest stub: the command is recognized but not yet implemented in the current phase.
 fn not_implemented(command: &str) -> ExitCode {
     let phase = match command {
-        "doctor" => "F2",
         "run" | "analyze" | "resume" | "report" => "F9",
         _ => "a later phase",
     };
@@ -73,6 +73,46 @@ fn not_implemented(command: &str) -> ExitCode {
     );
     // Distinct code so scripts/tests can tell "not implemented" from a usage error (2) or success.
     ExitCode::from(3)
+}
+
+/// `jitgen doctor [--format human|json]` — report environment / toolchain / sandbox readiness.
+fn run_doctor_cmd(rest: &[String]) -> ExitCode {
+    let state_root = jitgen_orchestrator::default_state_root();
+    // F2: the deterministic mock is the default provider; real providers are trusted-config (F5).
+    let report = jitgen_orchestrator::run_doctor(&state_root, "mock (default)");
+
+    if wants_json(rest) {
+        match serde_json::to_string_pretty(&report) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("jitgen doctor: failed to serialize report: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        print!("{}", report.render_human());
+    }
+
+    // Non-zero when a hard prerequisite (git) is missing, so CI can gate on it.
+    if report.prerequisites_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// Minimal flag scan for `--format json` / `--format=json` (full parsing arrives with clap in F9).
+fn wants_json(args: &[String]) -> bool {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--format" {
+            return it.next().map(|v| v == "json").unwrap_or(false);
+        }
+        if let Some(v) = a.strip_prefix("--format=") {
+            return v == "json";
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -93,9 +133,24 @@ mod tests {
 
     #[test]
     fn known_subcommands_report_not_implemented() {
-        for cmd in ["run", "analyze", "resume", "report", "doctor"] {
+        for cmd in ["run", "analyze", "resume", "report"] {
             assert_eq!(dispatch(&args(&[cmd])), ExitCode::from(3), "{cmd}");
         }
+    }
+
+    #[test]
+    fn doctor_is_wired_not_a_stub() {
+        // Runs the real environment probe; git is present on this host so it succeeds, and it
+        // must NOT return the not-implemented code (3).
+        assert_ne!(dispatch(&args(&["doctor"])), ExitCode::from(3));
+    }
+
+    #[test]
+    fn wants_json_parses_both_forms() {
+        assert!(wants_json(&args(&["--format", "json"])));
+        assert!(wants_json(&args(&["--format=json"])));
+        assert!(!wants_json(&args(&["--format", "human"])));
+        assert!(!wants_json(&args(&[])));
     }
 
     #[test]

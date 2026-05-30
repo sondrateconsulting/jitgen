@@ -24,20 +24,7 @@ crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
     cargo_lockfile = "//:Cargo.lock",
-    manifests = [
-        "//:Cargo.toml",
-        "//crates/jitgen-core:Cargo.toml",
-        "//crates/jitgen-state:Cargo.toml",
-        "//crates/jitgen-gitintake:Cargo.toml",
-        "//crates/jitgen-adapters:Cargo.toml",
-        "//crates/jitgen-context:Cargo.toml",
-        "//crates/jitgen-llm:Cargo.toml",
-        "//crates/jitgen-materialize:Cargo.toml",
-        "//crates/jitgen-sandbox:Cargo.toml",
-        "//crates/jitgen-feedback:Cargo.toml",
-        "//crates/jitgen-report:Cargo.toml",
-        "//crates/jitgen-orchestrator:Cargo.toml",
-        "//crates/jitgen-cli:Cargo.toml",
-    ],
+    # For a Cargo workspace, only the root manifest is required; members are discovered from it.
+    manifests = ["//:Cargo.toml"],
 )
 use_repo(crate, "crates")

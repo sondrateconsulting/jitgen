@@ -5,6 +5,7 @@ jitgen_rust_library(
     deps = [
         "@crates//:serde",
         "@crates//:serde_json",
+        "@crates//:serde_yaml",
         "@crates//:thiserror",
     ],
 )

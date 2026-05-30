@@ -8,6 +8,7 @@
 mod candidate;
 mod change;
 mod classify;
+mod config;
 mod context;
 mod error;
 mod execution;
@@ -20,6 +21,10 @@ pub use candidate::{MaterializedTest, TestCandidate};
 pub use change::{ChangeKind, ChangeSet, FileChange, LineRange};
 pub use classify::{
     AssessorSignal, CatchClass, CatchDecision, ClassifiedResult, TpBucket, WeakCatchAssessment,
+};
+pub use config::{
+    ProviderConfig, ProviderKind, RepoConfig, ResolvedConfig, SandboxBackend, TrustedConfig,
+    FORBIDDEN_REPO_KEYS, MAX_REPO_CONFIG_BYTES,
 };
 pub use context::{ContextBudget, ContextBundle, ContextItem, ContextItemKind};
 pub use error::{CoreError, Result};

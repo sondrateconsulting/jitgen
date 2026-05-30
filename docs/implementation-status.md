@@ -9,7 +9,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 |-------|-------------|--------|--------|-----------------|
 | F0 | Research, architecture, plan, ADRs, security & resume docs | ✅ complete | `c9cd845` | T1·S1·T2·T3 ✅ |
 | F1 | Monorepo scaffold (Bazel Bzlmod + Rust workspace + skeletons) | ✅ complete | `2a10058` | T1·S1·T2·T3 ✅ |
-| F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | 🟦 in_progress | — | pending (after F2 code complete) |
+| F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | ✅ complete | _(this commit)_ | T1·S1·T2·T3·T4·T5 ✅ |
 | F3 | Git intake & diff analysis (overlay, path safety) | ⬜ | — | — |
 | F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ⬜ | — | — |
 | F5 | LLM provider abstraction + context packager | ⬜ | — | — |
@@ -79,3 +79,11 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   holds. **Remaining in F2:** `.jitgen.yaml` config + typed trust split (`TrustedConfig`/`RepoConfig`),
   rusqlite durable run-state (global run index, atomic publish), `jitgen doctor`, then the full F2
   Codex review protocol before marking F2 complete.
+- 2026-05-30: **F2 complete.** Added config (`.jitgen.yaml` typed trust split
+  `TrustedConfig`/`RepoConfig`→`ResolvedConfig`, security-key + grammar allowlisting, YAML cap),
+  `jitgen-state` (rusqlite durable store: global index + per-run DBs, idempotent/re-entrant steps,
+  resume point, atomic+sha256 artifacts, run-id & changed-input safety), and a hardened `jitgen
+  doctor`. Bazel `crate_universe` now builds rusqlite (bundled C) + serde/serde_yaml/sha2. Codex
+  review **T1**(5)·**S1**(6)·**T2**(1)·**T3**(5)·**T4**(1)·**T5**(0, clean): **18 P3+ resolved**
+  incl. the P1 doctor-execute-from-hostile-CWD. cargo ~76 tests + bazel 12 targets green;
+  clippy/fmt clean. Artifacts: [reviews/F2/](reviews/F2/).

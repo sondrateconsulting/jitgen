@@ -23,19 +23,31 @@ pub enum CatchClass {
     Flaky,
 }
 
+/// An outcome from which we cannot determine pass/fail behavior (so it cannot establish a baseline
+/// or a clean catch): build failure, harness error, or **timeout** (F2/T1 review #3).
+fn unusable(outcome: ExecOutcome) -> bool {
+    matches!(
+        outcome,
+        ExecOutcome::BuildError | ExecOutcome::Errored | ExecOutcome::Timeout
+    )
+}
+
 impl CatchClass {
     /// Classify a single execution (harden mode).
     pub fn from_single(result: &ExecutionResult) -> Self {
         match result.outcome {
             ExecOutcome::Passed => CatchClass::HardenPass,
-            ExecOutcome::BuildError | ExecOutcome::Errored => CatchClass::Broken,
-            ExecOutcome::Failed | ExecOutcome::Timeout => CatchClass::NoCatch,
+            ExecOutcome::Failed => CatchClass::NoCatch,
+            // BuildError / Errored / Timeout: we could not determine behavior.
+            o if unusable(o) => CatchClass::Broken,
+            // Exhaustiveness guard (all variants covered above).
+            _ => CatchClass::Broken,
         }
     }
 
     /// Classify a base+head execution pair (catch mode).
     pub fn from_catch(exec: &CatchExecution) -> Self {
-        let unusable = |o: ExecOutcome| matches!(o, ExecOutcome::BuildError | ExecOutcome::Errored);
+        // If either side is unusable (incl. timeout), we cannot classify a catch.
         if unusable(exec.base.outcome) || unusable(exec.head.outcome) {
             return CatchClass::Broken;
         }
@@ -171,6 +183,27 @@ mod tests {
         );
         assert_eq!(
             CatchClass::from_single(&r(ExecOutcome::BuildError)),
+            CatchClass::Broken
+        );
+    }
+
+    #[test]
+    fn timeout_is_unusable_not_a_catch() {
+        // base pass + head timeout: cannot determine a regression → Broken (not NoCatch).
+        let head_to = CatchExecution {
+            base: r(ExecOutcome::Passed),
+            head: r(ExecOutcome::Timeout),
+        };
+        assert_eq!(CatchClass::from_catch(&head_to), CatchClass::Broken);
+        // base timeout: cannot establish a baseline → Broken.
+        let base_to = CatchExecution {
+            base: r(ExecOutcome::Timeout),
+            head: r(ExecOutcome::Failed),
+        };
+        assert_eq!(CatchClass::from_catch(&base_to), CatchClass::Broken);
+        // single-execution timeout (harden) → Broken.
+        assert_eq!(
+            CatchClass::from_single(&r(ExecOutcome::Timeout)),
             CatchClass::Broken
         );
     }

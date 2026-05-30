@@ -17,6 +17,10 @@ pub enum CoreError {
     /// JSON (de)serialization of contract data failed.
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// YAML parsing of (untrusted) `.jitgen.yaml` failed.
+    #[error("yaml parse error: {0}")]
+    Yaml(#[from] serde_yaml::Error),
 }
 
 /// Convenience result alias for the core layer.

@@ -12,4 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 jitgen-core.workspace = true
-# jitgen-orchestrator and arg-parsing (clap) are wired in F2/F9; F1 keeps the CLI std-only.
+jitgen-orchestrator.workspace = true
+serde_json.workspace = true
+# Full arg-parsing (clap) and run/analyze/resume/report wiring arrive in F9.

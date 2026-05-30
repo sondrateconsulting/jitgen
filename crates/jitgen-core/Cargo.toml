@@ -9,4 +9,5 @@ description = "Core domain types and the stable, versioned data contract for jit
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 thiserror.workspace = true

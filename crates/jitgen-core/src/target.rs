@@ -17,8 +17,19 @@ pub enum SymbolKind {
 }
 
 /// Explainable risk score in `[0.0, 1.0]` used to prioritize targets (a Diff-Risk-Score analogue).
+///
+/// Deserialization is **validating** (`try_from = "f64"`): a persisted value outside `[0,1]` (or NaN)
+/// is rejected on decode, not just at `new()` (F2/T3 review #4).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f64")]
 pub struct RiskScore(f64);
+
+impl TryFrom<f64> for RiskScore {
+    type Error = String;
+    fn try_from(v: f64) -> std::result::Result<Self, String> {
+        RiskScore::new(v).map_err(|e| e.to_string())
+    }
+}
 
 impl RiskScore {
     /// Construct a score, validating it is a finite value in `[0.0, 1.0]`.
@@ -68,6 +79,13 @@ mod tests {
         assert!(RiskScore::new(1.1).is_err());
         assert!(RiskScore::new(f64::NAN).is_err());
         assert_eq!(RiskScore::new(0.5).unwrap().get(), 0.5);
+    }
+
+    #[test]
+    fn risk_score_deserialize_rejects_out_of_range() {
+        assert!(serde_json::from_str::<RiskScore>("2.0").is_err());
+        assert!(serde_json::from_str::<RiskScore>("-0.5").is_err());
+        assert_eq!(serde_json::from_str::<RiskScore>("0.5").unwrap().get(), 0.5);
     }
 
     #[test]

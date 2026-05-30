@@ -41,9 +41,36 @@ impl Strategy {
     }
 }
 
+impl Mode {
+    /// Stable lowercase string form (for persistence / display).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Harden => "harden",
+            Mode::Catch => "catch",
+        }
+    }
+
+    /// Parse from the [`Mode::as_str`] form.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "harden" => Some(Mode::Harden),
+            "catch" => Some(Mode::Catch),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn as_str_roundtrips() {
+        for m in [Mode::Harden, Mode::Catch] {
+            assert_eq!(Mode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(Mode::parse("bogus"), None);
+    }
 
     #[test]
     fn defaults_are_safe() {

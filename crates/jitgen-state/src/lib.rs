@@ -1,26 +1,17 @@
 #![forbid(unsafe_code)]
-//! `jitgen-state` — Durable, resumable run state (SQLite). Pipeline layer 2 (run-state).
+//! `jitgen-state` — durable, resumable run state (SQLite). Pipeline layer 2 (run-state).
 //!
-//! Skeleton established in F1; functionality is implemented in later foundational phases.
-//! See `docs/architecture.md` and `docs/implementation-plan.md`.
+//! A [`RunStore`] manages the state root (a private `0700` dir outside the target repo): a global
+//! `index.sqlite` plus per-run `state.sqlite` databases. Steps are idempotent / re-entrant and
+//! artifacts are published atomically (temp → fsync → rename) with a sha256, so `jitgen resume` can
+//! continue from the first not-yet-succeeded step (ADR-0005).
 
-/// Stable identifier for this pipeline layer/crate.
-pub fn layer_id() -> &'static str {
-    "jitgen-state"
-}
+mod error;
+mod fsutil;
+mod model;
+mod store;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layer_id_matches_crate_name() {
-        assert_eq!(layer_id(), "jitgen-state");
-    }
-
-    #[test]
-    fn links_against_core_contract() {
-        // Proves the intra-workspace dependency on jitgen-core compiles & links.
-        assert!(!jitgen_core::version().is_empty());
-    }
-}
+pub use error::{Result, StateError};
+pub use fsutil::{atomic_write, ensure_private_dir, safe_join, sha256_hex};
+pub use model::{ArtifactRecord, RunMeta, StepRecord, StepStatus};
+pub use store::{RunHandle, RunStore, STATE_SCHEMA_VERSION};

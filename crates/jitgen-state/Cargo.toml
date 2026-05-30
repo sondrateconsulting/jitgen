@@ -8,3 +8,6 @@ description = "Durable, resumable run state (SQLite). Pipeline layer 2 (run-stat
 
 [dependencies]
 jitgen-core.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
