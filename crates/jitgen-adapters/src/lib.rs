@@ -1,26 +1,22 @@
 #![forbid(unsafe_code)]
-//! `jitgen-adapters` — Language discovery & the LanguageAdapter registry. Pipeline layer 4.
+//! `jitgen-adapters` — language discovery & the LanguageAdapter registry (pipeline layer 4).
 //!
-//! Skeleton established in F1; functionality is implemented in later foundational phases.
-//! See `docs/architecture.md` and `docs/implementation-plan.md`.
+//! Detects languages/build tools in a [`RepoSnapshot`], maps changes to [`jitgen_core::Target`]s via
+//! tree-sitter symbol extraction (ADR-0007, with a line-range fallback), and derives per-language
+//! argv test commands. First-class adapters: TypeScript, Java, Python, Rust; plus a generic
+//! `.jitgen.yaml`-driven adapter. See `docs/architecture.md`.
 
-/// Stable identifier for this pipeline layer/crate.
-pub fn layer_id() -> &'static str {
-    "jitgen-adapters"
-}
+mod builtin;
+mod discovery;
+mod glob;
+mod lang;
+mod snapshot;
+mod spi;
+mod symbols;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layer_id_matches_crate_name() {
-        assert_eq!(layer_id(), "jitgen-adapters");
-    }
-
-    #[test]
-    fn links_against_core_contract() {
-        // Proves the intra-workspace dependency on jitgen-core compiles & links.
-        assert!(!jitgen_core::version().is_empty());
-    }
-}
+pub use builtin::{GenericAdapter, JavaAdapter, PythonAdapter, RustAdapter, TypeScriptAdapter};
+pub use discovery::{AdapterRegistry, DetectionProfile};
+pub use lang::Lang;
+pub use snapshot::RepoSnapshot;
+pub use spi::{AdapterContext, DetectionResult, LanguageAdapter, TestCommand};
+pub use symbols::extract_targets;

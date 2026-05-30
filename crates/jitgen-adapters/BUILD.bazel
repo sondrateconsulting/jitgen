@@ -2,5 +2,12 @@ load("//bazel:defs.bzl", "jitgen_rust_library")
 
 jitgen_rust_library(
     name = "jitgen-adapters",
-    deps = ["//crates/jitgen-core"],
+    deps = [
+        "//crates/jitgen-core",
+        "@crates//:tree-sitter",
+        "@crates//:tree-sitter-java",
+        "@crates//:tree-sitter-python",
+        "@crates//:tree-sitter-rust",
+        "@crates//:tree-sitter-typescript",
+    ],
 )

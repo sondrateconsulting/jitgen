@@ -8,3 +8,8 @@ description = "Language discovery & the LanguageAdapter registry. Pipeline layer
 
 [dependencies]
 jitgen-core.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-typescript.workspace = true

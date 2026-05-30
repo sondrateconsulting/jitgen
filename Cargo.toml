@@ -28,6 +28,13 @@ git2 = { version = "0.19.0", default-features = false, features = ["vendored-lib
 # Force statically-built (vendored) zlib so libgit2-sys never probes/links system zlib via
 # pkg-config (F3/S1 review #5). Requires a C toolchain at build time (already needed for libgit2).
 libz-sys = { version = "1.1.20", features = ["static"] }
+# tree-sitter symbol extraction (ADR-0007). Grammars compile C; the 0.23 cohort co-resolves on a
+# single tree-sitter version. Grammars are compiled-in; repo `.jitgen.yaml` only selects allowlisted names.
+tree-sitter = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-typescript = "0.23"
 
 # Intra-workspace (path-based).
 jitgen-core = { path = "crates/jitgen-core" }

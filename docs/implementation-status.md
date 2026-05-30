@@ -10,8 +10,8 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F0 | Research, architecture, plan, ADRs, security & resume docs | ✅ complete | `c9cd845` | T1·S1·T2·T3 ✅ |
 | F1 | Monorepo scaffold (Bazel Bzlmod + Rust workspace + skeletons) | ✅ complete | `2a10058` | T1·S1·T2·T3 ✅ |
 | F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | ✅ complete | `11aaaae` | T1·S1·T2·T3·T4·T5 ✅ |
-| F3 | Git intake & diff analysis (overlay, path safety) | ✅ complete | _(this commit)_ | T1·S1·T2·T3·T4·T5 ✅ |
-| F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ⬜ | — | — |
+| F3 | Git intake & diff analysis (overlay, path safety) | ✅ complete | `aa3bcf3` | T1·S1·T2·T3·T4·T5 ✅ |
+| F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ✅ complete | _(this commit)_ | T1·S1·T2·T3·T4 ✅ |
 | F5 | LLM provider abstraction + context packager | ⬜ | — | — |
 | F6 | Candidate materialization & rendering (overlay-confined) | ⬜ | — | — |
 | F7 | Sandboxed execution & classification [MAX SCRUTINY] | ⬜ | — | — |
@@ -96,3 +96,12 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   (0, clean): **13 P3+ resolved** incl. P1-class hostile-repo vectors (.git-file/alternates/commondir
   boundary escapes, case-fold filter bypass, pre-sandbox DoS). cargo ~91 tests + bazel 12 targets
   green. Artifacts: [reviews/F3/](reviews/F3/).
+- 2026-05-30: **F4 complete.** `jitgen-adapters`: `LanguageAdapter` SPI + `AdapterContext`,
+  `RepoSnapshot`, discovery/registry, tree-sitter symbol extraction (0.23 cohort: Rust/Python/Java/
+  TS+TSX; iterative DFS, DoS-bounded, parse timeout, line-range fallback), and adapters for
+  Rust/Python/Java/TypeScript + a generic `.jitgen.yaml` adapter (extensions, allowlisted grammar,
+  include/exclude globs, argv template, id-collision namespacing). argv-only test commands (no env
+  authority). Codex review **T1**(6)·**S1**(2)·**T2**(1)·**T3**(1)·**T4**(0, clean): **10 P3+
+  resolved** incl. generic-id collision, untrusted-source/glob DoS (iterative walks + caps + parse
+  timeout). cargo ~109 tests + bazel 12 targets green (4 grammars compile C via crate_universe).
+  Artifacts: [reviews/F4/](reviews/F4/).

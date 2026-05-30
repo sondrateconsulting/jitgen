@@ -44,15 +44,10 @@ pub const FORBIDDEN_REPO_KEYS: &[&str] = &[
 
 /// tree-sitter grammar names a repo `.jitgen.yaml` may reference. Grammars are compiled into the
 /// binary; a non-allowlisted name is ignored with a warning (never dynamically loaded) — ADR-0007.
-pub const ALLOWED_GRAMMARS: &[&str] = &[
-    "typescript",
-    "tsx",
-    "javascript",
-    "java",
-    "python",
-    "rust",
-    "go",
-];
+// Kept in lock-step with the grammars actually compiled into `jitgen-adapters` (F4/T1 review #4):
+// adding a name here without a compiled grammar would silently degrade to hunk fallback.
+pub const ALLOWED_GRAMMARS: &[&str] =
+    &["typescript", "tsx", "javascript", "java", "python", "rust"];
 
 /// Untrusted, repo-provided config (`.jitgen.yaml`). Only non-security fields.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
