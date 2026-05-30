@@ -1,0 +1,29 @@
+# Rust / Cargo
+/target/
+**/target/
+*.rs.bk
+# Bazel
+/bazel-*
+MODULE.bazel.lock
+# jitgen runtime state (never commit run state / overlays)
+.jitgen/
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+# Local env / secrets (never commit)
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+# Scratch
+/tmp/
+*.log
+!docs/reviews/availability.log
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

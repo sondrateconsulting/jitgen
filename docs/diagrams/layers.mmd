@@ -1,0 +1,21 @@
+flowchart TB
+  User[User / CI] --> CLI[Rust CLI: jitgen]
+  CLI --> RunMgr[Run Manager / Orchestrator]
+  RunMgr --> State[(SQLite Durable Run State)]
+  RunMgr --> Repo[Git Repository Intake]
+  Repo --> Overlay[Ephemeral Worktree / Patch Overlay]
+  Repo --> Discovery[Language + Build/Test Discovery]
+  Discovery --> Adapters[Language Adapter Registry]
+  Adapters --> TS & Java & Py & Rust & Generic[Generic .jitgen.yaml Adapter]
+  Discovery --> TargetSel[Change/Symbol Target Selection]
+  TargetSel --> Context[Context Builder / Prompt Packager]
+  Context --> LLM[LLM Provider Abstraction + Mock]
+  LLM --> Candidate[Candidate Test Renderer]
+  Candidate --> Overlay
+  Overlay --> Sandbox[Sandboxed Test Executor]
+  Sandbox --> Classifier[Result Classifier]
+  Classifier --> Repair[Repair / Minimize / Flake Filter]
+  Repair --> LLM
+  Repair --> Accepted[Accepted Tests]
+  Accepted --> Reports[Patch + JSON + Markdown + JUnit/SARIF]
+  Reports --> User

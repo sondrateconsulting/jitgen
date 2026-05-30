@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "project": "jitgen",
+  "updated_at": "2026-05-30",
+  "current_phase": "F1",
+  "phases": [
+    { "id": "F0", "title": "Research, architecture, plan, ADRs, security & resume docs", "status": "complete", "commit": "this-commit", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
+    { "id": "F1", "title": "Monorepo scaffold (Bazel Bzlmod + Rust workspace + crate skeletons)", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F2", "title": "Core domain, config (.jitgen.yaml), SQLite durable state, doctor", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F3", "title": "Git intake & diff analysis (overlay, path safety)", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F4", "title": "Language discovery & adapters (TS/Java/Python/Rust + generic)", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F5", "title": "LLM provider abstraction + context packager", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F6", "title": "Candidate materialization & per-language rendering", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F7", "title": "Sandboxed execution & classification [MAX SCRUTINY]", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F8", "title": "Feedback/repair/minimization/flake-filter + assessors", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F9", "title": "End-to-end CLI + exporters", "status": "not_started", "commit": null, "review_protocol": null },
+    { "id": "F10", "title": "Hardening, audits, docs, packaging, mid-run resume test", "status": "not_started", "commit": null, "review_protocol": null }
+  ],
+  "notes": "Resumable build. On startup read docs/implementation-status.md + this file, inspect git, continue from first incomplete phase. Source paper fetched (arXiv:2601.22832). Bazel provisioned in F1; no code is buildable before F1, after which Cargo is the always-working dev build (Bazel canonical)."
+}

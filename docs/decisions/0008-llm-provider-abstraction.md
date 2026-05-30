@@ -1,0 +1,46 @@
+# ADR-0008: LLM provider trait with deterministic mock default
+
+- **Status:** Accepted
+- **Date:** 2026-05-30
+
+## Context
+
+The system calls an LLM to generate/repair tests, but the entire test suite must run **without real
+API keys** (mock provider), and real providers must be optional and safe (no key leakage, TLS always
+on). The provider boundary is also a prompt-injection surface (untrusted repo content goes into
+prompts).
+
+## Decision
+
+Define an async `LlmProvider` trait. Implementations:
+
+- **`MockProvider` (default):** deterministic, offline, seeded by a hash of the request. Returns
+  canned-but-structured candidate tests so the full loop (generate → materialize → run → classify →
+  repair) is exercised in tests with **no network and no keys**. Supports scripted multi-turn
+  behavior (e.g. "fail then repair-to-pass") for repair-loop tests.
+- **Optional real providers:** Anthropic Messages API, OpenAI-compatible (incl. local servers like
+  Ollama/LM Studio via base-URL). **Provider, base URL, key-env-var name, and real-LLM enablement are
+  TRUSTED-config only** (CLI/user config); a hostile repo `.jitgen.yaml` can **never** redirect egress
+  (F0/S1 review #3, [ADR-0010](0010-config-trust-and-fail-closed.md)). API keys are read **only** from
+  the trusted-named environment variable (never config files, never logged). TLS verification is always
+  on. Requests are bounded (token budget), rate-limited, and **redacted + size-capped** — including
+  every field that could carry secrets (context, stdout/stderr, stack traces, repair feedback,
+  assessor rationale). Responses are size-capped.
+
+Real providers are gated behind config and, for e2e, the `JITGEN_REAL_LLM=true` env flag. Prompt
+templates are **injection-resistant**: untrusted repo content is fenced and labeled as data, with
+explicit instructions that it must never be treated as commands; the model's output is parsed as a
+**candidate** and independently validated/sandboxed (we never trust it to drive execution).
+
+## Consequences
+
+- Hermetic, deterministic tests; CI needs no secrets.
+- Adding a provider = implement the trait; the rest of the system is provider-agnostic.
+- Clear, auditable secret handling.
+
+## Alternatives considered
+
+- **Bake in one vendor SDK:** rejected — couples the system to a vendor and complicates offline tests.
+- **Record/replay HTTP cassettes as the default test path:** rejected as the *default* (still implies
+  real calls to record); the deterministic mock is simpler and fully offline. Cassettes may be added
+  later for provider-contract tests.
