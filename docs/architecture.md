@@ -145,8 +145,11 @@ OS sandbox (bubblewrap/firejail on Linux; `sandbox-exec` on macOS) or container 
 none is available, execution is **refused** unless the trusted user passes `--unsafe-local-execution`
 (loud, recorded). **No network by default** (conformance-tested per backend); **hardcoded env
 allowlist** with synthetic `HOME` (no inherited tokens/creds); cwd pinned to the overlay; mandatory
-timeouts, output caps, rlimits (CPU/AS/NOFILE/NPROC/FSIZE); **preflight resource budgets** before
-sandboxing. **argv-only** execution; `shell: true` is trusted-config only and high-risk. See
+timeouts, output caps, and **per-backend** resource limits (containers via cgroup flags
+`--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/constrained-local via a
+`ulimit` preamble applying **CPU-time + address-space only** — process-count is intentionally omitted,
+since `ulimit -u` is per-UID and the container `--pids-limit` + wall-clock timeout are the fork-bomb
+controls); **preflight resource budgets** before sandboxing. **argv-only** execution; `shell: true` is trusted-config only and high-risk. See
 [ADR-0003](decisions/0003-sandbox-strategy.md), [ADR-0010](decisions/0010-config-trust-and-fail-closed.md). **[MAX SCRUTINY]**
 
 ### 9 — Feedback / repair / flake-filter / assessors (`jitgen-feedback`)

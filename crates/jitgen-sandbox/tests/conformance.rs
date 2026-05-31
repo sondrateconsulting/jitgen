@@ -25,6 +25,8 @@ struct Fixture {
     base: PathBuf,
     overlay: PathBuf,
     state: PathBuf,
+    /// Per-fixture container instance id (unique across parallel tests, valid `[A-Za-z0-9_-]`).
+    instance: String,
 }
 
 impl Fixture {
@@ -38,6 +40,9 @@ impl Fixture {
             overlay: std::fs::canonicalize(&overlay).unwrap(),
             state: std::fs::canonicalize(&state).unwrap(),
             base,
+            // Unique per test (process id + test name) so parallel ignored tests don't collide on
+            // the container name `jitgen-<instance>` (T1/F7 P4).
+            instance: format!("{}-{name}", std::process::id()),
         }
     }
 }
@@ -62,7 +67,7 @@ fn exec_as(
         command: cmd,
         overlay_root: &fx.overlay,
         state_root: &fx.state,
-        instance: "conf",
+        instance: &fx.instance,
         run_as,
     })
     .unwrap()
@@ -207,19 +212,24 @@ fn docker_denies_network() {
     // Containers require an explicit non-root --user (fail-closed); supply the invoking user's id.
     let uid_gid = current_uid_gid();
     let fx = Fixture::new("docker-net");
-    // `nc`/`wget` to a public resolver; under --network=none this must fail (non-Passed outcome).
-    let cmd = SpawnRequest::argv(
-        "/bin/sh",
-        [
-            "-c".into(),
-            "nc -w 3 1.1.1.1 53 < /dev/null || wget -T 3 -q -O /dev/null http://1.1.1.1/".into(),
-        ],
-    );
+    // Probe network denial robustly: pick a tool that actually EXISTS in the image, then attempt a
+    // connect. Distinguish "denied" from "no probe tool" so a toolless image can't masquerade as a
+    // passing network-denial test (T1/F7 P3). Emit a sentinel word and assert on it (not on exit).
+    let script = "\
+        if command -v nc >/dev/null 2>&1; then \
+            nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        elif command -v bash >/dev/null 2>&1; then \
+            bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        else echo NO_PROBE_TOOL; fi";
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script.into()]);
     let res = exec_as(&sb, &cmd, &fx, uid_gid.as_deref());
-    assert_ne!(
-        res.outcome,
-        ExecOutcome::Passed,
-        "Docker network must be denied; got {res:?}"
+    if res.stdout.contains("NO_PROBE_TOOL") {
+        eprintln!("SKIP docker_denies_network: image has no nc/bash probe tool");
+        return;
+    }
+    assert!(
+        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+        "Docker network must be denied (expected NET_DENIED); got {res:?}"
     );
 }
 

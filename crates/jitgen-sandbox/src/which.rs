@@ -31,7 +31,15 @@ const TRUSTED_BIN_DIRS: &[&str] = &[
 pub fn resolve_trusted(program: &str) -> Option<PathBuf> {
     if program.contains('/') {
         let p = Path::new(program);
-        if p.is_absolute() && is_in_trusted_dir(p) && is_executable_file(p) {
+        // An absolute path is honored only if EVERY component is `Normal` (no `..`/`.`) and its
+        // parent dir is exactly a trusted bin dir. Rejecting `ParentDir`/`CurDir` is essential:
+        // `/usr/bin/../../tmp/x` lexically `starts_with("/usr/bin")` yet resolves outside it
+        // (T1/F7 P3). We do not canonicalize — the trust anchor is the literal trusted-dir entry.
+        if p.is_absolute()
+            && has_only_normal_components(p)
+            && parent_is_trusted_dir(p)
+            && is_executable_file(p)
+        {
             return Some(p.to_path_buf());
         }
         return None;
@@ -42,11 +50,20 @@ pub fn resolve_trusted(program: &str) -> Option<PathBuf> {
         .find(|cand| is_executable_file(cand))
 }
 
-/// Whether `p`'s path lies (component-wise) under a trusted bin dir. Checks the literal path, not a
-/// canonicalized one: the trust anchor is the root-owned entry in the trusted dir, even if it is a
-/// symlink pointing elsewhere.
-fn is_in_trusted_dir(p: &Path) -> bool {
-    TRUSTED_BIN_DIRS.iter().any(|d| p.starts_with(d))
+/// Whether every component of `p` is a root or a `Normal` segment — no `..`/`.`/prefix trickery.
+fn has_only_normal_components(p: &Path) -> bool {
+    use std::path::Component;
+    p.components()
+        .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+}
+
+/// Whether `p`'s immediate parent directory is exactly one of the trusted bin dirs (so the launcher
+/// is a direct child of a trusted dir, e.g. `/usr/bin/docker` — not nested deeper).
+fn parent_is_trusted_dir(p: &Path) -> bool {
+    match p.parent() {
+        Some(parent) => TRUSTED_BIN_DIRS.iter().any(|d| Path::new(d) == parent),
+        None => false,
+    }
 }
 
 #[cfg(unix)]
@@ -78,11 +95,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn rejects_dotdot_escape_that_lexically_starts_with_a_trusted_dir() {
+        // `/usr/bin/../../bin/sh` resolves to `/bin/sh` (exists) but contains `..`; it must be
+        // rejected because its literal parent is not a trusted dir and it has non-Normal components
+        // (T1/F7 P3). Also a nested path one level below a trusted dir is refused.
+        assert!(resolve_trusted("/usr/bin/../../bin/sh").is_none());
+        assert!(resolve_trusted("/usr/bin/sub/sh").is_none());
+        assert!(resolve_trusted("/usr/bin/./sh").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn resolves_known_system_binaries() {
         // `/bin/sh` exists on every unix host and is under a trusted dir.
         let sh = resolve_trusted("sh").expect("sh resolvable from a trusted dir");
         assert!(sh.is_absolute());
-        assert!(is_in_trusted_dir(&sh));
+        assert!(parent_is_trusted_dir(&sh));
+        assert!(has_only_normal_components(&sh));
         // The same binary by absolute trusted path resolves to itself.
         assert_eq!(resolve_trusted("/bin/sh"), Some(PathBuf::from("/bin/sh")));
     }

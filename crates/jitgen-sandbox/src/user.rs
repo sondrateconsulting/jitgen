@@ -15,6 +15,12 @@
 pub fn current_uid_gid() -> Option<String> {
     let uid = id_value("-u")?;
     let gid = id_value("-g")?;
+    // Refuse root: containers must run as a non-root user, and `plan_container` rejects a `0:*`
+    // pair anyway — returning `None` here makes the "running as root" case fail closed (with a clear
+    // `MissingContainerUser`) rather than silently produce `--user 0:0` (T1/F7 P3).
+    if uid.bytes().all(|b| b == b'0') {
+        return None;
+    }
     Some(format!("{uid}:{gid}"))
 }
 
@@ -51,10 +57,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn returns_numeric_uid_gid_on_unix() {
-        let u = current_uid_gid().expect("id should be available on a unix test host");
-        let (uid, gid) = u.split_once(':').expect("uid:gid format");
-        assert!(!uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()));
-        assert!(!gid.is_empty() && gid.bytes().all(|b| b.is_ascii_digit()));
+    fn returns_numeric_nonroot_uid_gid_on_unix() {
+        // As a non-root user → a `<nonzero-uid>:<gid>` pair; as root (e.g. a CI container) → `None`
+        // by design (containers must not run as root). Accept either, asserting the shape if present.
+        match current_uid_gid() {
+            Some(u) => {
+                let (uid, gid) = u.split_once(':').expect("uid:gid format");
+                assert!(uid.bytes().all(|b| b.is_ascii_digit()) && uid.bytes().any(|b| b != b'0'));
+                assert!(!gid.is_empty() && gid.bytes().all(|b| b.is_ascii_digit()));
+            }
+            None => { /* running as root: refusing is the documented behavior */ }
+        }
     }
 }

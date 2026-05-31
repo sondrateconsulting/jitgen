@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 const POLL: Duration = Duration::from_millis(20);
 /// Clamp captured output to the redaction window so the whole returned blob is scanned for secrets
 /// (mirrors `jitgen_context`'s 256 KiB redaction window; output beyond this is dropped + flagged).
+/// This is the hard ceiling on the effective cap — see [`crate::policy::DEFAULT_OUTPUT_CAP_BYTES`].
 const REDACT_WINDOW: usize = 256 * 1024;
 /// On truncation, drop this many trailing bytes before redaction so a secret straddling the cap
 /// boundary (whose completing suffix was dropped by the cap) cannot survive. Larger than any single
@@ -218,6 +219,11 @@ fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture
 /// Collect a capture with a bounded wait: if the reader has not finished within [`COLLECT_GRACE`]
 /// (an escaped descendant still holding the pipe), snapshot what was captured and move on rather
 /// than hang. The orphaned reader thread dies when the OS finally closes the pipe.
+///
+/// Returns `(bytes, truncated)`. `truncated` is true if the cap was hit **or** the reader had not
+/// finished when we gave up — an unfinished reader means the captured bytes are an arbitrary
+/// mid-stream prefix, which is exactly the "truncated" contract: it flags the result and makes the
+/// caller apply the redaction tail-guard to that boundary (T1/F7 P2).
 fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
     let Some(cap) = cap else {
         return (Vec::new(), false);
@@ -226,23 +232,32 @@ fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
     while !cap.handle.is_finished() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(5));
     }
-    if cap.handle.is_finished() {
+    let finished = cap.handle.is_finished();
+    if finished {
         let _ = cap.handle.join();
     }
     let buf = cap.buf.lock().map(|g| g.clone()).unwrap_or_default();
-    let truncated = cap.truncated.load(Ordering::Relaxed);
+    let truncated = cap.truncated.load(Ordering::Relaxed) || !finished;
     (buf, truncated)
 }
 
 /// Run a teardown argv (e.g. `docker kill …`) with all stdio discarded; best-effort.
+///
+/// The teardown program (`docker`/`podman`) is resolved from a trusted system dir and the env is
+/// cleared — same rationale as the main launcher: never let an inherited `PATH` decide which binary
+/// tears down an attacker's container (T1/F7 P3). If it can't be trusted-resolved, skip it (the
+/// container's own resource limits + `--rm` still bound it).
 fn run_cleanup(argv: &[String]) {
     if let Some((prog, rest)) = argv.split_first() {
-        let _ = Command::new(prog)
-            .args(rest)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if let Some(abs) = resolve_trusted(prog) {
+            let _ = Command::new(abs)
+                .args(rest)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 

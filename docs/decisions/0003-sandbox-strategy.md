@@ -19,10 +19,13 @@ chosen tier in run state and reports:
    SBPL profile (deny network, restrict writes to the overlay).
 2. **Container** — Docker/Podman: `--network=none`, read-only mounts except the overlay, dropped
    capabilities, `--pids-limit`, memory/cpu limits, non-root user.
-3. **Constrained local fallback** — spawn under a fresh **process group**, apply `setrlimit`
-   (CPU/AS/NOFILE/NPROC/FSIZE), set a **jitgen-owned env allowlist** with a **synthetic `HOME`**, set
-   cwd to the overlay, enforce a wall-clock **timeout** with whole-group kill, and **cap captured
-   output**. This tier provides **no kernel-enforced network/file isolation**.
+3. **Constrained local fallback** — spawn under a fresh **process group**, apply best-effort rlimits
+   via a `ulimit` preamble (**CPU-time + address-space only**; process-count is intentionally omitted
+   because `ulimit -u` is per-UID, so the container `--pids-limit` + wall-clock timeout are the
+   fork-bomb controls — and on macOS `ulimit -v`/AS is unenforced), set a **jitgen-owned env
+   allowlist** with a **synthetic `HOME`**, set cwd to the overlay, enforce a wall-clock **timeout**
+   with whole-group kill, and **cap captured output**. This tier provides **no kernel-enforced
+   network/file isolation**.
 
 **Fail-closed (per F0/S1 review #1, [ADR-0010](0010-config-trust-and-fail-closed.md)):** untrusted
 execution **requires** tier 1 or 2. If neither is available, `run`/e2e **refuse to execute**. The
@@ -38,7 +41,8 @@ constrained-local tier is **never auto-selected**; it runs only when the trusted
   **trusted-config only** (never from repo `.jitgen.yaml`), flagged high-risk, still sandboxed.
 - **Never execute commands originating from LLM output.** Only adapter-derived, validated commands.
 - **Preflight resource budgets** are applied **before** sandboxing (repo/blob/diff/parse caps) in
-  addition to in-sandbox timeout + output cap + rlimits, on every execution, every tier.
+  addition to in-sandbox timeout + output cap + per-backend rlimits (above), on every execution,
+  every tier.
 - cwd restricted to the overlay; writes outside allowed roots are prevented/rejected.
 
 ## Consequences

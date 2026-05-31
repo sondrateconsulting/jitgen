@@ -78,8 +78,9 @@ fn validated_cwd(overlay_root: &Path, cwd_rel: &str) -> Result<PathBuf> {
     for comp in Path::new(cwd_rel).components() {
         match comp {
             Component::Normal(s) => path.push(s),
-            // The empty string yields no components; anything else (RootDir, ParentDir, CurDir,
-            // Prefix) is an escape attempt.
+            // `.` is a harmless no-op (a normal adapter cwd like `"."` or `"pkg/./sub"`); skip it
+            // (T1/F7 P4). Anything else (RootDir, ParentDir, Prefix) is an escape attempt.
+            Component::CurDir => {}
             _ => return Err(SandboxError::UnsafeCwd(cwd_rel.to_string())),
         }
     }
@@ -115,14 +116,15 @@ fn is_digest_pinned(image: &str) -> bool {
     }
 }
 
-/// Whether `s` is a `<digits>:<digits>` uid:gid pair (for the container `--user` flag).
+/// Whether `s` is a **non-root** `<digits>:<digits>` uid:gid pair (for the container `--user` flag).
+/// uid `0` is rejected: the non-root invariant is the whole point of `--user` here, so `0:0` (and any
+/// all-zero uid like `00`) must not pass (T1/F7 P3). `current_uid_gid` likewise refuses root.
 fn is_uid_gid(s: &str) -> bool {
     match s.split_once(':') {
         Some((uid, gid)) => {
-            !uid.is_empty()
-                && !gid.is_empty()
-                && uid.bytes().all(|b| b.is_ascii_digit())
-                && gid.bytes().all(|b| b.is_ascii_digit())
+            let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+            // uid is non-root iff it has at least one non-`0` digit.
+            digits(uid) && digits(gid) && uid.bytes().any(|b| b != b'0')
         }
         None => false,
     }
@@ -606,13 +608,15 @@ mod tests {
             build_plan(pi).unwrap_err(),
             SandboxError::MissingContainerUser
         ));
-        // Malformed uid:gid → rejected.
-        let mut pi = input(Backend::Docker, &r, &policy);
-        pi.run_as = Some("root:root");
-        assert!(matches!(
-            build_plan(pi).unwrap_err(),
-            SandboxError::InvalidRunAs(_)
-        ));
+        // Malformed and root uid:gid → rejected (root must never pass the non-root invariant).
+        for bad in ["root:root", "0:0", "00:0", "0:20"] {
+            let mut pi = input(Backend::Docker, &r, &policy);
+            pi.run_as = Some(bad);
+            assert!(
+                matches!(build_plan(pi).unwrap_err(), SandboxError::InvalidRunAs(_)),
+                "{bad} should be rejected as not a non-root uid:gid"
+            );
+        }
     }
 
     #[test]

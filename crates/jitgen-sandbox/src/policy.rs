@@ -13,7 +13,12 @@ use std::time::Duration;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// Default cap on captured stdout/stderr **each** (bytes). Output beyond this is dropped and the
 /// result is flagged truncated (security §3/§10 — bounded, redacted output).
-pub const DEFAULT_OUTPUT_CAP_BYTES: u64 = 1024 * 1024;
+///
+/// This is also the effective **ceiling**: the runtime caps each stream at
+/// `min(output_cap_bytes, 256 KiB)` because redaction scans a 256 KiB window — capturing beyond that
+/// would return bytes that were never secret-scanned (T1/F7 P3). Raising `output_cap_bytes` above
+/// 256 KiB therefore has no effect today; honoring a larger cap would require windowed redaction.
+pub const DEFAULT_OUTPUT_CAP_BYTES: u64 = 256 * 1024;
 
 /// Per-execution resource limits. Enforced by the backend where possible (Docker
 /// `--memory`/`--pids-limit`/`--cpus`; firejail `--rlimit-*`). The constrained-local tier applies
