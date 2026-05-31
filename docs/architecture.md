@@ -126,10 +126,18 @@ Parses/validates candidate tests from model output. See
 [ADR-0008](decisions/0008-llm-provider-abstraction.md).
 
 ### 7 — Candidate materialization (`jitgen-materialize`)
-Renders a `TestCandidate` into a `MaterializedTest` placed **inside the overlay only**, using
-`openat`/`O_NOFOLLOW`/`O_EXCL` dirfd traversal + post-open `fstat` (race-safe; no
-canonicalize-then-write). Per-language file placement (`*.test.ts`, `src/test/java/...`, `test_*.py`,
-`#[cfg(test)]`/`tests/`).
+Renders a `TestCandidate` into a `MaterializedTest` placed **inside the overlay only**. Confinement is
+`#![forbid(unsafe_code)]`-compatible pure-std ([ADR-0011](decisions/0011-overlay-materialization.md)):
+lexical path validation (no absolute/`..`/`\`/drive prefix; length & nesting caps), **per-component
+symlink rejection** while creating parent dirs, and a **crash-atomic install** — a uniquely-named
+same-dir temp written with `O_CREAT|O_EXCL` (refuses a final-component symlink per POSIX), fsync'd,
+then `rename`d into place (atomic; replaces a destination symlink without following it; never a
+partial `dest`); no canonicalize-then-write. Idempotent for resume (byte-identical re-materialization
+is a no-op via a length-then-sha256 check; differing content is a conflict; a non-regular destination
+is refused). Per-language,
+sanitized file placement (`*.test.ts`, `src/test/java/...`, `test_*.py`, Rust `tests/`). The residual
+TOCTOU (a parent swapped between check and open) needs a concurrent local attacker — out of the threat
+model; full `openat`/`O_NOFOLLOW` dirfd traversal is the F7 hardening.
 
 ### 8 — Sandboxed execution (`jitgen-sandbox`)
 Runs the adapter's `test_command` under a **fail-closed** sandbox: untrusted execution **requires** an

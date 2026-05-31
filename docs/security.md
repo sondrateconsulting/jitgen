@@ -79,9 +79,19 @@ exfiltrate env".
 
 ### 4. Path traversal / symlink attacks (intake AND materialization)
 - Reads use repo **blobs** at pinned OIDs, not the working tree (avoids symlink/TOCTOU on intake).
-- Writes use **`openat`-style dirfd traversal** with `O_NOFOLLOW` on every component and `O_EXCL` for
-  new files, then **post-open `fstat`** to confirm regular-file + within the overlay device/inode
-  root. We do **not** rely on canonicalize-then-write (raceable; fails for not-yet-existing files).
+- **Materialization, F6 current guarantee** ([ADR-0011](decisions/0011-overlay-materialization.md)):
+  writes are confined to the overlay with pure-`std` (no `unsafe`) — lexical path validation (no
+  absolute/`..`/`\`/drive prefix; length & nesting caps), **per-component symlink rejection** when
+  creating parent dirs, an `O_CREAT|O_EXCL` temp write (refuses a final-component symlink per POSIX,
+  never overwrites), and an atomic `rename` into place (replaces a destination symlink without
+  following it). A non-regular destination (dir/FIFO/device) is refused; idempotency compares length
+  then sha256, never reading an oversized file. We do **not** canonicalize-then-write. **Residual
+  (deferred to F7):** the parent symlink check → final open and the existing-file stat → read are
+  TOCTOU windows that require a *concurrent local attacker* with overlay write access (out of the
+  threat model: the overlay is a private, single-process, sequentially-built dir).
+- **Materialization, F7 conformance requirement:** full `openat`-style dirfd traversal with
+  `O_NOFOLLOW` on every component and post-open `fstat` (regular-file + within the overlay
+  device/inode root), closing the above TOCTOU windows, plus preflight resource budgets.
 - The **state root** is a private `0700` directory **outside the repo** with **no symlink ancestors**;
   artifacts are addressed by **relative IDs**, not attacker-influenced absolute paths.
 

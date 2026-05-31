@@ -12,8 +12,8 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | ✅ complete | `11aaaae` | T1·S1·T2·T3·T4·T5 ✅ |
 | F3 | Git intake & diff analysis (overlay, path safety) | ✅ complete | `aa3bcf3` | T1·S1·T2·T3·T4·T5 ✅ |
 | F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ✅ complete | `9fe4de4` | T1·S1·T2·T3·T4 ✅ |
-| F5 | LLM provider abstraction + context packager | ✅ complete | `pending` | T1·S1·T2·T3·T4·T5·T6·T7 ✅ |
-| F6 | Candidate materialization & rendering (overlay-confined) | ⬜ | — | — |
+| F5 | LLM provider abstraction + context packager | ✅ complete | `e4ff52d` | T1·S1·T2·T3·T4·T5·T6·T7 ✅ |
+| F6 | Candidate materialization & rendering (overlay-confined) | ✅ complete | `pending` | T1·S1·T2·T3 ✅ |
 | F7 | Sandboxed execution & classification [MAX SCRUTINY] | ⬜ | — | — |
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ⬜ | — | — |
 | F9 | End-to-end CLI + exporters | ⬜ | — | — |
@@ -119,3 +119,14 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   heuristic, converged to uppercase-env-unconditional + line-anchored value-shape gating with a
   documented residual ([security.md](security.md)). cargo ~152 tests + bazel 12 targets green; all
   offline. Artifacts: [reviews/F5/](reviews/F5/).
+- 2026-05-30: **F6 complete.** `jitgen-materialize` (layer 7). Overlay-confined candidate
+  materialization with **no `unsafe`** ([ADR-0011](decisions/0011-overlay-materialization.md)):
+  lexical path validation + length/nesting caps, per-component symlink rejection, and a crash-atomic
+  install (unique-named same-dir temp `O_EXCL` → fsync → atomic `rename`), idempotent for resume
+  (length-then-sha256; non-regular destination refused). Per-language, sanitized, id-disambiguated
+  placement (`tests/jitgen_*`, `test_*_jitgen_<id>.py`, `<stem>.jitgen.<id>.test.<ts|tsx|js|…>`,
+  `src/test/java/<pkg>/<Stem>Jitgen<Id>Test.java` preserving module prefix & matching Surefire
+  discovery). Codex review **T1**·**S1**·**T2**·**T3** (clean final; 0 unresolved): **7 P3+ resolved**
+  — crash-atomicity, traversal-via-backslash, Java module-prefix/Surefire discovery, TS extension
+  family, py/ts collision, temp-cleanup-deletes-content, non-regular dest, resource caps. cargo ~173
+  tests + bazel 12 targets green; all offline. Artifacts: [reviews/F6/](reviews/F6/).

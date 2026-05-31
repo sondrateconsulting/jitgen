@@ -378,6 +378,8 @@ name = "jitgen-materialize"
 version = "0.1.0"
 dependencies = [
  "jitgen-core",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
