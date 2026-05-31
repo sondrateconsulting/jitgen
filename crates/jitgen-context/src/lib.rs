@@ -1,26 +1,14 @@
 #![forbid(unsafe_code)]
-//! `jitgen-context` — Context builder / prompt packager (bounded, redacted). Pipeline layer 5.
+//! `jitgen-context` — context builder / prompt packager (pipeline layer 5).
 //!
-//! Skeleton established in F1; functionality is implemented in later foundational phases.
-//! See `docs/architecture.md` and `docs/implementation-plan.md`.
+//! Assembles a **bounded, redacted** [`jitgen_core::ContextBundle`] for a target and renders an
+//! **injection-resistant** prompt (untrusted repo content fenced as data). Secret redaction
+//! ([`redact`]) is reused by later layers before any send/log/persist. See `docs/security.md`.
 
-/// Stable identifier for this pipeline layer/crate.
-pub fn layer_id() -> &'static str {
-    "jitgen-context"
-}
+mod packager;
+mod prompt;
+mod redact;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn layer_id_matches_crate_name() {
-        assert_eq!(layer_id(), "jitgen-context");
-    }
-
-    #[test]
-    fn links_against_core_contract() {
-        // Proves the intra-workspace dependency on jitgen-core compiles & links.
-        assert!(!jitgen_core::version().is_empty());
-    }
-}
+pub use packager::ContextBuilder;
+pub use prompt::{render_prompt, Prompt};
+pub use redact::{redact, Redaction};

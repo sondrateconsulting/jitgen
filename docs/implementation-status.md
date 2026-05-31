@@ -11,8 +11,8 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F1 | Monorepo scaffold (Bazel Bzlmod + Rust workspace + skeletons) | ✅ complete | `2a10058` | T1·S1·T2·T3 ✅ |
 | F2 | Core domain, config (.jitgen.yaml), SQLite state, `doctor` | ✅ complete | `11aaaae` | T1·S1·T2·T3·T4·T5 ✅ |
 | F3 | Git intake & diff analysis (overlay, path safety) | ✅ complete | `aa3bcf3` | T1·S1·T2·T3·T4·T5 ✅ |
-| F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ✅ complete | _(this commit)_ | T1·S1·T2·T3·T4 ✅ |
-| F5 | LLM provider abstraction + context packager | ⬜ | — | — |
+| F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ✅ complete | `9fe4de4` | T1·S1·T2·T3·T4 ✅ |
+| F5 | LLM provider abstraction + context packager | ✅ complete | `pending` | T1·S1·T2·T3·T4·T5·T6·T7 ✅ |
 | F6 | Candidate materialization & rendering (overlay-confined) | ⬜ | — | — |
 | F7 | Sandboxed execution & classification [MAX SCRUTINY] | ⬜ | — | — |
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ⬜ | — | — |
@@ -105,3 +105,17 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   resolved** incl. generic-id collision, untrusted-source/glob DoS (iterative walks + caps + parse
   timeout). cargo ~109 tests + bazel 12 targets green (4 grammars compile C via crate_universe).
   Artifacts: [reviews/F4/](reviews/F4/).
+- 2026-05-30: **F5 complete.** `jitgen-context` (layer 5) + `jitgen-llm` (layer 6). Context: secret
+  **redaction** (`redact`: known token formats + URL creds + quoted/env/line-anchored config
+  assignments, value-shape-gated to avoid corrupting code; size-bounded, fail-closed at the window
+  edge), bounded **packager** (per-file/​max-files/​token budget, UTF-8-safe truncation reserving the
+  marker, empty-drop, redaction flag), injection-resistant **prompt** rendering (untrusted content
+  fenced + labeled DATA, strict-slug metadata, redacted/​capped/​count-bounded hints, non-leaking
+  `Debug`). LLM: synchronous `LlmProvider` trait (ADR-0008 deviation), deterministic offline
+  **MockProvider** (no keys/network), deferred real providers (trusted-config-only, `NotEnabled`),
+  candidate **parser** (line-aware fence extraction, byte-capped) + static **validator** (heuristic
+  tripwire; sandbox is the real boundary). Codex review **T1**·**S1**·**T2**·**T3**·**T4**·**T5**·
+  **T6**·**T7** (review cap; 0 unresolved): **12 P3+ resolved** — most on the redaction FP/FN
+  heuristic, converged to uppercase-env-unconditional + line-anchored value-shape gating with a
+  documented residual ([security.md](security.md)). cargo ~152 tests + bazel 12 targets green; all
+  offline. Artifacts: [reviews/F5/](reviews/F5/).

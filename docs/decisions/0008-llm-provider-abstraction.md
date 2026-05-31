@@ -12,7 +12,13 @@ prompts).
 
 ## Decision
 
-Define an async `LlmProvider` trait. Implementations:
+> **F5 deviation (sync trait):** the trait is implemented **synchronous**, not async. jitgen is a
+> CLI batch tool that drives a bounded loop; a sync trait avoids a `tokio` runtime dependency, and
+> real providers use **blocking** HTTP. Redaction (regex via the linear-time `regex` crate, no
+> catastrophic backtracking) runs before any send/log. This is the defensible choice for a CLI;
+> revisit if concurrency across many targets is later required.
+
+Define an `LlmProvider` trait. Implementations:
 
 - **`MockProvider` (default):** deterministic, offline, seeded by a hash of the request. Returns
   canned-but-structured candidate tests so the full loop (generate → materialize → run → classify →

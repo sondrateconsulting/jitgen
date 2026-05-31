@@ -8,3 +8,5 @@ description = "Context builder / prompt packager (bounded, redacted). Pipeline l
 
 [dependencies]
 jitgen-core.workspace = true
+regex.workspace = true
+thiserror.workspace = true

@@ -333,6 +333,8 @@ name = "jitgen-context"
 version = "0.1.0"
 dependencies = [
  "jitgen-core",
+ "regex",
+ "thiserror",
 ]
 
 [[package]]
@@ -366,7 +368,9 @@ dependencies = [
 name = "jitgen-llm"
 version = "0.1.0"
 dependencies = [
+ "jitgen-context",
  "jitgen-core",
+ "thiserror",
 ]
 
 [[package]]

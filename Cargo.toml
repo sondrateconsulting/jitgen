@@ -35,6 +35,8 @@ tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-java = "0.23"
 tree-sitter-typescript = "0.23"
+# Linear-time regex (RE2-style; no catastrophic backtracking) for secret redaction over untrusted text.
+regex = "1.11"
 
 # Intra-workspace (path-based).
 jitgen-core = { path = "crates/jitgen-core" }

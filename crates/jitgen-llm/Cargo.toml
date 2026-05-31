@@ -8,3 +8,5 @@ description = "LLM provider abstraction with a deterministic mock. Pipeline laye
 
 [dependencies]
 jitgen-core.workspace = true
+jitgen-context.workspace = true
+thiserror.workspace = true

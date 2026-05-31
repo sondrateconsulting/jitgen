@@ -174,3 +174,25 @@ These MUST exist and pass before the relevant phase is complete (built security-
   and recorded. macOS `sandbox-exec` is Apple-deprecated though functional. Redaction is heuristic
   (minimize context + exclude secret files; cannot guarantee zero leakage of novel secret formats).
   Real-LLM mode is opt-in and off by default.
+- **Secret redaction heuristic (F5, `jitgen-context::redact`):** runs before any prompt/log/report
+  on a **size-bounded** input window (256 KiB/item, with a fail-closed drop of a window-split
+  trailing token), using the linear-time `regex` engine (no catastrophic backtracking). It covers
+  known token formats (AWS, GitHub classic/`github_pat_`, GitLab, Slack token/app/webhook, Google
+  key/OAuth, OpenAI `sk-`, npm, JWT, PEM, bearer, basic-auth), `scheme://user:pass@` URL
+  credentials, quoted secret-key assignments, unquoted high-confidence env assignments
+  (`API_KEY=…`), and line-anchored config assignments (`password=…`, `api_key: …`, `secret.key=…`,
+  CRLF, base64 padding). For *unquoted* config assignments the value-shape gate (`looks_like_secret`)
+  redacts a value (≥12 chars) that has a digit or base64 special, or is an all-lowercase run with no
+  `_`/`-` separators and ≥16 chars (passphrase). **Residual:** an unquoted value that has uppercase
+  but no digit/base64 (looks CamelCase), or contains `_`/`-` separators with no digit/base64 (looks
+  snake/kebab), or is an all-lowercase run shorter than 16 chars, is indistinguishable from a code
+  identifier and is **not** redacted via the unquoted path — the dual being that a real secret of
+  those exact shapes is not caught. Relatedly, the *unanchored* matcher that scans mid-line text
+  (logs/feedback) is restricted to uppercase-style keys (`API_KEY=…`), so a **mid-line, lowercase
+  compound-key** secret (`… api_key=secret123 …` not at line start) is a documented false-negative;
+  line-start config assignments of those keys are still caught. This is the irreducible
+  false-positive/false-negative tradeoff of a regex heuristic, chosen to avoid corrupting the ordinary
+  code the model must read. Quoted values and all known token formats are unaffected, and the primary
+  guarantees stand independently — **API keys are read only from the trusted-named env var (never repo
+  config/logs), model output is never executed, and execution is sandboxed** (threats #1/#3,
+  ADR-0008/0010). Reviewed across F5/S1·T2·T3·T4·T5·T6·T7.
