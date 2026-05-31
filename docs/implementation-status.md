@@ -14,7 +14,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ✅ complete | `9fe4de4` | T1·S1·T2·T3·T4 ✅ |
 | F5 | LLM provider abstraction + context packager | ✅ complete | `e4ff52d` | T1·S1·T2·T3·T4·T5·T6·T7 ✅ |
 | F6 | Candidate materialization & rendering (overlay-confined) | ✅ complete | `039a80a` | T1·S1·T2·T3 ✅ |
-| F7 | Sandboxed execution & classification [MAX SCRUTINY] | ⬜ | — | — |
+| F7 | Sandboxed execution & classification [MAX SCRUTINY] | 🟦 in_progress | — | — |
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ⬜ | — | — |
 | F9 | End-to-end CLI + exporters | ⬜ | — | — |
 | F10 | Hardening, audits, docs, packaging, mid-run resume test | ⬜ | — | — |
@@ -130,3 +130,18 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   — crash-atomicity, traversal-via-backslash, Java module-prefix/Surefire discovery, TS extension
   family, py/ts collision, temp-cleanup-deletes-content, non-regular dest, resource caps. cargo ~173
   tests + bazel 12 targets green; all offline. Artifacts: [reviews/F6/](reviews/F6/).
+- 2026-05-31: **F7 in progress — Stage 1 (construction only; nothing is spawned).** `jitgen-sandbox`
+  (layer 8): fail-closed backend **selection** (`select`/`os_candidates`; constrained-local never
+  auto-selected), a hardcoded **env allowlist** (`build_env`: synthetic `HOME`/`TMPDIR`/`TERM`,
+  baseline passthrough with filtered `PATH`, credential/socket **deny-patterns that beat allow**), a
+  sandbox-local **`SpawnRequest`** (so the security-critical crate does **not** depend on
+  `jitgen-adapters`/tree-sitter), deterministic **per-backend launcher argv** (`build_plan`:
+  sandbox-exec+SBPL, Docker/Podman `--network=none --read-only --cap-drop ALL` with digest-pinned
+  image, bwrap `--unshare-all --clearenv`, firejail `--net=none`+rlimits, constrained-local), and the
+  macOS **SBPL** generator (`(deny default)`+`(deny network*)`, writes confined to overlay/tmp).
+  Trusted-only `ExecPolicy`. cwd validated (no `..`/`\`/abs); `shell:true` trusted-gated. **Deferred
+  to Stage 2:** detection probes, spawning + std-only watchdog timeout/process-group teardown, output
+  caps, `jitgen_context::redact` on captured output, exit→`ExecOutcome` classification, and the
+  security **conformance suite** + the security-first (S1) Codex review protocol. 40 sandbox unit
+  tests; `./scripts/check.sh` green (cargo + bazel `--lockfile_mode=error`). Added `thiserror` to the
+  crate (Bazel `crate_universe` re-pinned). No `unsafe`. **F7 is NOT complete.**

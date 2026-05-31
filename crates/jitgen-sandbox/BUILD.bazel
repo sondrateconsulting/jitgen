@@ -2,5 +2,8 @@ load("//bazel:defs.bzl", "jitgen_rust_library")
 
 jitgen_rust_library(
     name = "jitgen-sandbox",
-    deps = ["//crates/jitgen-core"],
+    deps = [
+        "//crates/jitgen-core",
+        "@crates//:thiserror",
+    ],
 )
