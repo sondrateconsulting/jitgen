@@ -6,14 +6,14 @@
 //!
 //! ```text
 //! cargo test -p jitgen-sandbox --test conformance -- --ignored --test-threads=1
-//! # Docker gate also needs a digest-pinned local image:
-//! JITGEN_TEST_DOCKER_IMAGE=alpine@sha256:... cargo test -p jitgen-sandbox --test conformance -- --ignored
+//! # Docker gates also need a digest-pinned local image (we never pull during a test):
+//! JITGEN_TEST_DOCKER_IMAGE=name@sha256:... cargo test -p jitgen-sandbox --test conformance -- --ignored
 //! ```
 //!
 //! Only the crate's public API is used (these run as a separate integration binary).
 
 use jitgen_core::{ExecOutcome, ExecutionResult, SandboxBackend};
-use jitgen_sandbox::{Backend, ExecPolicy, RunRequest, Sandbox, SpawnRequest};
+use jitgen_sandbox::{current_uid_gid, Backend, ExecPolicy, RunRequest, Sandbox, SpawnRequest};
 use std::path::{Path, PathBuf};
 
 /// A temp overlay+state pair that cleans up on drop. Paths are canonicalized so the SBPL write
@@ -46,14 +46,52 @@ impl Drop for Fixture {
 }
 
 fn exec(sb: &Sandbox, cmd: &SpawnRequest, fx: &Fixture) -> ExecutionResult {
+    exec_as(sb, cmd, fx, None)
+}
+
+fn exec_as(
+    sb: &Sandbox,
+    cmd: &SpawnRequest,
+    fx: &Fixture,
+    run_as: Option<&str>,
+) -> ExecutionResult {
     sb.run(&RunRequest {
         command: cmd,
         overlay_root: &fx.overlay,
         state_root: &fx.state,
         instance: "conf",
-        run_as: None,
+        run_as,
     })
     .unwrap()
+}
+
+/// Resolve a digest-pinned image from the env, or skip. Enforces `@sha256:` so the test never pulls
+/// or runs a floating tag (matches the production `FloatingImageTag` guard).
+fn docker_test_image() -> Option<String> {
+    match std::env::var("JITGEN_TEST_DOCKER_IMAGE") {
+        Ok(v) if v.contains("@sha256:") => Some(v),
+        Ok(v) if !v.is_empty() => {
+            eprintln!("SKIP docker test: JITGEN_TEST_DOCKER_IMAGE={v:?} is not digest-pinned");
+            None
+        }
+        _ => {
+            eprintln!("SKIP docker test: set JITGEN_TEST_DOCKER_IMAGE=<name@sha256:...>");
+            None
+        }
+    }
+}
+
+fn docker_sandbox(image: String) -> Option<Sandbox> {
+    if !jitgen_sandbox::detect().contains(&Backend::Docker) {
+        eprintln!("SKIP docker test: docker daemon not available");
+        return None;
+    }
+    let policy = ExecPolicy {
+        backend: SandboxBackend::Docker,
+        docker_image: Some(image),
+        ..ExecPolicy::default()
+    };
+    Some(Sandbox::new(&[Backend::Docker], policy).unwrap())
 }
 
 fn sandbox_exec() -> Sandbox {

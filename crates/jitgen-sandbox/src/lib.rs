@@ -29,6 +29,7 @@ mod run;
 mod sandbox;
 mod sbpl;
 mod spawn;
+mod user;
 
 pub use backend::{os_candidates, select, Backend, Tier};
 pub use command::{build_plan, PlanInput, SandboxPlan};
@@ -39,7 +40,8 @@ pub use policy::{ExecPolicy, ResourceLimits, DEFAULT_OUTPUT_CAP_BYTES, DEFAULT_T
 pub use run::run;
 pub use sandbox::{RunRequest, Sandbox};
 pub use sbpl::render_profile;
-pub use spawn::SpawnRequest;
+pub use spawn::{BuildSignal, SpawnRequest};
+pub use user::current_uid_gid;
 
 /// Stable identifier for this pipeline layer/crate.
 pub fn layer_id() -> &'static str {

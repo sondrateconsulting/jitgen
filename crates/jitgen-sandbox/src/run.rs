@@ -13,6 +13,7 @@ use crate::classify::{classify, Disposition};
 use crate::command::SandboxPlan;
 use crate::error::{Result, SandboxError};
 use crate::policy::ExecPolicy;
+use crate::spawn::BuildSignal;
 use jitgen_core::ExecutionResult;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -64,9 +65,12 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
         exit_code: status.code(),
         signal: exit_signal(&status),
         timed_out,
-        // Build-vs-test discrimination (compile failure → BuildError) is a follow-up refinement;
-        // for now a nonzero test-runner exit is classified as Failed.
-        build_failed: false,
+        build_failed: detect_build_failure(
+            &plan.build_signal,
+            status.code(),
+            &stdout_raw,
+            &stderr_raw,
+        ),
     };
 
     Ok(ExecutionResult {
@@ -99,6 +103,34 @@ fn wait_with_timeout(
         }
         thread::sleep(POLL);
     }
+}
+
+/// Decide whether a finished run looks like a **build/compile** failure (vs a test-assertion
+/// failure), from the adapter-provided [`BuildSignal`]. Only meaningful on a nonzero normal exit — a
+/// signal/timeout (`code == None`) is classified upstream as Errored/Timeout, not BuildError.
+/// Markers are matched on the raw (pre-redaction) output; the result is a bool, so nothing leaks.
+fn detect_build_failure(
+    signal: &BuildSignal,
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> bool {
+    let Some(c) = code else { return false };
+    if c == 0 {
+        return false;
+    }
+    if signal.exit_codes.contains(&c) {
+        return true;
+    }
+    if signal.markers.is_empty() {
+        return false;
+    }
+    let out = String::from_utf8_lossy(stdout);
+    let err = String::from_utf8_lossy(stderr);
+    signal
+        .markers
+        .iter()
+        .any(|m| out.contains(m.as_str()) || err.contains(m.as_str()))
 }
 
 /// Lossily decode and redact captured output before it leaves the crate.
@@ -228,6 +260,14 @@ mod tests {
                 container_name: None,
                 cleanup: None,
                 new_process_group: true,
+                build_signal: BuildSignal::default(),
+            }
+        }
+
+        fn sh_plan_with_signal(script: &str, build_signal: BuildSignal) -> SandboxPlan {
+            SandboxPlan {
+                build_signal,
+                ..sh_plan(script)
             }
         }
 
@@ -273,6 +313,40 @@ mod tests {
         }
 
         #[test]
+        fn build_marker_in_output_yields_build_error() {
+            let signal = BuildSignal {
+                exit_codes: vec![],
+                markers: vec!["could not compile".into()],
+            };
+            let plan = sh_plan_with_signal("echo 'error: could not compile foo'; exit 101", signal);
+            let r = run(&plan, &ExecPolicy::default()).unwrap();
+            assert_eq!(r.outcome, ExecOutcome::BuildError);
+        }
+
+        #[test]
+        fn build_exit_code_yields_build_error() {
+            let signal = BuildSignal {
+                exit_codes: vec![2],
+                markers: vec![],
+            };
+            let plan = sh_plan_with_signal("exit 2", signal);
+            let r = run(&plan, &ExecPolicy::default()).unwrap();
+            assert_eq!(r.outcome, ExecOutcome::BuildError);
+        }
+
+        #[test]
+        fn nonbuild_failure_without_markers_stays_failed() {
+            let signal = BuildSignal {
+                exit_codes: vec![2],
+                markers: vec!["could not compile".into()],
+            };
+            // Exit 1, no marker in output → an ordinary test failure, not a build error.
+            let plan = sh_plan_with_signal("echo 'assertion failed'; exit 1", signal);
+            let r = run(&plan, &ExecPolicy::default()).unwrap();
+            assert_eq!(r.outcome, ExecOutcome::Failed);
+        }
+
+        #[test]
         fn runaway_process_times_out_and_is_killed() {
             // Busy loop uses only shell builtins (no PATH needed) so this tests the watchdog, not
             // command resolution. A short budget; the run must return well before the loop would end.
@@ -286,6 +360,48 @@ mod tests {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "watchdog did not kill the runaway promptly"
+            );
+        }
+
+        #[test]
+        fn rlimit_preamble_caps_cpu_time_end_to_end() {
+            use crate::command::{build_plan, PlanInput};
+            use crate::policy::{ExecPolicy, ResourceLimits};
+            use crate::spawn::SpawnRequest;
+
+            // Build a real constrained-local plan with a 1-CPU-second limit (so the rlimit preamble
+            // — not the wall-clock watchdog — does the killing) and a busy loop. The preamble's
+            // `ulimit -t 1` must fire (SIGXCPU) within a few wall-clock seconds; the watchdog timeout
+            // is left at its 120s default so it cannot be what stops the run.
+            let overlay = std::env::temp_dir();
+            let policy = ExecPolicy {
+                limits: ResourceLimits {
+                    cpu_seconds: 1,
+                    ..ResourceLimits::default()
+                },
+                ..ExecPolicy::default()
+            };
+            let req = SpawnRequest::argv("/bin/sh", ["-c".into(), "while :; do :; done".into()]);
+            let plan = build_plan(PlanInput {
+                backend: Backend::ConstrainedLocal,
+                req: &req,
+                overlay_root: &overlay,
+                synthetic_tmp: &overlay,
+                env: BTreeMap::new(),
+                policy: &policy,
+                instance: "cpulimit",
+                run_as: None,
+            })
+            .unwrap();
+            let start = Instant::now();
+            let r = run(&plan, &policy).unwrap();
+            // SIGXCPU terminates by signal → no normal exit code → Errored (a resource kill, distinct
+            // from the wall-clock Timeout). The point is it was stopped by the limit, fast.
+            assert_eq!(r.exit_code, None, "expected signal kill, got {r:?}");
+            assert_eq!(r.outcome, ExecOutcome::Errored, "got {r:?}");
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "CPU rlimit did not stop the spinner promptly"
             );
         }
     }

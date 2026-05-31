@@ -11,9 +11,9 @@
 
 use crate::backend::Backend;
 use crate::error::{Result, SandboxError};
-use crate::policy::ExecPolicy;
+use crate::policy::{ExecPolicy, ResourceLimits};
 use crate::sbpl;
-use crate::spawn::SpawnRequest;
+use crate::spawn::{BuildSignal, SpawnRequest};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -39,6 +39,8 @@ pub struct SandboxPlan {
     /// Spawn the child in a fresh process group so the whole tree can be signalled on timeout
     /// (true for direct-spawn tiers; false for container backends, which are torn down via cleanup).
     pub new_process_group: bool,
+    /// Build-vs-test classification hints, applied to the captured output by the runtime.
+    pub build_signal: BuildSignal,
 }
 
 /// Inputs to [`build_plan`]. Grouped into a struct to keep the call site readable.
@@ -118,22 +120,65 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
     }
 }
 
+/// Wrap an inner argv in a `/bin/sh` preamble that applies **best-effort** rlimits and then `exec`s
+/// the real command. Used only for tiers with no native rlimit mechanism (sandbox-exec, bwrap,
+/// constrained-local); firejail uses `--rlimit-*` and containers use cgroup flags.
+///
+/// The untrusted argv is passed as positional parameters and re-exec'd via `exec "$@"`, so it is
+/// **never** parsed by the shell — this adds no command-injection surface (the shell script is a fixed
+/// jitgen-authored string). What it enforces:
+/// - **CPU time** (`ulimit -t`, seconds): unambiguous across `sh` implementations and verified to fire
+///   (SIGXCPU) including under `sandbox-exec`. Bounds runaway compute.
+/// - **Address space** (`ulimit -v`, KiB): best-effort — enforced on Linux; macOS does not enforce
+///   `RLIMIT_AS`. Guarded so an unsupported flag never aborts the run.
+///
+/// **Process count is deliberately NOT set.** `RLIMIT_NPROC`/`ulimit -u` is per-real-UID, not
+/// per-process-tree: a per-run cap either fails outright on a busy host (observed on macOS) or fails
+/// to constrain a single run. The container `--pids-limit` is the real fork-bomb control
+/// (see `docs/security.md`). The wall-clock timeout is the cross-tier backstop.
+fn with_rlimit_preamble(inner: Vec<String>, limits: &ResourceLimits) -> Vec<String> {
+    let script = format!(
+        "ulimit -t {} 2>/dev/null || true; ulimit -v {} 2>/dev/null || true; exec \"$@\"",
+        limits.cpu_seconds,
+        limits.address_space_bytes / 1024,
+    );
+    let mut v = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        script,
+        // `$0` for the exec'd shell; purely cosmetic (appears as the program name).
+        "jitgen-sandbox".to_string(),
+    ];
+    v.extend(inner);
+    v
+}
+
 /// Build the concrete, ready-to-spawn plan for the chosen backend.
 pub fn build_plan(input: PlanInput) -> Result<SandboxPlan> {
     validate_instance(input.instance)?;
     let cwd = validated_cwd(input.overlay_root, &input.req.cwd_rel)?;
-    let inner = inner_argv(input.req, input.policy)?;
+    let mut inner = inner_argv(input.req, input.policy)?;
     // `inner_argv` always yields at least the program, but make downstream indexing provably safe.
     if inner.is_empty() {
         return Err(SandboxError::EmptyCommand);
     }
-    match input.backend {
-        Backend::SandboxExec => plan_sandbox_exec(&input, cwd, inner),
-        Backend::Bwrap => Ok(plan_bwrap(&input, cwd, inner)),
-        Backend::Firejail => Ok(plan_firejail(&input, cwd, inner)),
-        Backend::Docker | Backend::Podman => plan_container(&input, cwd, inner),
-        Backend::ConstrainedLocal => Ok(plan_local(&input, cwd, inner)),
+    // Best-effort rlimits for tiers with no native mechanism (no-op for firejail/containers).
+    if matches!(
+        input.backend,
+        Backend::SandboxExec | Backend::Bwrap | Backend::ConstrainedLocal
+    ) {
+        inner = with_rlimit_preamble(inner, &input.policy.limits);
     }
+    let mut plan = match input.backend {
+        Backend::SandboxExec => plan_sandbox_exec(&input, cwd, inner)?,
+        Backend::Bwrap => plan_bwrap(&input, cwd, inner),
+        Backend::Firejail => plan_firejail(&input, cwd, inner),
+        Backend::Docker | Backend::Podman => plan_container(&input, cwd, inner)?,
+        Backend::ConstrainedLocal => plan_local(&input, cwd, inner),
+    };
+    // Carry the adapter's build-vs-test hints to the runtime (set centrally, not per-backend).
+    plan.build_signal = input.req.build_signal.clone();
+    Ok(plan)
 }
 
 fn plan_sandbox_exec(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result<SandboxPlan> {
@@ -149,6 +194,7 @@ fn plan_sandbox_exec(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Res
         container_name: None,
         cleanup: None,
         new_process_group: true,
+        build_signal: BuildSignal::default(),
     })
 }
 
@@ -190,6 +236,7 @@ fn plan_bwrap(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPla
         container_name: None,
         cleanup: None,
         new_process_group: true,
+        build_signal: BuildSignal::default(),
     }
 }
 
@@ -222,6 +269,7 @@ fn plan_firejail(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Sandbox
         container_name: None,
         cleanup: None,
         new_process_group: true,
+        build_signal: BuildSignal::default(),
     }
 }
 
@@ -309,6 +357,7 @@ fn plan_container(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result
         container_name: Some(name),
         cleanup: Some(cleanup),
         new_process_group: false,
+        build_signal: BuildSignal::default(),
     })
 }
 
@@ -327,6 +376,7 @@ fn plan_local(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPla
         container_name: None,
         cleanup: None,
         new_process_group: true,
+        build_signal: BuildSignal::default(),
     }
 }
 
@@ -392,8 +442,11 @@ mod tests {
         assert_eq!(plan.program, "sandbox-exec");
         assert_eq!(plan.args[0], "-p");
         assert!(plan.args[1].contains("(deny network*)"));
-        // Inner command appears after the profile.
-        assert_eq!(&plan.args[2..], &["cargo", "test", "--quiet"]);
+        // The rlimit preamble wraps the inner command, which still appears as the argv tail.
+        assert!(plan.args.iter().any(|a| a.contains("ulimit -t")));
+        assert!(plan
+            .args
+            .ends_with(&["cargo".into(), "test".into(), "--quiet".into()]));
         assert!(plan.new_process_group);
     }
 
@@ -472,9 +525,14 @@ mod tests {
         assert_eq!(plan.program, "bwrap");
         assert!(plan.args.contains(&"--unshare-all".to_string()));
         assert!(plan.args.contains(&"--clearenv".to_string()));
-        // The inner command is the argv tail after `--`.
+        // After `--`, bwrap runs the rlimit-preamble shell, which execs the inner command (tail).
         let dd = plan.args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&plan.args[dd + 1..], &["cargo", "test", "--quiet"]);
+        let after = &plan.args[dd + 1..];
+        assert_eq!(after.first().map(String::as_str), Some("/bin/sh"));
+        assert!(after.iter().any(|a| a.contains("ulimit -t")));
+        assert!(plan
+            .args
+            .ends_with(&["cargo".into(), "test".into(), "--quiet".into()]));
     }
 
     #[test]
@@ -507,8 +565,42 @@ mod tests {
             ..ExecPolicy::default()
         };
         let plan = build_plan(input(Backend::SandboxExec, &r, &policy)).unwrap();
-        // Inner becomes `/bin/sh -c "echo hi"`.
-        assert_eq!(&plan.args[2..], &["/bin/sh", "-c", "echo hi"]);
+        // Inner becomes `/bin/sh -c "echo hi"`, then wrapped by the rlimit preamble — so the trusted
+        // shell invocation is the argv tail.
+        assert!(plan
+            .args
+            .ends_with(&["/bin/sh".into(), "-c".into(), "echo hi".into()]));
+    }
+
+    #[test]
+    fn firejail_and_docker_are_not_preamble_wrapped() {
+        // firejail has --rlimit-*; containers use cgroup flags — neither gets the shell preamble.
+        let r = req();
+        let fj = build_plan(input(Backend::Firejail, &r, &ExecPolicy::default())).unwrap();
+        assert!(!fj.args.iter().any(|a| a.contains("ulimit -t")));
+        assert!(fj
+            .args
+            .ends_with(&["cargo".into(), "test".into(), "--quiet".into()]));
+
+        let policy = ExecPolicy {
+            backend: jitgen_core::SandboxBackend::Docker,
+            docker_image: Some("img@sha256:abc".into()),
+            ..ExecPolicy::default()
+        };
+        let dk = build_plan(input(Backend::Docker, &r, &policy)).unwrap();
+        assert!(!dk.args.iter().any(|a| a.contains("ulimit -t")));
+    }
+
+    #[test]
+    fn build_signal_is_carried_into_the_plan() {
+        let signal = BuildSignal {
+            exit_codes: vec![2],
+            markers: vec!["could not compile".into()],
+        };
+        let r = req().with_build_signal(signal.clone());
+        let plan =
+            build_plan(input(Backend::ConstrainedLocal, &r, &ExecPolicy::default())).unwrap();
+        assert_eq!(plan.build_signal, signal);
     }
 
     #[test]
@@ -516,8 +608,13 @@ mod tests {
         let r = req();
         let policy = ExecPolicy::default();
         let plan = build_plan(input(Backend::ConstrainedLocal, &r, &policy)).unwrap();
-        assert_eq!(plan.program, "cargo");
-        assert_eq!(plan.args, vec!["test", "--quiet"]);
+        // The local tier has no native limits, so it runs under the rlimit-preamble shell; the real
+        // command is the argv tail.
+        assert_eq!(plan.program, "/bin/sh");
+        assert!(plan.args.iter().any(|a| a.contains("ulimit -t")));
+        assert!(plan
+            .args
+            .ends_with(&["cargo".into(), "test".into(), "--quiet".into()]));
         assert!(plan.new_process_group);
         assert!(plan.cleanup.is_none());
     }
