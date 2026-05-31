@@ -34,13 +34,29 @@ pub struct RunRequest<'a> {
 pub struct Sandbox {
     backend: Backend,
     policy: ExecPolicy,
+    warnings: Vec<String>,
 }
 
 impl Sandbox {
     /// Select a backend fail-closed from the detected-available set.
     pub fn new(available: &[Backend], policy: ExecPolicy) -> Result<Self> {
         let backend = select(available, &policy)?;
-        Ok(Self { backend, policy })
+        // Surface (don't swallow) any trusted `env_allowlist_extra` entries the deny-patterns refuse.
+        let warnings = policy
+            .env_allowlist_extra
+            .iter()
+            .filter(|n| crate::env::is_denied(n))
+            .map(|n| {
+                format!(
+                    "env_allowlist_extra {n:?} ignored: matches a credential/socket deny-pattern"
+                )
+            })
+            .collect();
+        Ok(Self {
+            backend,
+            policy,
+            warnings,
+        })
     }
 
     /// Detect available backends on this host and select one (fail-closed).
@@ -53,19 +69,24 @@ impl Sandbox {
         self.backend
     }
 
+    /// Operator-facing, non-fatal warnings from policy resolution (e.g. `env_allowlist_extra` entries
+    /// refused by the credential deny-patterns). Surfaced so a misconfiguration isn't silently dropped.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     /// Build the env + plan and execute, returning a redacted/capped/classified result.
     pub fn run(&self, req: &RunRequest) -> Result<ExecutionResult> {
-        if !req.overlay_root.is_absolute() {
-            return Err(SandboxError::NonAbsolutePath(
-                req.overlay_root.display().to_string(),
-            ));
-        }
-        // Synthetic, jitgen-owned, writable locations. Both live INSIDE the overlay so they fall
-        // within every backend's write-confinement (the SBPL / container bind only permit writes
-        // under the overlay); they are ephemeral with it. `state_root` is still used to keep its
-        // entries off the child `PATH` (see `build_env`).
-        let home = req.overlay_root.join(".jitgen-home");
-        let tmp = req.overlay_root.join(".jitgen-tmp");
+        // Canonicalize the overlay + state roots so the SBPL `subpath` / container bind paths match
+        // the kernel-resolved path (macOS `/tmp`→`/private/tmp`) and PATH filtering compares real
+        // paths. `canonicalize` also yields absolute paths and requires both roots to already exist.
+        let overlay_root = req.overlay_root.canonicalize().map_err(SandboxError::Io)?;
+        let state_root = req.state_root.canonicalize().map_err(SandboxError::Io)?;
+
+        // Synthetic, jitgen-owned, writable locations INSIDE the overlay (within every backend's
+        // write-confinement); ephemeral with it. `state_root` keeps its entries off the child `PATH`.
+        let home = overlay_root.join(".jitgen-home");
+        let tmp = overlay_root.join(".jitgen-tmp");
         std::fs::create_dir_all(&home).map_err(SandboxError::Io)?;
         std::fs::create_dir_all(&tmp).map_err(SandboxError::Io)?;
 
@@ -74,13 +95,13 @@ impl Sandbox {
             &self.policy,
             &home,
             &tmp,
-            req.overlay_root,
-            req.state_root,
+            &overlay_root,
+            &state_root,
         );
         let plan = build_plan(PlanInput {
             backend: self.backend,
             req: req.command,
-            overlay_root: req.overlay_root,
+            overlay_root: &overlay_root,
             synthetic_tmp: &tmp,
             env,
             policy: &self.policy,
@@ -103,6 +124,25 @@ mod tests {
             Sandbox::new(&[], ExecPolicy::default()),
             Err(SandboxError::NoIsolationAvailable)
         ));
+    }
+
+    #[test]
+    fn denied_env_allowlist_extra_is_surfaced_as_a_warning() {
+        let policy = ExecPolicy {
+            backend: SandboxBackend::SandboxExec,
+            env_allowlist_extra: vec!["AWS_SECRET_ACCESS_KEY".into(), "CI".into()],
+            ..ExecPolicy::default()
+        };
+        let sb = Sandbox::new(&[Backend::SandboxExec], policy).unwrap();
+        assert!(
+            sb.warnings()
+                .iter()
+                .any(|w| w.contains("AWS_SECRET_ACCESS_KEY")),
+            "denied extra should surface: {:?}",
+            sb.warnings()
+        );
+        // A clean entry produces no warning.
+        assert!(!sb.warnings().iter().any(|w| w.contains("\"CI\"")));
     }
 
     #[cfg(unix)]

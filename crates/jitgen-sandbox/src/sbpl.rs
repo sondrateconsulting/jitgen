@@ -14,6 +14,15 @@ use std::path::Path;
 ///
 /// Both paths must be absolute (the caller canonicalizes them); a relative path is rejected rather
 /// than silently producing an unconfined profile.
+///
+/// SECURITY: `(allow file-read*)` and `(allow mach-lookup)` are intentionally broad — toolchains and
+/// shared libraries load from paths not statically known, and required Mach service names are
+/// toolchain-version dependent. A sandboxed process can therefore *read* any host file its Unix
+/// credentials permit (`~/.aws/credentials`, `~/.ssh/id_rsa`, …). The primary mitigation is
+/// `(deny network*)` (no exfiltration path); secondary is stdout/stderr redaction; tertiary is the
+/// synthetic `HOME`. `(allow process-fork)` is unbounded: macOS SBPL has no process-count primitive
+/// and a `setrlimit` pre-exec would require `unsafe`, so the wall-clock timeout is the only fork-bomb
+/// backstop on this backend — see `docs/security.md` (F7 resource-limit residual).
 pub fn render_profile(overlay: &Path, tmp: &Path) -> Result<String> {
     let overlay = abs(overlay)?;
     let tmp = abs(tmp)?;

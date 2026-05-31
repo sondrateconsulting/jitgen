@@ -144,9 +144,12 @@ pub fn build_env(
             ));
             continue;
         }
-        let upper_managed =
-            MANAGED.contains(&name.as_str()) || BASELINE_PASSTHROUGH.contains(&name.as_str());
-        if upper_managed || env.contains_key(name) {
+        // Compare managed/baseline names case-insensitively so a lowercase alias (e.g. `home`)
+        // cannot smuggle a parallel variable past the guard.
+        let upper = name.to_ascii_uppercase();
+        let is_managed =
+            MANAGED.contains(&upper.as_str()) || BASELINE_PASSTHROUGH.contains(&upper.as_str());
+        if is_managed || env.contains_key(name) {
             warnings.push(format!(
                 "ignored env_allowlist_extra {name:?}: name is managed by the sandbox"
             ));

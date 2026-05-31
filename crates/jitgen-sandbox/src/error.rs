@@ -41,6 +41,23 @@ pub enum SandboxError {
     #[error("container backend selected without a digest-pinned image")]
     MissingImage,
 
+    /// A container image was provided but is not digest-pinned (`name@sha256:...`); we never run a
+    /// floating tag ([ADR-0009]).
+    #[error("container image is not digest-pinned (expected name@sha256:...): {0:?}")]
+    FloatingImageTag(String),
+
+    /// The run instance id contains characters unsafe for a container name (collision/DoS risk).
+    #[error("invalid instance id (expected [A-Za-z0-9_-], 1..=64 chars): {0:?}")]
+    InvalidInstance(String),
+
+    /// The overlay path is unusable for a container `--mount` spec (e.g. contains a comma).
+    #[error("overlay path is not container-mount-safe: {0:?}")]
+    UnsafeOverlayPath(String),
+
+    /// The resolved inner command was empty (no program to run).
+    #[error("empty command: no program to execute")]
+    EmptyCommand,
+
     /// A sandbox-confinement path (overlay/tmp) was not absolute; the SBPL/bind construction requires
     /// canonical absolute paths.
     #[error("sandbox path must be absolute and canonical: {0:?}")]

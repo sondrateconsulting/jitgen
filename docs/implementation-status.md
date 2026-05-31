@@ -158,3 +158,14 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   **Remaining for F7 complete:** build-vs-test (`BuildError`) refinement, Docker live conformance with
   a pinned image + container `--user` uid probe, and the **security-first Codex review protocol**
   (S1 → T1 → …).
+- 2026-05-31: **F7 review round 1 (S1 security + T1 rust) — all P1–P3 resolved.** Reviewed the Stage
+  1+2 increment with Claude's security-reviewer + rust-reviewer subagents (not the `codex` CLI; the
+  formal codex protocol still gates `complete`). Fixes: Docker image **digest-pin enforced**
+  (`@sha256:`), `overlay_root`/`state_root` **canonicalized** in `Sandbox::run` (macOS `/tmp` symlink
+  + PATH-filter correctness), `instance` **validated** (container-name collision DoS), `--mount`
+  comma-unsafe path rejected, `env_allowlist_extra` denials **surfaced** via `Sandbox::warnings()`,
+  reader-thread **leak-on-wait-error fixed** (always-join), `backend` `expect()`→fail-closed match,
+  `teardown` `/bin/kill` **cfg(unix)-gated**, empty-command guard, conformance `set_var` unsoundness
+  removed, env managed-name case-insensitive. Documented residuals: bwrap/sandbox-exec **rlimits**
+  (ulimit-preamble follow-up), `file-read*`/`mach-lookup` breadth. 61 unit + 4 live conformance;
+  `./scripts/check.sh` green. Artifact: [reviews/F7/round-1.md](reviews/F7/round-1.md).

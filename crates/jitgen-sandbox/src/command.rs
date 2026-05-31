@@ -84,6 +84,20 @@ fn validated_cwd(overlay_root: &Path, cwd_rel: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Validate the run instance id used for container naming. An attacker-influenced value could
+/// collide with an existing container name so that teardown (`docker kill jitgen-<instance>`) kills
+/// the wrong container — so we constrain it to a safe charset rather than trusting the caller.
+fn validate_instance(s: &str) -> Result<()> {
+    let ok = (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if ok {
+        Ok(())
+    } else {
+        Err(SandboxError::InvalidInstance(s.to_string()))
+    }
+}
+
 /// The inner command argv (the actual test invocation), honoring the trusted shell gate.
 fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
     if req.shell {
@@ -106,8 +120,13 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
 
 /// Build the concrete, ready-to-spawn plan for the chosen backend.
 pub fn build_plan(input: PlanInput) -> Result<SandboxPlan> {
+    validate_instance(input.instance)?;
     let cwd = validated_cwd(input.overlay_root, &input.req.cwd_rel)?;
     let inner = inner_argv(input.req, input.policy)?;
+    // `inner_argv` always yields at least the program, but make downstream indexing provably safe.
+    if inner.is_empty() {
+        return Err(SandboxError::EmptyCommand);
+    }
     match input.backend {
         Backend::SandboxExec => plan_sandbox_exec(&input, cwd, inner),
         Backend::Bwrap => Ok(plan_bwrap(&input, cwd, inner)),
@@ -217,7 +236,15 @@ fn plan_container(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result
     } else {
         "docker"
     };
+    // Supply chain: never run a floating tag — require a digest-pinned image (ADR-0009).
+    if !image.contains("@sha256:") {
+        return Err(SandboxError::FloatingImageTag(image));
+    }
     let overlay = input.overlay_root.to_string_lossy().into_owned();
+    // `--mount type=bind,src=…,dst=…` is comma-delimited; a comma in the path corrupts the spec.
+    if overlay.contains(',') {
+        return Err(SandboxError::UnsafeOverlayPath(overlay));
+    }
     let name = format!("jitgen-{}", input.instance);
     let l = &input.policy.limits;
 
@@ -261,10 +288,11 @@ fn plan_container(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result
         args.push("-e".into());
         args.push(format!("{k}={v}"));
     }
+    let (entrypoint, rest) = inner.split_first().ok_or(SandboxError::EmptyCommand)?;
     args.push("--entrypoint".into());
-    args.push(inner[0].clone());
+    args.push(entrypoint.clone());
     args.push(image);
-    args.extend(inner.into_iter().skip(1));
+    args.extend(rest.iter().cloned());
 
     let cleanup = vec![
         program.to_string(),
@@ -407,6 +435,32 @@ mod tests {
         assert!(matches!(
             build_plan(input(Backend::Docker, &r, &policy)).unwrap_err(),
             SandboxError::MissingImage
+        ));
+    }
+
+    #[test]
+    fn docker_floating_tag_is_refused() {
+        let r = req();
+        let policy = ExecPolicy {
+            backend: jitgen_core::SandboxBackend::Docker,
+            docker_image: Some("node:latest".into()),
+            ..ExecPolicy::default()
+        };
+        assert!(matches!(
+            build_plan(input(Backend::Docker, &r, &policy)).unwrap_err(),
+            SandboxError::FloatingImageTag(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_instance_is_refused() {
+        let r = req();
+        let policy = ExecPolicy::default();
+        let mut pi = input(Backend::SandboxExec, &r, &policy);
+        pi.instance = "bad name/with;chars";
+        assert!(matches!(
+            build_plan(pi).unwrap_err(),
+            SandboxError::InvalidInstance(_)
         ));
     }
 

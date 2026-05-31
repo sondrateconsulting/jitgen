@@ -15,7 +15,7 @@ use crate::error::{Result, SandboxError};
 use crate::policy::ExecPolicy;
 use jitgen_core::ExecutionResult;
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,22 +50,15 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     let err_reader = child.stderr.take().map(|p| spawn_capped_reader(p, cap));
 
     let deadline = start + policy.timeout;
-    let mut timed_out = false;
-    let status: ExitStatus = loop {
-        if let Some(st) = child.try_wait().map_err(SandboxError::Io)? {
-            break st;
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            let _ = child.kill();
-            teardown(plan, pid);
-            break child.wait().map_err(SandboxError::Io)?;
-        }
-        thread::sleep(POLL);
-    };
-
+    let wait_result = wait_with_timeout(&mut child, plan, pid, deadline);
+    // If waiting errored, ensure the child is dead so its pipes close and the reader threads can
+    // finish — otherwise the joins below could block. Always join (never detach/leak the threads).
+    if wait_result.is_err() {
+        let _ = child.kill();
+    }
     let (stdout_raw, out_trunc) = join_reader(out_reader);
     let (stderr_raw, err_trunc) = join_reader(err_reader);
+    let (status, timed_out) = wait_result?;
 
     let disp = Disposition {
         exit_code: status.code(),
@@ -84,6 +77,28 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
         stdout: redact_bytes(&stdout_raw),
         stderr: redact_bytes(&stderr_raw),
     })
+}
+
+/// Poll the child to completion or the deadline. On timeout, kill it and tear down any escaped
+/// descendants (process group / container). Returns `(status, timed_out)`.
+fn wait_with_timeout(
+    child: &mut Child,
+    plan: &SandboxPlan,
+    pid: u32,
+    deadline: Instant,
+) -> Result<(ExitStatus, bool)> {
+    loop {
+        if let Some(status) = child.try_wait().map_err(SandboxError::Io)? {
+            return Ok((status, false));
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            teardown(plan, pid);
+            let status = child.wait().map_err(SandboxError::Io)?;
+            return Ok((status, true));
+        }
+        thread::sleep(POLL);
+    }
 }
 
 /// Lossily decode and redact captured output before it leaves the crate.
@@ -139,6 +154,11 @@ fn teardown(plan: &SandboxPlan, pid: u32) {
             .stderr(Stdio::null())
             .status();
     }
+    kill_process_group(plan, pid);
+}
+
+#[cfg(unix)]
+fn kill_process_group(plan: &SandboxPlan, pid: u32) {
     if plan.new_process_group {
         // The child leads a fresh group (pgid == pid); a negative pid signals the whole group.
         let _ = Command::new("/bin/kill")
@@ -150,6 +170,9 @@ fn teardown(plan: &SandboxPlan, pid: u32) {
             .status();
     }
 }
+
+#[cfg(not(unix))]
+fn kill_process_group(_plan: &SandboxPlan, _pid: u32) {}
 
 #[cfg(unix)]
 fn set_process_group(cmd: &mut Command, new_group: bool) {

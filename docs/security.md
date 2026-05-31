@@ -184,6 +184,15 @@ These MUST exist and pass before the relevant phase is complete (built security-
   and recorded. macOS `sandbox-exec` is Apple-deprecated though functional. Redaction is heuristic
   (minimize context + exclude secret files; cannot guarantee zero leakage of novel secret formats).
   Real-LLM mode is opt-in and off by default.
+- **Sandbox resource limits (F7) are backend-dependent.** Docker/Podman (`--memory` / `--pids-limit`
+  / `--cpus`) and firejail (`--rlimit-*`) enforce CPU/memory/process caps in-kernel. **bwrap** and
+  macOS **`sandbox-exec`** have no flag-level rlimit primitive, and a `setrlimit` pre-exec would
+  require `unsafe` (forbidden crate-wide); on those backends the **wall-clock timeout is currently the
+  only fork-bomb/resource backstop**. Network egress, write-confinement, and the env allowlist are
+  unaffected. Planned hardening: a `ulimit` shell preamble (`sh -c 'ulimit …; exec "$@"'`) for the
+  non-container tiers — tracked for F7 finalization / F10. Relatedly, the OS-sandbox tiers allow broad
+  `file-read*` (so toolchains load), so a sandboxed process can read host files its uid permits; the
+  primary mitigation is no-network + output redaction + synthetic `HOME` (see `sbpl.rs`).
 - **Secret redaction heuristic (F5, `jitgen-context::redact`):** runs before any prompt/log/report
   on a **size-bounded** input window (256 KiB/item, with a fail-closed drop of a window-split
   trailing token), using the linear-time `regex` engine (no catastrophic backtracking). It covers

@@ -150,14 +150,14 @@ pub fn select(available: &[Backend], policy: &ExecPolicy) -> Result<Backend> {
                 Err(SandboxError::NoIsolationAvailable)
             }
         }
-        other => {
-            let b = explicit(other).expect("Auto/Local handled above");
-            if available.contains(&b) {
-                Ok(b)
-            } else {
-                Err(SandboxError::BackendUnavailable(b.id()))
-            }
-        }
+        // A specific isolating backend. `explicit` returns `None` only for `Auto`/`Local` (handled
+        // above); if a future `SandboxBackend` variant lands without updating `explicit`, fail closed
+        // rather than panic.
+        other => match explicit(other) {
+            Some(b) if available.contains(&b) => Ok(b),
+            Some(b) => Err(SandboxError::BackendUnavailable(b.id())),
+            None => Err(SandboxError::NoIsolationAvailable),
+        },
     }
 }
 
