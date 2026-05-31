@@ -21,11 +21,6 @@ pub enum SandboxError {
     #[error("requested sandbox backend {0:?} is not available on this host")]
     BackendUnavailable(&'static str),
 
-    /// A backend could not *prove* network denial (its conformance probe failed), so it is treated
-    /// as unavailable rather than trusted (security §1; verified in Stage 2).
-    #[error("backend {0:?} failed its network-denial proof; treated as unavailable")]
-    NetworkProofFailed(&'static str),
-
     /// A `shell: true` command was supplied but the trusted config did not permit a shell. Refused
     /// rather than silently downgraded (security §5).
     #[error("shell command requires trusted shell_allowed=true; refusing")]
@@ -77,6 +72,12 @@ pub enum SandboxError {
     /// The resolved inner command was empty (no program to run).
     #[error("empty command: no program to execute")]
     EmptyCommand,
+
+    /// A synthetic runtime dir (`.jitgen-home`/`.jitgen-tmp`) already existed in the overlay before
+    /// the run — refused rather than followed/reused, since the overlay is attacker-controlled and a
+    /// pre-planted symlink or seeded directory would subvert the inert `HOME`/`TMPDIR` guarantee.
+    #[error("synthetic runtime dir already exists in overlay (possible pre-plant): {0:?}")]
+    UnsafeSyntheticDir(String),
 
     /// A sandbox-confinement path (overlay/tmp) was not absolute; the SBPL/bind construction requires
     /// canonical absolute paths.

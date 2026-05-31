@@ -111,6 +111,25 @@ fn docker_sandbox(image: String) -> Option<Sandbox> {
     Some(Sandbox::new(&[Backend::Docker], policy).unwrap())
 }
 
+/// The non-root `uid:gid` to run containers as: `current_uid_gid()` for a normal user, or the
+/// `JITGEN_TEST_DOCKER_UID_GID` override for a root CI context (where `current_uid_gid()` returns
+/// `None` by design). `None` means "no non-root user available" → the caller skips loudly rather than
+/// panicking on `MissingContainerUser` (T2/F7 P4).
+fn test_uid_gid() -> Option<String> {
+    if let Some(u) = current_uid_gid() {
+        return Some(u);
+    }
+    match std::env::var("JITGEN_TEST_DOCKER_UID_GID") {
+        Ok(v) if v.contains(':') && !v.starts_with("0:") && v != "0" => Some(v),
+        _ => {
+            eprintln!(
+                "SKIP docker test: running as root and no JITGEN_TEST_DOCKER_UID_GID=<nonroot uid:gid>"
+            );
+            None
+        }
+    }
+}
+
 /// Gate 1 — network denial. A connect attempt inside the sandbox must fail.
 #[test]
 #[ignore = "live sandbox; run with --ignored on the host"]
@@ -139,26 +158,30 @@ fn sandbox_exec_denies_network() {
 #[test]
 #[ignore = "live sandbox; run with --ignored on the host"]
 fn sandbox_exec_confines_writes_to_overlay() {
-    let fx = Fixture::new("write");
     let sb = sandbox_exec();
 
+    // A fresh fixture per execution: `Sandbox::run` refuses a pre-existing `.jitgen-home`/
+    // `.jitgen-tmp` (T2/F7 P3), matching production where every run gets a freshly-materialized
+    // overlay.
     // Escape attempt: write into the state dir (outside the overlay) must fail and create nothing.
-    let escape = fx.state.join("escape.txt");
+    let fx_escape = Fixture::new("write-escape");
+    let escape = fx_escape.state.join("escape.txt");
     let cmd = SpawnRequest::argv(
         "/bin/sh",
         ["-c".into(), format!("printf x > {}", escape.display())],
     );
-    let res = exec(&sb, &cmd, &fx);
+    let res = exec(&sb, &cmd, &fx_escape);
     assert!(!escape.exists(), "write escaped the overlay to {escape:?}");
     assert_ne!(res.outcome, ExecOutcome::Passed, "escape write should fail");
 
     // Control: writing inside the overlay succeeds.
-    let inside = fx.overlay.join("ok.txt");
+    let fx_ok = Fixture::new("write-ok");
+    let inside = fx_ok.overlay.join("ok.txt");
     let cmd = SpawnRequest::argv(
         "/bin/sh",
         ["-c".into(), format!("printf x > {}", inside.display())],
     );
-    let res = exec(&sb, &cmd, &fx);
+    let res = exec(&sb, &cmd, &fx_ok);
     assert_eq!(
         res.outcome,
         ExecOutcome::Passed,
@@ -209,8 +232,10 @@ fn docker_denies_network() {
     let Some(sb) = docker_sandbox(image) else {
         return;
     };
-    // Containers require an explicit non-root --user (fail-closed); supply the invoking user's id.
-    let uid_gid = current_uid_gid();
+    // Containers require an explicit non-root --user (fail-closed); supply it or skip loudly.
+    let Some(uid_gid) = test_uid_gid() else {
+        return;
+    };
     let fx = Fixture::new("docker-net");
     // Probe network denial robustly: pick a tool that actually EXISTS in the image, then attempt a
     // connect. Distinguish "denied" from "no probe tool" so a toolless image can't masquerade as a
@@ -222,7 +247,7 @@ fn docker_denies_network() {
             bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
         else echo NO_PROBE_TOOL; fi";
     let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script.into()]);
-    let res = exec_as(&sb, &cmd, &fx, uid_gid.as_deref());
+    let res = exec_as(&sb, &cmd, &fx, Some(&uid_gid));
     if res.stdout.contains("NO_PROBE_TOOL") {
         eprintln!("SKIP docker_denies_network: image has no nc/bash probe tool");
         return;
@@ -245,7 +270,9 @@ fn docker_runs_as_requested_nonroot_user() {
     let Some(sb) = docker_sandbox(image) else {
         return;
     };
-    let uid_gid = current_uid_gid().expect("uid:gid on unix");
+    let Some(uid_gid) = test_uid_gid() else {
+        return;
+    };
     let want_uid = uid_gid.split(':').next().unwrap().to_string();
     assert_ne!(want_uid, "0", "test must not run as root to be meaningful");
 
@@ -272,15 +299,18 @@ fn docker_confines_writes_to_overlay() {
     let Some(sb) = docker_sandbox(image) else {
         return;
     };
-    let uid_gid = current_uid_gid();
-    let fx = Fixture::new("docker-write");
+    let Some(uid_gid) = test_uid_gid() else {
+        return;
+    };
 
-    // Write outside the overlay (root fs is --read-only) must fail.
+    // Fresh fixture per execution (run() refuses a pre-existing synthetic dir; production rebuilds
+    // the overlay each run). Write outside the overlay (root fs is --read-only) must fail.
+    let fx_escape = Fixture::new("docker-write-escape");
     let cmd = SpawnRequest::argv(
         "/bin/sh",
         ["-c".into(), "printf x > /etc/jitgen-escape".into()],
     );
-    let res = exec_as(&sb, &cmd, &fx, uid_gid.as_deref());
+    let res = exec_as(&sb, &cmd, &fx_escape, Some(&uid_gid));
     assert_ne!(
         res.outcome,
         ExecOutcome::Passed,
@@ -288,12 +318,13 @@ fn docker_confines_writes_to_overlay() {
     );
 
     // Write inside the overlay bind mount (same path in/out) succeeds and lands on the host.
-    let inside = fx.overlay.join("docker_ok.txt");
+    let fx_ok = Fixture::new("docker-write-ok");
+    let inside = fx_ok.overlay.join("docker_ok.txt");
     let cmd = SpawnRequest::argv(
         "/bin/sh",
         ["-c".into(), format!("printf x > {}", inside.display())],
     );
-    let res = exec_as(&sb, &cmd, &fx, uid_gid.as_deref());
+    let res = exec_as(&sb, &cmd, &fx_ok, Some(&uid_gid));
     assert_eq!(
         res.outcome,
         ExecOutcome::Passed,

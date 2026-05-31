@@ -50,7 +50,10 @@ Test commands and build scripts are attacker-controlled.
   with the trusted `--unsafe-local-execution` flag, which warns loudly and is recorded.
   ([ADR-0003](decisions/0003-sandbox-strategy.md), [ADR-0010](decisions/0010-config-trust-and-fail-closed.md))
 - No network by default (enforced + **conformance-tested per backend**); cwd pinned to overlay;
-  rlimits (CPU/AS/NOFILE/NPROC/FSIZE); whole-process-group timeout kill; output caps.
+  resource limits **per backend** (containers via cgroup flags `--memory`/`--pids-limit`/`--cpus`;
+  firejail via `--rlimit-*`; OS-sandbox/constrained-local via a `ulimit` preamble applying CPU-time +
+  address-space only — process-count is omitted by design, see Residual risks); whole-process-group
+  timeout kill; output caps.
 - **Environment is a jitgen-owned hardcoded allowlist**, NOT inherited: a **synthetic `HOME`**, no
   `GITHUB_TOKEN`/`AWS_*`/`SSH_AUTH_SOCK`/`*_TOKEN`/`*_API_KEY`/npm·pip·cargo creds; deny-patterns
   applied even to trusted additions. argv-only execution; shell only via trusted `shell: true`.
@@ -125,8 +128,10 @@ exfiltrate env".
 ### 9. Denial of service / resource exhaustion (incl. **pre-sandbox**)
 - **Preflight budgets BEFORE any heavy work or sandboxing:** caps on repo/pack/object/blob/file sizes,
   path counts, diff size, tree depth, **tree-sitter parse time/memory**, and context bytes/tokens;
-  operations are cancelable/streaming. Plus in-sandbox rlimits (NPROC/CPU/AS/FSIZE), timeouts, output
-  caps, bounded retries/candidates, and overall run budgets.
+  operations are cancelable/streaming. Plus in-sandbox per-backend resource limits (container
+  `--pids-limit`/`--memory`/`--cpus`, firejail `--rlimit-*`, or the OS-sandbox/local `ulimit` preamble
+  — CPU-time + address-space; see Residual risks), timeouts, output caps, bounded retries/candidates,
+  and overall run budgets.
 
 ### 10. Unsafe persistence / logging / report injection
 - State DB + overlays live under the private `0700` state root **outside** the repo; resume/report
@@ -186,13 +191,16 @@ These MUST exist and pass before the relevant phase is complete (built security-
   Real-LLM mode is opt-in and off by default.
 - **Sandbox resource limits (F7) are backend-dependent.** Docker/Podman (`--memory` / `--pids-limit`
   / `--cpus`) and firejail (`--rlimit-*`) enforce CPU/memory/process caps in-kernel. **bwrap** and
-  macOS **`sandbox-exec`** have no flag-level rlimit primitive, and a `setrlimit` pre-exec would
-  require `unsafe` (forbidden crate-wide); on those backends the **wall-clock timeout is currently the
-  only fork-bomb/resource backstop**. Network egress, write-confinement, and the env allowlist are
-  unaffected. Planned hardening: a `ulimit` shell preamble (`sh -c 'ulimit …; exec "$@"'`) for the
-  non-container tiers — tracked for F7 finalization / F10. Relatedly, the OS-sandbox tiers allow broad
-  `file-read*` (so toolchains load), so a sandboxed process can read host files its uid permits; the
-  primary mitigation is no-network + output redaction + synthetic `HOME` (see `sbpl.rs`).
+  macOS **`sandbox-exec`** (and the opt-in constrained-local tier) have no flag-level rlimit
+  primitive, and a `setrlimit` pre-exec would require `unsafe` (forbidden crate-wide); on those tiers
+  jitgen applies a **`ulimit` shell preamble** (`sh -c 'ulimit -t …; ulimit -v …; exec -- "$@"'`)
+  that enforces **CPU-time and address-space** (address-space is unenforced on macOS). **Process-count
+  is intentionally omitted** (`ulimit -u` is per-UID, not per-process-tree): the container
+  `--pids-limit` plus the wall-clock timeout are the fork-bomb controls, and the whole-process-group
+  kill bounds escapees. Network egress, write-confinement, and the env allowlist are unaffected.
+  Relatedly, the OS-sandbox tiers allow broad `file-read*` (so toolchains load), so a sandboxed
+  process can read host files its uid permits; the primary mitigation is no-network + output redaction
+  + synthetic `HOME` (see `sbpl.rs`).
 - **Secret redaction heuristic (F5, `jitgen-context::redact`):** runs before any prompt/log/report
   on a **size-bounded** input window (256 KiB/item, with a fail-closed drop of a window-split
   trailing token), using the linear-time `regex` engine (no catastrophic backtracking). It covers

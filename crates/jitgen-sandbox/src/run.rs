@@ -40,6 +40,9 @@ const REDACT_TAIL_GUARD: usize = 8 * 1024;
 /// closes pipes for in-group processes immediately, so this is only consumed by a descendant that
 /// escaped the group (`setsid`); we then return the captured-so-far bytes rather than hang.
 const COLLECT_GRACE: Duration = Duration::from_secs(2);
+/// Max time to wait for a teardown command (`docker kill …`) before killing it. A stalled daemon
+/// must not let cleanup hang `run()` past the wall-clock watchdog (T2/F7 P3).
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawn and run a fully-resolved plan, returning a redacted, capped, classified result.
 pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
@@ -241,22 +244,45 @@ fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
     (buf, truncated)
 }
 
-/// Run a teardown argv (e.g. `docker kill …`) with all stdio discarded; best-effort.
+/// Run a teardown argv (e.g. `docker kill …`) with all stdio discarded; best-effort and **bounded**.
 ///
 /// The teardown program (`docker`/`podman`) is resolved from a trusted system dir and the env is
 /// cleared — same rationale as the main launcher: never let an inherited `PATH` decide which binary
 /// tears down an attacker's container (T1/F7 P3). If it can't be trusted-resolved, skip it (the
 /// container's own resource limits + `--rm` still bound it).
+///
+/// The wait is bounded by [`CLEANUP_TIMEOUT`] and the cleanup process is killed on expiry: a stalled
+/// daemon/client must not let teardown hang `run()` past the watchdog (T2/F7 P3).
 fn run_cleanup(argv: &[String]) {
-    if let Some((prog, rest)) = argv.split_first() {
-        if let Some(abs) = resolve_trusted(prog) {
-            let _ = Command::new(abs)
-                .args(rest)
-                .env_clear()
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+    let Some((prog, rest)) = argv.split_first() else {
+        return;
+    };
+    let Some(abs) = resolve_trusted(prog) else {
+        return;
+    };
+    let spawned = Command::new(abs)
+        .args(rest)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = spawned else {
+        return;
+    };
+    let deadline = Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                thread::sleep(POLL);
+            }
+            Err(_) => return,
         }
     }
 }

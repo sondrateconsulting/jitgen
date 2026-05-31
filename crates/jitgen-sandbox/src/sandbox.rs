@@ -85,10 +85,14 @@ impl Sandbox {
 
         // Synthetic, jitgen-owned, writable locations INSIDE the overlay (within every backend's
         // write-confinement); ephemeral with it. `state_root` keeps its entries off the child `PATH`.
+        // Create them **fresh** with symlink-aware checks: the overlay is hostile (F6 materialized
+        // attacker-controlled paths), so a pre-planted symlinked or pre-existing `.jitgen-home`/
+        // `.jitgen-tmp` must not be followed — that would let repo content seed the "synthetic" HOME
+        // or redirect writes outside the overlay (T2/F7 P3).
         let home = overlay_root.join(".jitgen-home");
         let tmp = overlay_root.join(".jitgen-tmp");
-        std::fs::create_dir_all(&home).map_err(SandboxError::Io)?;
-        std::fs::create_dir_all(&tmp).map_err(SandboxError::Io)?;
+        create_fresh_dir(&home)?;
+        create_fresh_dir(&tmp)?;
 
         let (env, _warnings) = build_env(
             &process_env(),
@@ -112,6 +116,20 @@ impl Sandbox {
     }
 }
 
+/// Create `dir` fresh, refusing to follow or reuse a pre-existing entry at that leaf. The parent
+/// (`overlay_root`, already `canonicalize`d → symlink-free) is trusted; only the leaf could have been
+/// pre-planted by the hostile overlay. `symlink_metadata` does **not** follow a final symlink, so a
+/// planted `.jitgen-home -> /etc` is detected and rejected rather than written through (T2/F7 P3).
+fn create_fresh_dir(dir: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => Err(SandboxError::UnsafeSyntheticDir(dir.display().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(dir).map_err(SandboxError::Io)
+        }
+        Err(e) => Err(SandboxError::Io(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +142,37 @@ mod tests {
             Sandbox::new(&[], ExecPolicy::default()),
             Err(SandboxError::NoIsolationAvailable)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_fresh_dir_refuses_preexisting_and_symlink() {
+        let base = std::env::temp_dir().join(format!("jitgen-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Fresh leaf → created.
+        let fresh = base.join("home-a");
+        assert!(create_fresh_dir(&fresh).is_ok());
+        assert!(fresh.is_dir());
+
+        // Pre-existing real dir → refused (a repo could seed it).
+        assert!(matches!(
+            create_fresh_dir(&fresh),
+            Err(SandboxError::UnsafeSyntheticDir(_))
+        ));
+
+        // Pre-planted symlink → refused WITHOUT following it (the escape vector).
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = base.join("home-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            create_fresh_dir(&link),
+            Err(SandboxError::UnsafeSyntheticDir(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -132,6 +132,12 @@ fn is_uid_gid(s: &str) -> bool {
 
 /// The inner command argv (the actual test invocation), honoring the trusted shell gate.
 fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
+    // Reject an empty program up front: otherwise a `SpawnRequest{program:""}` yields a one-element
+    // argv `[""]` that slips past the `inner.is_empty()` guard and reaches the launcher as a blank
+    // program (T2/F7 P4).
+    if req.program.is_empty() {
+        return Err(SandboxError::EmptyCommand);
+    }
     if req.shell {
         if !policy.shell_allowed {
             return Err(SandboxError::ShellNotAllowed);
@@ -631,6 +637,16 @@ mod tests {
             "preamble must use `exec -- \"$@\"`: {:?}",
             plan.args
         );
+    }
+
+    #[test]
+    fn empty_program_is_refused() {
+        let r = SpawnRequest::argv("", ["x".into()]);
+        let policy = ExecPolicy::default();
+        assert!(matches!(
+            build_plan(input(Backend::ConstrainedLocal, &r, &policy)).unwrap_err(),
+            SandboxError::EmptyCommand
+        ));
     }
 
     #[test]
