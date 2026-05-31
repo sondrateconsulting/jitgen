@@ -10,7 +10,7 @@
     { "id": "F3", "title": "Git intake & diff analysis (overlay, path safety)", "status": "complete", "commit": "aa3bcf3", "review_protocol": "T1,S1,T2,T3,T4,T5 complete; 13 P3+ resolved; 0 unresolved" },
     { "id": "F4", "title": "Language discovery & adapters (TS/Java/Python/Rust + generic)", "status": "complete", "commit": "9fe4de4", "review_protocol": "T1,S1,T2,T3,T4 complete; 10 P3+ resolved; 0 unresolved" },
     { "id": "F5", "title": "LLM provider abstraction + context packager", "status": "complete", "commit": "e4ff52d", "review_protocol": "T1,S1,T2,T3,T4,T5,T6,T7 complete; 12 P3+ resolved; 0 unresolved" },
-    { "id": "F6", "title": "Candidate materialization & per-language rendering", "status": "complete", "commit": "pending", "review_protocol": "T1,S1,T2,T3 complete; 7 P3+ resolved; 0 unresolved" },
+    { "id": "F6", "title": "Candidate materialization & per-language rendering", "status": "complete", "commit": "039a80a", "review_protocol": "T1,S1,T2,T3 complete; 7 P3+ resolved; 0 unresolved" },
     { "id": "F7", "title": "Sandboxed execution & classification [MAX SCRUTINY]", "status": "not_started", "commit": null, "review_protocol": null },
     { "id": "F8", "title": "Feedback/repair/minimization/flake-filter + assessors", "status": "not_started", "commit": null, "review_protocol": null },
     { "id": "F9", "title": "End-to-end CLI + exporters", "status": "not_started", "commit": null, "review_protocol": null },

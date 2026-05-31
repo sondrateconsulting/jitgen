@@ -13,7 +13,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F3 | Git intake & diff analysis (overlay, path safety) | ✅ complete | `aa3bcf3` | T1·S1·T2·T3·T4·T5 ✅ |
 | F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ✅ complete | `9fe4de4` | T1·S1·T2·T3·T4 ✅ |
 | F5 | LLM provider abstraction + context packager | ✅ complete | `e4ff52d` | T1·S1·T2·T3·T4·T5·T6·T7 ✅ |
-| F6 | Candidate materialization & rendering (overlay-confined) | ✅ complete | `pending` | T1·S1·T2·T3 ✅ |
+| F6 | Candidate materialization & rendering (overlay-confined) | ✅ complete | `039a80a` | T1·S1·T2·T3 ✅ |
 | F7 | Sandboxed execution & classification [MAX SCRUTINY] | ⬜ | — | — |
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ⬜ | — | — |
 | F9 | End-to-end CLI + exporters | ⬜ | — | — |
