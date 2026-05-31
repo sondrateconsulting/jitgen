@@ -2,7 +2,7 @@
   "schema_version": 1,
   "project": "jitgen",
   "updated_at": "2026-05-31",
-  "current_phase": "F7",
+  "current_phase": "F8",
   "phases": [
     { "id": "F0", "title": "Research, architecture, plan, ADRs, security & resume docs", "status": "complete", "commit": "c9cd845", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
     { "id": "F1", "title": "Monorepo scaffold (Bazel Bzlmod + Rust workspace + crate skeletons)", "status": "complete", "commit": "2a10058", "review_protocol": "T1,S1,T2,T3 complete; 0 unresolved P3+" },
@@ -11,7 +11,7 @@
     { "id": "F4", "title": "Language discovery & adapters (TS/Java/Python/Rust + generic)", "status": "complete", "commit": "9fe4de4", "review_protocol": "T1,S1,T2,T3,T4 complete; 10 P3+ resolved; 0 unresolved" },
     { "id": "F5", "title": "LLM provider abstraction + context packager", "status": "complete", "commit": "e4ff52d", "review_protocol": "T1,S1,T2,T3,T4,T5,T6,T7 complete; 12 P3+ resolved; 0 unresolved" },
     { "id": "F6", "title": "Candidate materialization & per-language rendering", "status": "complete", "commit": "039a80a", "review_protocol": "T1,S1,T2,T3 complete; 7 P3+ resolved; 0 unresolved" },
-    { "id": "F7", "title": "Sandboxed execution & classification [MAX SCRUTINY]", "status": "in_progress", "commit": null, "review_protocol": "Stage 1+2 (construction + runtime + live sandbox-exec conformance) landed; S1-first review + BuildError/Docker-image/uid refinements pending" },
+    { "id": "F7", "title": "Sandboxed execution & classification [MAX SCRUTINY]", "status": "complete", "commit": "ba7c13c", "review_protocol": "S1,T1,S2,T1,T2 complete; round-2 S2 (7 P3+) + round-3 T1 (6 P3+) + round-4 T2 (2 P3) resolved; 0 unresolved P3+" },
     { "id": "F8", "title": "Feedback/repair/minimization/flake-filter + assessors", "status": "not_started", "commit": null, "review_protocol": null },
     { "id": "F9", "title": "End-to-end CLI + exporters", "status": "not_started", "commit": null, "review_protocol": null },
     { "id": "F10", "title": "Hardening, audits, docs, packaging, mid-run resume test", "status": "not_started", "commit": null, "review_protocol": null }

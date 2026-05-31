@@ -14,7 +14,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F4 | Language discovery & adapters (TS/Java/Py/Rust + generic) | ✅ complete | `9fe4de4` | T1·S1·T2·T3·T4 ✅ |
 | F5 | LLM provider abstraction + context packager | ✅ complete | `e4ff52d` | T1·S1·T2·T3·T4·T5·T6·T7 ✅ |
 | F6 | Candidate materialization & rendering (overlay-confined) | ✅ complete | `039a80a` | T1·S1·T2·T3 ✅ |
-| F7 | Sandboxed execution & classification [MAX SCRUTINY] | 🟦 in_progress | — | — |
+| F7 | Sandboxed execution & classification [MAX SCRUTINY] | ✅ complete | `ba7c13c` | S1·T1·S2·T1·T2 ✅ |
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ⬜ | — | — |
 | F9 | End-to-end CLI + exporters | ⬜ | — | — |
 | F10 | Hardening, audits, docs, packaging, mid-run resume test | ⬜ | — | — |
@@ -185,4 +185,28 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   crate-private (external callers go through `Sandbox`). 76 unit + 6 live conformance (incl. Docker
   non-root `--user` + overlay write-confinement, vs `postgres@sha256:…`); `./scripts/check.sh` green
   (cargo + bazel `--lockfile_mode=error`). No `unsafe`. Artifact: [reviews/F7/round-2.md](reviews/F7/round-2.md).
-  **Remaining for F7 complete:** ≥1 traditional Codex round (T) after this final security cycle.
+- 2026-05-31: **F7 review round 3 (formal Codex T1 traditional) — all 6 P3+ resolved.** First
+  traditional round after the security cycle: **1×P2, 5×P3 + 3×P4** (several on round-2's own new code).
+  `collect` reports `truncated || !finished`; output-cap default lowered to the 256 KiB redaction
+  ceiling; `run_cleanup` trusted-resolves `docker`/`podman` + `env_clear`; `which::resolve_trusted`
+  rejects `..`/`.` and requires the literal parent to be a trusted bin dir; `is_uid_gid`/
+  `current_uid_gid` reject root uid; Docker net-conformance asserts a `NET_DENIED` sentinel; per-test
+  container instance; `validated_cwd` accepts `.`; `architecture.md`/ADR-0003 state per-backend rlimits.
+  Artifact: [reviews/F7/round-3.md](reviews/F7/round-3.md).
+- 2026-05-31: **F7 COMPLETE** (`ba7c13c`) — review round 4 (formal Codex **T2** traditional, final
+  sign-off): **2×P3 + 3×P4**, all fixed. `create_fresh_dir` (symlink-aware `symlink_metadata`; refuses
+  a pre-planted `.jitgen-home`/`.jitgen-tmp` → `UnsafeSyntheticDir`); bounded `run_cleanup`
+  (`CLEANUP_TIMEOUT`, can't hang past the watchdog); `security.md` rlimit docs aligned; dead
+  `NetworkProofFailed` removed + `EmptyCommand` made reachable (empty program rejected); Docker
+  conformance root-CI ergonomics (`JITGEN_TEST_DOCKER_UID_GID` override / loud skip). **Review protocol
+  S1·T1·S2·T1·T2 complete; 0 unresolved P3+** (round-2 S2 7 P3+, round-3 T1 6 P3+, round-4 T2 2 P3).
+  `jitgen-sandbox` (layer 8): fail-closed tiered sandbox running untrusted argv-only commands against
+  the F6 overlay → redacted/classified `ExecutionResult`; trusted launcher resolution; no-network; env
+  allowlist + symlink-safe synthetic `HOME`/`TMPDIR`; overlay-confined writes; per-backend resource
+  limits; digest-pinned non-root containers (`--pull=never`); timeout with process-group/container
+  teardown. 79 unit + 6 live conformance (sandbox-exec + Docker, on-host, verified `CONF_EXIT=0`);
+  `./scripts/check.sh` `REAL_GATE_EXIT=0` (cargo + bazel `--lockfile_mode=error`);
+  `#![forbid(unsafe_code)]`. Artifacts: [reviews/F7/](reviews/F7/) (round-1..4). Residuals
+  (`security.md`, `sbpl.rs`): macOS AS/NPROC limits + `setsid`-escapee output bound (container tier is
+  the full fix); broad SBPL `file-read*`/`mach-lookup` (mitigated by no-network + redaction +
+  synthetic HOME).
