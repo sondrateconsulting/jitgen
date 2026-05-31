@@ -3,9 +3,13 @@
 //! Containers run as root by default; to keep an attacker-controlled test off root (and so writes to
 //! the host-owned overlay bind mount carry the caller's ownership), the orchestrator runs the
 //! container as the invoking user. `std` exposes no `getuid`/`getgid` without the `libc` crate, and
-//! this crate is dependency-light and `#![forbid(unsafe_code)]`, so we read them from `id(1)` — the
-//! same shell-out approach used by backend detection. Returns `None` off-unix or on any failure
-//! (the caller then omits `--user`).
+//! this crate is dependency-light and `#![forbid(unsafe_code)]`, so we read them from `id(1)`.
+//!
+//! `id` is resolved from a **trusted system dir** ([`crate::which`]), never the inherited `PATH` — a
+//! hostile repo dir on `PATH` could otherwise ship a fake `id` that prints `0`, fabricating a root
+//! `--user` value (S2/F7 P3). Returns `None` off-unix or on any failure; container planning then
+//! **fails closed** (it refuses to run without an explicit non-root `--user`), so a `None` here can
+//! never silently become container-root.
 
 #[cfg(unix)]
 pub fn current_uid_gid() -> Option<String> {
@@ -22,7 +26,9 @@ pub fn current_uid_gid() -> Option<String> {
 #[cfg(unix)]
 fn id_value(flag: &str) -> Option<String> {
     use std::process::{Command, Stdio};
-    let out = Command::new("id")
+    // Trusted absolute path only (e.g. `/usr/bin/id`); never a PATH-resolved bare `id`.
+    let id_bin = crate::which::resolve_trusted("id")?;
+    let out = Command::new(id_bin)
         .arg(flag)
         .stdin(Stdio::null())
         .stderr(Stdio::null())

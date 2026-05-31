@@ -24,7 +24,13 @@ fn available(backend: Backend) -> bool {
     match backend.version_probe() {
         // No probe (constrained-local): never auto-detected.
         None => false,
-        Some((program, args)) => probe(program, args, PROBE_TIMEOUT),
+        // Resolve the launcher from a trusted system dir, never the inherited `PATH` — otherwise a
+        // fake `docker`/`sandbox-exec` planted on `PATH` could pass the probe and be deemed
+        // "available", later running the inner command with no isolation (S2/F7 P1).
+        Some((program, args)) => match crate::which::resolve_trusted(program) {
+            Some(abs) => probe(&abs.to_string_lossy(), args, PROBE_TIMEOUT),
+            None => false,
+        },
     }
 }
 

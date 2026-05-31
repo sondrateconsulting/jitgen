@@ -1,22 +1,28 @@
-//! Runtime execution of a [`SandboxPlan`]: spawn, wall-clock timeout (whole-group teardown), output
-//! caps, redaction, and outcome classification. **std-only, no `unsafe`, no extra runtime crates.**
+//! Runtime execution of a [`SandboxPlan`]: spawn, wall-clock timeout, output caps, redaction, and
+//! outcome classification. **std-only, no `unsafe`, no extra runtime crates.**
 //!
-//! - **Timeout:** a watchdog poll loop over `try_wait`; on expiry the child is killed and — because it
-//!   was spawned in a fresh process group — the whole group is swept with `/bin/kill -KILL -<pgid>`
-//!   (containers via the plan's `cleanup` argv, e.g. `docker kill …`).
-//! - **Output caps:** per-stream reader threads keep up to `cap` bytes but **keep draining** so the
-//!   child can never block on a full pipe; anything beyond `cap` sets `truncated`.
-//! - **Redaction:** captured bytes are run through `jitgen_context::redact` before they leave this
-//!   crate. The cap is clamped to the redaction window so the entire returned blob is scanned.
+//! - **Trusted launcher:** `plan.program` is resolved to an absolute path in a trusted system dir
+//!   ([`crate::which`]) before spawn — never via the inherited `PATH` (S2/F7 P1).
+//! - **Timeout:** a watchdog poll over `try_wait`; on expiry the child is killed and (for container
+//!   backends) torn down by name.
+//! - **Teardown without hang:** for direct-spawn tiers the whole process group is swept **before**
+//!   the reader threads are joined, so a backgrounded grandchild holding a pipe cannot block the
+//!   join. Reads happen off-thread into shared buffers with a **bounded** join, so even a `setsid`
+//!   escapee cannot hang `run()` (S2/F7 P2) — we return what was captured and move on.
+//! - **Output caps + redaction:** each stream keeps up to `cap` bytes; when truncated, a tail guard
+//!   is dropped before redaction so a secret split across the cap boundary cannot leak (S2/F7 P2).
 
 use crate::classify::{classify, Disposition};
 use crate::command::SandboxPlan;
 use crate::error::{Result, SandboxError};
 use crate::policy::ExecPolicy;
 use crate::spawn::BuildSignal;
+use crate::which::resolve_trusted;
 use jitgen_core::ExecutionResult;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,13 +31,25 @@ const POLL: Duration = Duration::from_millis(20);
 /// Clamp captured output to the redaction window so the whole returned blob is scanned for secrets
 /// (mirrors `jitgen_context`'s 256 KiB redaction window; output beyond this is dropped + flagged).
 const REDACT_WINDOW: usize = 256 * 1024;
+/// On truncation, drop this many trailing bytes before redaction so a secret straddling the cap
+/// boundary (whose completing suffix was dropped by the cap) cannot survive. Larger than any single
+/// secret token we redact (S2/F7 P2).
+const REDACT_TAIL_GUARD: usize = 8 * 1024;
+/// Max time to wait for a reader thread to finish after the process group has been swept. The sweep
+/// closes pipes for in-group processes immediately, so this is only consumed by a descendant that
+/// escaped the group (`setsid`); we then return the captured-so-far bytes rather than hang.
+const COLLECT_GRACE: Duration = Duration::from_secs(2);
 
 /// Spawn and run a fully-resolved plan, returning a redacted, capped, classified result.
 pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     let start = Instant::now();
     let cap = REDACT_WINDOW.min(policy.output_cap_bytes as usize);
 
-    let mut cmd = Command::new(&plan.program);
+    // Resolve the launcher from a trusted system dir (never inherited PATH) before spawning.
+    let program = resolve_trusted(&plan.program)
+        .ok_or_else(|| SandboxError::UntrustedLauncher(plan.program.clone()))?;
+
+    let mut cmd = Command::new(&program);
     cmd.args(&plan.args)
         .current_dir(&plan.cwd)
         .env_clear()
@@ -47,18 +65,21 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     })?;
     let pid = child.id();
 
-    let out_reader = child.stdout.take().map(|p| spawn_capped_reader(p, cap));
-    let err_reader = child.stderr.take().map(|p| spawn_capped_reader(p, cap));
+    let out_cap = child.stdout.take().map(|p| spawn_capture(p, cap));
+    let err_cap = child.stderr.take().map(|p| spawn_capture(p, cap));
 
     let deadline = start + policy.timeout;
-    let wait_result = wait_with_timeout(&mut child, plan, pid, deadline);
-    // If waiting errored, ensure the child is dead so its pipes close and the reader threads can
-    // finish — otherwise the joins below could block. Always join (never detach/leak the threads).
+    let wait_result = wait_with_timeout(&mut child, plan, deadline);
     if wait_result.is_err() {
         let _ = child.kill();
     }
-    let (stdout_raw, out_trunc) = join_reader(out_reader);
-    let (stderr_raw, err_trunc) = join_reader(err_reader);
+    // Sweep any in-group stragglers (e.g. a backgrounded child still holding a pipe) BEFORE joining
+    // the readers, so the joins see EOF promptly and cannot hang. Harmless if the group is gone.
+    if plan.new_process_group {
+        kill_process_group(pid);
+    }
+    let (stdout_raw, out_trunc) = collect(out_cap);
+    let (stderr_raw, err_trunc) = collect(err_cap);
     let (status, timed_out) = wait_result?;
 
     let disp = Disposition {
@@ -78,17 +99,17 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
         exit_code: status.code(),
         duration_ms: start.elapsed().as_millis() as u64,
         truncated: out_trunc || err_trunc,
-        stdout: redact_bytes(&stdout_raw),
-        stderr: redact_bytes(&stderr_raw),
+        stdout: redact_capped(&stdout_raw, out_trunc),
+        stderr: redact_capped(&stderr_raw, err_trunc),
     })
 }
 
-/// Poll the child to completion or the deadline. On timeout, kill it and tear down any escaped
-/// descendants (process group / container). Returns `(status, timed_out)`.
+/// Poll the child to completion or the deadline. On timeout, kill it and (for container backends)
+/// tear it down by name. The process-group sweep for direct-spawn tiers is done by the caller on
+/// every path. Returns `(status, timed_out)`.
 fn wait_with_timeout(
     child: &mut Child,
     plan: &SandboxPlan,
-    pid: u32,
     deadline: Instant,
 ) -> Result<(ExitStatus, bool)> {
     loop {
@@ -97,7 +118,9 @@ fn wait_with_timeout(
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            teardown(plan, pid);
+            if let Some(cleanup) = &plan.cleanup {
+                run_cleanup(cleanup);
+            }
             let status = child.wait().map_err(SandboxError::Io)?;
             return Ok((status, true));
         }
@@ -133,52 +156,87 @@ fn detect_build_failure(
         .any(|m| out.contains(m.as_str()) || err.contains(m.as_str()))
 }
 
-/// Lossily decode and redact captured output before it leaves the crate.
-fn redact_bytes(bytes: &[u8]) -> String {
-    jitgen_context::redact(&String::from_utf8_lossy(bytes)).text
+/// Drop the cap-boundary tail (when truncated) then redact, before any bytes leave the crate.
+fn redact_capped(bytes: &[u8], truncated: bool) -> String {
+    let slice: &[u8] = if truncated {
+        let keep = bytes.len().saturating_sub(REDACT_TAIL_GUARD);
+        &bytes[..keep]
+    } else {
+        bytes
+    };
+    jitgen_context::redact(&String::from_utf8_lossy(slice)).text
 }
 
-type Reader = thread::JoinHandle<(Vec<u8>, bool)>;
-
-/// Drain `r` fully (so the child never blocks on a full pipe) while retaining at most `cap` bytes.
-fn spawn_capped_reader<R: Read + Send + 'static>(reader: R, cap: usize) -> Reader {
-    thread::spawn(move || read_capped(reader, cap))
+/// A streaming capture: a reader thread appends into a shared buffer (bounded by `cap`) while the
+/// main thread can snapshot it at any time — so an escaped descendant holding the pipe cannot
+/// prevent us from returning what was captured.
+struct Capture {
+    buf: Arc<Mutex<Vec<u8>>>,
+    truncated: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
 }
 
-fn read_capped<R: Read>(mut reader: R, cap: usize) -> (Vec<u8>, bool) {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut truncated = false;
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                if buf.len() < cap {
-                    let take = (cap - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
-                    if take < n {
-                        truncated = true;
+/// Spawn a reader that drains `reader` into a shared, `cap`-bounded buffer.
+fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let truncated = Arc::new(AtomicBool::new(false));
+    let buf_w = Arc::clone(&buf);
+    let trunc_w = Arc::clone(&truncated);
+    let handle = thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    // Lock only to append (never held across the blocking `read`), so the main
+                    // thread can snapshot between chunks even if a later read blocks forever.
+                    let mut g = match buf_w.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    if g.len() < cap {
+                        let take = (cap - g.len()).min(n);
+                        g.extend_from_slice(&chunk[..take]);
+                        if take < n {
+                            trunc_w.store(true, Ordering::Relaxed);
+                        }
+                    } else {
+                        trunc_w.store(true, Ordering::Relaxed);
                     }
-                } else {
-                    truncated = true;
                 }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
+    });
+    Capture {
+        buf,
+        truncated,
+        handle,
     }
+}
+
+/// Collect a capture with a bounded wait: if the reader has not finished within [`COLLECT_GRACE`]
+/// (an escaped descendant still holding the pipe), snapshot what was captured and move on rather
+/// than hang. The orphaned reader thread dies when the OS finally closes the pipe.
+fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
+    let Some(cap) = cap else {
+        return (Vec::new(), false);
+    };
+    let deadline = Instant::now() + COLLECT_GRACE;
+    while !cap.handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if cap.handle.is_finished() {
+        let _ = cap.handle.join();
+    }
+    let buf = cap.buf.lock().map(|g| g.clone()).unwrap_or_default();
+    let truncated = cap.truncated.load(Ordering::Relaxed);
     (buf, truncated)
 }
 
-fn join_reader(reader: Option<Reader>) -> (Vec<u8>, bool) {
-    match reader {
-        Some(h) => h.join().unwrap_or_else(|_| (Vec::new(), false)),
-        None => (Vec::new(), false),
-    }
-}
-
-/// Best-effort teardown of any escaped descendants: container by name, else the whole process group.
-fn teardown(plan: &SandboxPlan, pid: u32) {
-    if let Some((prog, rest)) = plan.cleanup.as_ref().and_then(|c| c.split_first()) {
+/// Run a teardown argv (e.g. `docker kill …`) with all stdio discarded; best-effort.
+fn run_cleanup(argv: &[String]) {
+    if let Some((prog, rest)) = argv.split_first() {
         let _ = Command::new(prog)
             .args(rest)
             .stdin(Stdio::null())
@@ -186,14 +244,16 @@ fn teardown(plan: &SandboxPlan, pid: u32) {
             .stderr(Stdio::null())
             .status();
     }
-    kill_process_group(plan, pid);
 }
 
 #[cfg(unix)]
-fn kill_process_group(plan: &SandboxPlan, pid: u32) {
-    if plan.new_process_group {
-        // The child leads a fresh group (pgid == pid); a negative pid signals the whole group.
-        let _ = Command::new("/bin/kill")
+fn kill_process_group(pid: u32) {
+    // The child leads a fresh group (pgid == pid); a negative pid signals the whole group. The pgid
+    // stays reserved while any group member is alive, so this reaches stragglers; the narrow
+    // post-reap recycle window is the documented residual (use the container tier for a real pid
+    // namespace). `/bin/kill` is resolved from a trusted dir for the same reason launchers are.
+    if let Some(kill) = resolve_trusted("kill") {
+        let _ = Command::new(kill)
             .arg("-KILL")
             .arg(format!("-{pid}"))
             .stdin(Stdio::null())
@@ -204,7 +264,7 @@ fn kill_process_group(plan: &SandboxPlan, pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_plan: &SandboxPlan, _pid: u32) {}
+fn kill_process_group(_pid: u32) {}
 
 #[cfg(unix)]
 fn set_process_group(cmd: &mut Command, new_group: bool) {
@@ -231,14 +291,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capped_reader_keeps_prefix_and_flags_truncation() {
-        let (buf, trunc) = read_capped(std::io::Cursor::new(b"abcdefgh".to_vec()), 4);
+    fn capture_keeps_prefix_and_flags_truncation() {
+        let cap = spawn_capture(std::io::Cursor::new(b"abcdefgh".to_vec()), 4);
+        let (buf, trunc) = collect(Some(cap));
         assert_eq!(buf, b"abcd");
         assert!(trunc);
 
-        let (buf, trunc) = read_capped(std::io::Cursor::new(b"hi".to_vec()), 16);
+        let cap = spawn_capture(std::io::Cursor::new(b"hi".to_vec()), 16);
+        let (buf, trunc) = collect(Some(cap));
         assert_eq!(buf, b"hi");
         assert!(!trunc);
+    }
+
+    #[test]
+    fn redact_capped_drops_boundary_tail_when_truncated() {
+        // A URL credential whose completing `@host` would be just past the cap: the kept prefix
+        // ends with the password. When truncated, the tail guard must drop it so it cannot leak.
+        let mut bytes = vec![b'x'; REDACT_TAIL_GUARD / 2];
+        bytes.extend_from_slice(b"https://user:supersecretpw");
+        let out = redact_capped(&bytes, true);
+        assert!(
+            !out.contains("supersecretpw"),
+            "boundary-split secret leaked: {out:?}"
+        );
+
+        // Not truncated → normal redaction (no spurious tail drop); ordinary text passes through.
+        let out = redact_capped(b"just some normal log line", false);
+        assert_eq!(out, "just some normal log line");
+    }
+
+    #[test]
+    fn untrusted_launcher_is_refused_before_spawn() {
+        use crate::backend::Backend;
+        use std::collections::BTreeMap;
+        let plan = SandboxPlan {
+            backend: Backend::ConstrainedLocal,
+            program: "/tmp/evil-launcher".to_string(),
+            args: vec![],
+            cwd: std::env::temp_dir(),
+            env: BTreeMap::new(),
+            container_name: None,
+            cleanup: None,
+            new_process_group: true,
+            build_signal: BuildSignal::default(),
+        };
+        assert!(matches!(
+            run(&plan, &ExecPolicy::default()),
+            Err(SandboxError::UntrustedLauncher(_))
+        ));
     }
 
     #[cfg(unix)]
@@ -249,7 +349,8 @@ mod tests {
         use std::collections::BTreeMap;
 
         // A constrained-local plan running `/bin/sh -c <script>` directly (no wrapper). Built by hand
-        // so these tests exercise the executor, not selection/argv construction.
+        // so these tests exercise the executor, not selection/argv construction. `/bin/sh` resolves
+        // from a trusted dir.
         fn sh_plan(script: &str) -> SandboxPlan {
             SandboxPlan {
                 backend: Backend::ConstrainedLocal,
@@ -364,9 +465,24 @@ mod tests {
         }
 
         #[test]
+        fn backgrounded_child_holding_pipe_does_not_hang_join() {
+            // The leader exits immediately but leaves a backgrounded `sleep` (same process group)
+            // holding stdout open. Without the pre-join group sweep + bounded collect, joining the
+            // reader would block until the sleep ends. The run must return promptly (S2/F7 P2).
+            let start = Instant::now();
+            let r = run(&sh_plan("(sleep 600 &) ; exit 0"), &ExecPolicy::default()).unwrap();
+            assert_eq!(r.outcome, ExecOutcome::Passed);
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "join hung on a backgrounded pipe-holder ({:?})",
+                start.elapsed()
+            );
+        }
+
+        #[test]
         fn rlimit_preamble_caps_cpu_time_end_to_end() {
             use crate::command::{build_plan, PlanInput};
-            use crate::policy::{ExecPolicy, ResourceLimits};
+            use crate::policy::ResourceLimits;
             use crate::spawn::SpawnRequest;
 
             // Build a real constrained-local plan with a 1-CPU-second limit (so the rlimit preamble

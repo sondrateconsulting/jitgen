@@ -30,18 +30,22 @@ mod sandbox;
 mod sbpl;
 mod spawn;
 mod user;
+mod which;
 
 pub use backend::{os_candidates, select, Backend, Tier};
-pub use command::{build_plan, PlanInput, SandboxPlan};
 pub use detect::detect;
 pub use env::{build_env, is_denied};
 pub use error::{Result, SandboxError};
 pub use policy::{ExecPolicy, ResourceLimits, DEFAULT_OUTPUT_CAP_BYTES, DEFAULT_TIMEOUT};
-pub use run::run;
 pub use sandbox::{RunRequest, Sandbox};
-pub use sbpl::render_profile;
 pub use spawn::{BuildSignal, SpawnRequest};
 pub use user::current_uid_gid;
+
+// NOT re-exported (S2/F7 P4): `command::{build_plan, PlanInput, SandboxPlan}`, `run::run`, and
+// `sbpl::render_profile`. Their modules are private, so these `pub`-within-module items are reachable
+// only inside the crate (via `crate::command::…` etc.) — never by an external caller, who would
+// otherwise be able to construct/execute a `ConstrainedLocal` plan and bypass the fail-closed opt-in
+// in [`Sandbox::new`]. External callers go through [`Sandbox`].
 
 /// Stable identifier for this pipeline layer/crate.
 pub fn layer_id() -> &'static str {
@@ -63,38 +67,8 @@ mod tests {
         assert!(!jitgen_core::version().is_empty());
     }
 
-    #[test]
-    fn end_to_end_construction_is_fail_closed_and_confined() {
-        // A representative offline construction path: no backend available + no opt-in => refuse.
-        let policy = ExecPolicy::default();
-        assert!(matches!(
-            select(&[], &policy),
-            Err(SandboxError::NoIsolationAvailable)
-        ));
-
-        // With sandbox-exec available, Auto selects it and the plan denies network + confines writes.
-        let chosen = select(&[Backend::SandboxExec], &policy).unwrap();
-        let req = SpawnRequest::argv("cargo", ["test".into()]);
-        let (env, _w) = build_env(
-            &std::collections::BTreeMap::new(),
-            &policy,
-            std::path::Path::new("/state/home"),
-            std::path::Path::new("/overlay/.jitgen-tmp"),
-            std::path::Path::new("/overlay"),
-            std::path::Path::new("/state"),
-        );
-        let plan = build_plan(PlanInput {
-            backend: chosen,
-            req: &req,
-            overlay_root: std::path::Path::new("/overlay"),
-            synthetic_tmp: std::path::Path::new("/overlay/.jitgen-tmp"),
-            env,
-            policy: &policy,
-            instance: "t",
-            run_as: None,
-        })
-        .unwrap();
-        assert!(plan.args.iter().any(|a| a.contains("(deny network*)")));
-        assert_eq!(plan.env.get("HOME").unwrap(), "/state/home");
-    }
+    // NOTE: the end-to-end select→build_env→build_plan construction test lives in `command.rs`
+    // (`end_to_end_construction_is_fail_closed_and_confined`), where the now-crate-private
+    // `build_plan`/`PlanInput` are in scope. This public-surface module deliberately does not reach
+    // into crate internals.
 }

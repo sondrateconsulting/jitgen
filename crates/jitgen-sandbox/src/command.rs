@@ -100,6 +100,34 @@ fn validate_instance(s: &str) -> Result<()> {
     }
 }
 
+/// Whether `image` is `name@sha256:<64 lowercase hex>` — a fully digest-pinned reference. A floating
+/// tag (`name:latest`) or a short/uppercase digest is rejected (ADR-0009; S2/F7 P3).
+fn is_digest_pinned(image: &str) -> bool {
+    match image.split_once("@sha256:") {
+        Some((name, digest)) => {
+            !name.is_empty()
+                && digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }
+        None => false,
+    }
+}
+
+/// Whether `s` is a `<digits>:<digits>` uid:gid pair (for the container `--user` flag).
+fn is_uid_gid(s: &str) -> bool {
+    match s.split_once(':') {
+        Some((uid, gid)) => {
+            !uid.is_empty()
+                && !gid.is_empty()
+                && uid.bytes().all(|b| b.is_ascii_digit())
+                && gid.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// The inner command argv (the actual test invocation), honoring the trusted shell gate.
 fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
     if req.shell {
@@ -124,9 +152,11 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
 /// the real command. Used only for tiers with no native rlimit mechanism (sandbox-exec, bwrap,
 /// constrained-local); firejail uses `--rlimit-*` and containers use cgroup flags.
 ///
-/// The untrusted argv is passed as positional parameters and re-exec'd via `exec "$@"`, so it is
+/// The untrusted argv is passed as positional parameters and re-exec'd via `exec -- "$@"`, so it is
 /// **never** parsed by the shell — this adds no command-injection surface (the shell script is a fixed
-/// jitgen-authored string). What it enforces:
+/// jitgen-authored string). The `--` terminator is essential: without it, an argv whose program
+/// begins with `-` (e.g. `-c`) would be consumed by `exec` as an option, turning the wrapper into a
+/// shell-gate bypass (S2/F7 P3). What it enforces:
 /// - **CPU time** (`ulimit -t`, seconds): unambiguous across `sh` implementations and verified to fire
 ///   (SIGXCPU) including under `sandbox-exec`. Bounds runaway compute.
 /// - **Address space** (`ulimit -v`, KiB): best-effort — enforced on Linux; macOS does not enforce
@@ -138,7 +168,7 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
 /// (see `docs/security.md`). The wall-clock timeout is the cross-tier backstop.
 fn with_rlimit_preamble(inner: Vec<String>, limits: &ResourceLimits) -> Vec<String> {
     let script = format!(
-        "ulimit -t {} 2>/dev/null || true; ulimit -v {} 2>/dev/null || true; exec \"$@\"",
+        "ulimit -t {} 2>/dev/null || true; ulimit -v {} 2>/dev/null || true; exec -- \"$@\"",
         limits.cpu_seconds,
         limits.address_space_bytes / 1024,
     );
@@ -284,9 +314,17 @@ fn plan_container(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result
     } else {
         "docker"
     };
-    // Supply chain: never run a floating tag — require a digest-pinned image (ADR-0009).
-    if !image.contains("@sha256:") {
+    // Supply chain: require a strictly digest-pinned image — `name@sha256:<64 lowercase hex>` — never
+    // a floating tag (ADR-0009; S2/F7 P3 tightened this from a loose `contains` check).
+    if !is_digest_pinned(&image) {
         return Err(SandboxError::FloatingImageTag(image));
+    }
+    // Fail closed on the non-root invariant: a container MUST run as an explicit `uid:gid`. Omitting
+    // `--user` lets the daemon default to root, running hostile tests as root and poisoning overlay
+    // ownership (S2/F7 P3). The orchestrator supplies the invoking user's id via `current_uid_gid`.
+    let user = input.run_as.ok_or(SandboxError::MissingContainerUser)?;
+    if !is_uid_gid(user) {
+        return Err(SandboxError::InvalidRunAs(user.to_string()));
     }
     let overlay = input.overlay_root.to_string_lossy().into_owned();
     // `--mount type=bind,src=…,dst=…` is comma-delimited; a comma in the path corrupts the spec.
@@ -305,6 +343,9 @@ fn plan_container(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result
     let mut args = vec![
         "run".into(),
         "--rm".into(),
+        // Never let `docker run` pull during the execution phase — that is host-daemon network
+        // egress while the run is supposed to be no-network. The image must be pre-fetched (S2/F7 P3).
+        "--pull=never".into(),
         "--name".into(),
         name.clone(),
         "--network=none".into(),
@@ -328,10 +369,8 @@ fn plan_container(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result
         "--cpus".into(),
         l.cpus.to_string(),
     ];
-    if let Some(user) = input.run_as {
-        args.push("--user".into());
-        args.push(user.to_string());
-    }
+    args.push("--user".into());
+    args.push(user.to_string());
     for (k, v) in &cenv {
         args.push("-e".into());
         args.push(format!("{k}={v}"));
@@ -409,6 +448,44 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_construction_is_fail_closed_and_confined() {
+        use crate::backend::select;
+        use crate::env::build_env;
+
+        // No backend available + no opt-in => refuse.
+        let policy = ExecPolicy::default();
+        assert!(matches!(
+            select(&[], &policy),
+            Err(SandboxError::NoIsolationAvailable)
+        ));
+
+        // With sandbox-exec available, Auto selects it and the plan denies network + confines writes.
+        let chosen = select(&[Backend::SandboxExec], &policy).unwrap();
+        let r = req();
+        let (built_env, _w) = build_env(
+            &BTreeMap::new(),
+            &policy,
+            Path::new("/state/home"),
+            Path::new("/overlay/.jitgen-tmp"),
+            Path::new("/overlay"),
+            Path::new("/state"),
+        );
+        let plan = build_plan(PlanInput {
+            backend: chosen,
+            req: &r,
+            overlay_root: Path::new("/overlay"),
+            synthetic_tmp: Path::new("/overlay/.jitgen-tmp"),
+            env: built_env,
+            policy: &policy,
+            instance: "t",
+            run_as: None,
+        })
+        .unwrap();
+        assert!(plan.args.iter().any(|a| a.contains("(deny network*)")));
+        assert_eq!(plan.env.get("HOME").unwrap(), "/state/home");
+    }
+
+    #[test]
     fn cwd_traversal_is_rejected() {
         let r = SpawnRequest::argv("x", []).with_cwd("../escape");
         let policy = ExecPolicy::default();
@@ -453,9 +530,10 @@ mod tests {
     #[test]
     fn docker_argv_has_no_network_readonly_and_pinned_image() {
         let r = req();
+        let image = format!("node@sha256:{}", "a".repeat(64));
         let policy = ExecPolicy {
             backend: jitgen_core::SandboxBackend::Docker,
-            docker_image: Some("node@sha256:deadbeef".into()),
+            docker_image: Some(image.clone()),
             ..ExecPolicy::default()
         };
         let plan = build_plan(input(Backend::Docker, &r, &policy)).unwrap();
@@ -463,7 +541,9 @@ mod tests {
         assert!(plan.args.contains(&"--network=none".to_string()));
         assert!(plan.args.contains(&"--read-only".to_string()));
         assert!(plan.args.contains(&"--cap-drop".to_string()));
-        assert!(plan.args.contains(&"node@sha256:deadbeef".to_string()));
+        // Never pulls during execution (S2/F7 P3).
+        assert!(plan.args.contains(&"--pull=never".to_string()));
+        assert!(plan.args.contains(&image));
         assert!(plan.args.contains(&"--user".to_string()));
         assert!(plan.args.contains(&"501:20".to_string()));
         // Teardown is by container name, not process group.
@@ -492,17 +572,61 @@ mod tests {
     }
 
     #[test]
-    fn docker_floating_tag_is_refused() {
+    fn docker_floating_or_short_digest_is_refused() {
         let r = req();
+        for bad in ["node:latest", "node@sha256:deadbeef", "node@sha256:ABCD"] {
+            let policy = ExecPolicy {
+                backend: jitgen_core::SandboxBackend::Docker,
+                docker_image: Some(bad.into()),
+                ..ExecPolicy::default()
+            };
+            assert!(
+                matches!(
+                    build_plan(input(Backend::Docker, &r, &policy)).unwrap_err(),
+                    SandboxError::FloatingImageTag(_)
+                ),
+                "{bad} should be refused as not digest-pinned"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_requires_explicit_nonroot_user() {
+        let r = req();
+        let image = format!("node@sha256:{}", "a".repeat(64));
         let policy = ExecPolicy {
             backend: jitgen_core::SandboxBackend::Docker,
-            docker_image: Some("node:latest".into()),
+            docker_image: Some(image),
             ..ExecPolicy::default()
         };
+        // No run_as → fail closed (never default to container root).
+        let mut pi = input(Backend::Docker, &r, &policy);
+        pi.run_as = None;
         assert!(matches!(
-            build_plan(input(Backend::Docker, &r, &policy)).unwrap_err(),
-            SandboxError::FloatingImageTag(_)
+            build_plan(pi).unwrap_err(),
+            SandboxError::MissingContainerUser
         ));
+        // Malformed uid:gid → rejected.
+        let mut pi = input(Backend::Docker, &r, &policy);
+        pi.run_as = Some("root:root");
+        assert!(matches!(
+            build_plan(pi).unwrap_err(),
+            SandboxError::InvalidRunAs(_)
+        ));
+    }
+
+    #[test]
+    fn rlimit_preamble_uses_exec_dash_dash() {
+        // The `--` terminator must be present so a leading-dash program can't become an exec option
+        // (S2/F7 P3 shell-gate bypass).
+        let r = req();
+        let plan =
+            build_plan(input(Backend::ConstrainedLocal, &r, &ExecPolicy::default())).unwrap();
+        assert!(
+            plan.args.iter().any(|a| a.contains("exec -- \"$@\"")),
+            "preamble must use `exec -- \"$@\"`: {:?}",
+            plan.args
+        );
     }
 
     #[test]
@@ -584,7 +708,7 @@ mod tests {
 
         let policy = ExecPolicy {
             backend: jitgen_core::SandboxBackend::Docker,
-            docker_image: Some("img@sha256:abc".into()),
+            docker_image: Some(format!("img@sha256:{}", "a".repeat(64))),
             ..ExecPolicy::default()
         };
         let dk = build_plan(input(Backend::Docker, &r, &policy)).unwrap();

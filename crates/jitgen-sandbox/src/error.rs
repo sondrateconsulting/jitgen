@@ -54,6 +54,26 @@ pub enum SandboxError {
     #[error("overlay path is not container-mount-safe: {0:?}")]
     UnsafeOverlayPath(String),
 
+    /// A backend launcher could not be resolved within a trusted system bin dir. We refuse to run a
+    /// launcher found via the inherited `PATH` (a hostile repo dir on `PATH` could shadow the real
+    /// `docker`/`sandbox-exec`, silently defeating isolation). Security §1, [ADR-0003].
+    #[error(
+        "sandbox launcher {0:?} not found in a trusted system bin dir; refusing PATH resolution"
+    )]
+    UntrustedLauncher(String),
+
+    /// A container backend was selected without an explicit non-root `uid:gid`. We never let a
+    /// container default to root by omitting `--user` (would run hostile tests as root and poison
+    /// overlay ownership). The orchestrator must supply the invoking user's id.
+    #[error(
+        "container backend requires an explicit uid:gid (--user); refusing to default to root"
+    )]
+    MissingContainerUser,
+
+    /// A supplied `uid:gid` was malformed (expected `<digits>:<digits>`).
+    #[error("invalid uid:gid for container --user: {0:?}")]
+    InvalidRunAs(String),
+
     /// The resolved inner command was empty (no program to run).
     #[error("empty command: no program to execute")]
     EmptyCommand,

@@ -59,8 +59,15 @@ const DENY_SUBSTRINGS: &[&str] = &[
     "CREDENTIAL",
     "APIKEY",
     "PRIVATE_KEY",
+    // URLs/DSNs/webhooks frequently embed `user:pass@` or a secret token (S2/F7 P3).
+    "DSN",
+    "WEBHOOK",
+    "NETRC",
+    "KUBECONFIG",
 ];
-const DENY_SUFFIXES: &[&str] = &["_KEY", "_AUTH"];
+// `_URL`/`_URI` cover DATABASE_URL/REDIS_URL/…; `_PROXY` covers HTTP(S)_PROXY (may carry creds).
+// Suffix-matched (not substring) so legitimate names like `CURL_CA_BUNDLE` are unaffected.
+const DENY_SUFFIXES: &[&str] = &["_KEY", "_AUTH", "_URL", "_URI", "_PROXY"];
 const DENY_EXACT: &[&str] = &[
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
@@ -310,10 +317,18 @@ mod tests {
             "FOO_KEY",
             "db_auth",
             "ssh_auth_sock",
+            // URL/DSN/proxy/webhook credential carriers (S2/F7 P3).
+            "DATABASE_URL",
+            "REDIS_URL",
+            "MONGO_URI",
+            "SENTRY_DSN",
+            "HTTPS_PROXY",
+            "SLACK_WEBHOOK",
+            "KUBECONFIG",
         ] {
             assert!(is_denied(n), "{n} should be denied");
         }
-        for n in ["PATH", "LANG", "CI", "MONKEY_BUSINESS"] {
+        for n in ["PATH", "LANG", "CI", "MONKEY_BUSINESS", "CURL_CA_BUNDLE"] {
             assert!(!is_denied(n), "{n} should be allowed");
         }
     }

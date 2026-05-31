@@ -204,6 +204,8 @@ fn docker_denies_network() {
     let Some(sb) = docker_sandbox(image) else {
         return;
     };
+    // Containers require an explicit non-root --user (fail-closed); supply the invoking user's id.
+    let uid_gid = current_uid_gid();
     let fx = Fixture::new("docker-net");
     // `nc`/`wget` to a public resolver; under --network=none this must fail (non-Passed outcome).
     let cmd = SpawnRequest::argv(
@@ -213,7 +215,7 @@ fn docker_denies_network() {
             "nc -w 3 1.1.1.1 53 < /dev/null || wget -T 3 -q -O /dev/null http://1.1.1.1/".into(),
         ],
     );
-    let res = exec(&sb, &cmd, &fx);
+    let res = exec_as(&sb, &cmd, &fx, uid_gid.as_deref());
     assert_ne!(
         res.outcome,
         ExecOutcome::Passed,

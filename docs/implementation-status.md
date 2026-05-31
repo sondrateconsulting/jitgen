@@ -169,3 +169,20 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   removed, env managed-name case-insensitive. Documented residuals: bwrap/sandbox-exec **rlimits**
   (ulimit-preamble follow-up), `file-read*`/`mach-lookup` breadth. 61 unit + 4 live conformance;
   `./scripts/check.sh` green. Artifact: [reviews/F7/round-1.md](reviews/F7/round-1.md).
+- 2026-05-31: **F7 review round 2 (formal Codex S2 security) — all 7 P3+ resolved.** The independent
+  `codex exec --sandbox read-only` (gpt-5.5, xhigh) review of the whole crate found **1×P1, 2×P2, 4×P3
+  + 1×P4** (two introduced by this session's items 2–3 — caught by the independent pass). Fixes:
+  **(P1)** new `which::resolve_trusted` — launchers/`id`/`kill` resolve ONLY from root-owned system
+  bin dirs, never the inherited `PATH` (kills the fake-`docker`/`sandbox-exec` spoof that silently
+  defeated isolation); `run()`/`detect()` use it (`UntrustedLauncher`). **(P2)** process-group swept
+  **before** joining readers + bounded `collect` (`COLLECT_GRACE`) so a backgrounded/`setsid`
+  pipe-holder can't hang `run()`. **(P2)** `redact_capped` drops an 8 KiB tail guard on truncation so
+  a cap-boundary-split secret can't leak. **(P3)** rlimit preamble uses `exec -- "$@"` (dash-program
+  shell-gate bypass). **(P3)** containers **require** an explicit non-root `--user` (`MissingContainerUser`/
+  `InvalidRunAs`), never default to root; `id` is trusted-resolved. **(P3)** env denies `_URL`/`_URI`/
+  `_PROXY`/`DSN`/`WEBHOOK`/`NETRC`/`KUBECONFIG`. **(P3)** `--pull=never` + strict
+  `name@sha256:<64hex>`. **(P4)** `build_plan`/`run`/`PlanInput`/`SandboxPlan`/`render_profile` are
+  crate-private (external callers go through `Sandbox`). 76 unit + 6 live conformance (incl. Docker
+  non-root `--user` + overlay write-confinement, vs `postgres@sha256:…`); `./scripts/check.sh` green
+  (cargo + bazel `--lockfile_mode=error`). No `unsafe`. Artifact: [reviews/F7/round-2.md](reviews/F7/round-2.md).
+  **Remaining for F7 complete:** ≥1 traditional Codex round (T) after this final security cycle.
