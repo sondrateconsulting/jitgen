@@ -11,6 +11,9 @@
 //! ```
 //!
 //! Only the crate's public API is used (these run as a separate integration binary).
+//!
+//! Note: the Docker helpers/tests are gated behind `#[ignore]` but must still compile cleanly under
+//! `-D warnings`; they are referenced by the ignored tests below, so they are never dead code.
 
 use jitgen_core::{ExecOutcome, ExecutionResult, SandboxBackend};
 use jitgen_sandbox::{current_uid_gid, Backend, ExecPolicy, RunRequest, Sandbox, SpawnRequest};
@@ -65,6 +68,14 @@ fn exec_as(
     .unwrap()
 }
 
+fn sandbox_exec() -> Sandbox {
+    let policy = ExecPolicy {
+        backend: SandboxBackend::SandboxExec,
+        ..ExecPolicy::default()
+    };
+    Sandbox::new(&[Backend::SandboxExec], policy).expect("sandbox-exec selectable")
+}
+
 /// Resolve a digest-pinned image from the env, or skip. Enforces `@sha256:` so the test never pulls
 /// or runs a floating tag (matches the production `FloatingImageTag` guard).
 fn docker_test_image() -> Option<String> {
@@ -81,6 +92,7 @@ fn docker_test_image() -> Option<String> {
     }
 }
 
+/// Build a Docker-backed sandbox for the given pinned image, or skip if the daemon is unavailable.
 fn docker_sandbox(image: String) -> Option<Sandbox> {
     if !jitgen_sandbox::detect().contains(&Backend::Docker) {
         eprintln!("SKIP docker test: docker daemon not available");
@@ -92,14 +104,6 @@ fn docker_sandbox(image: String) -> Option<Sandbox> {
         ..ExecPolicy::default()
     };
     Some(Sandbox::new(&[Backend::Docker], policy).unwrap())
-}
-
-fn sandbox_exec() -> Sandbox {
-    let policy = ExecPolicy {
-        backend: SandboxBackend::SandboxExec,
-        ..ExecPolicy::default()
-    };
-    Sandbox::new(&[Backend::SandboxExec], policy).expect("sandbox-exec selectable")
 }
 
 /// Gate 1 — network denial. A connect attempt inside the sandbox must fail.
@@ -164,8 +168,8 @@ fn sandbox_exec_confines_writes_to_overlay() {
 fn sandbox_exec_strips_secrets_and_synthesizes_home() {
     // Run with a credential already in the environment to prove stripping end-to-end, e.g.:
     //   AWS_SECRET_ACCESS_KEY=test cargo test -p jitgen-sandbox --test conformance -- --ignored
-    // We deliberately do NOT mutate the global env (unsound across threads; `unsafe` in edition
-    // 2024). The deterministic stripping proof lives in the `env.rs` unit tests (injected parent env).
+    // We deliberately do NOT mutate the global env (unsound across threads). The deterministic
+    // stripping proof lives in the `env.rs` unit tests (injected parent env).
     let had_secret = std::env::var_os("AWS_SECRET_ACCESS_KEY").is_some();
     let cmd = SpawnRequest::argv(
         "/bin/sh",
@@ -189,38 +193,102 @@ fn sandbox_exec_strips_secrets_and_synthesizes_home() {
     );
 }
 
-/// Gate 1 — network denial under Docker. Skips unless a daemon is up and a pinned image is provided
-/// via `JITGEN_TEST_DOCKER_IMAGE` (we never pull during a test).
+/// Gate 1 — network denial under Docker. Skips unless a daemon is up and a digest-pinned image is
+/// provided via `JITGEN_TEST_DOCKER_IMAGE` (we never pull during a test).
 #[test]
 #[ignore = "live Docker; needs daemon + JITGEN_TEST_DOCKER_IMAGE"]
 fn docker_denies_network() {
-    let image = match std::env::var("JITGEN_TEST_DOCKER_IMAGE") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            eprintln!("SKIP docker_denies_network: set JITGEN_TEST_DOCKER_IMAGE=<name@sha256:...>");
-            return;
-        }
-    };
-    if !jitgen_sandbox::detect().contains(&Backend::Docker) {
-        eprintln!("SKIP docker_denies_network: docker daemon not available");
+    let Some(image) = docker_test_image() else {
         return;
-    }
-    let fx = Fixture::new("docker-net");
-    let policy = ExecPolicy {
-        backend: SandboxBackend::Docker,
-        docker_image: Some(image),
-        ..ExecPolicy::default()
     };
-    let sb = Sandbox::new(&[Backend::Docker], policy).unwrap();
-    // BusyBox/Alpine `nc` connect to a public resolver; under --network=none this must fail.
+    let Some(sb) = docker_sandbox(image) else {
+        return;
+    };
+    let fx = Fixture::new("docker-net");
+    // `nc`/`wget` to a public resolver; under --network=none this must fail (non-Passed outcome).
     let cmd = SpawnRequest::argv(
         "/bin/sh",
-        ["-c".into(), "nc -w 3 1.1.1.1 53 < /dev/null".into()],
+        [
+            "-c".into(),
+            "nc -w 3 1.1.1.1 53 < /dev/null || wget -T 3 -q -O /dev/null http://1.1.1.1/".into(),
+        ],
     );
     let res = exec(&sb, &cmd, &fx);
     assert_ne!(
         res.outcome,
         ExecOutcome::Passed,
         "Docker network must be denied; got {res:?}"
+    );
+}
+
+/// Gate 3 (container) — runs as the requested non-root `uid:gid` via `--user`, proving an
+/// attacker-controlled test does not run as container root and that overlay writes carry caller
+/// ownership. Uses the live `current_uid_gid()` probe — the same path the orchestrator uses.
+#[test]
+#[ignore = "live Docker; needs daemon + JITGEN_TEST_DOCKER_IMAGE"]
+fn docker_runs_as_requested_nonroot_user() {
+    let Some(image) = docker_test_image() else {
+        return;
+    };
+    let Some(sb) = docker_sandbox(image) else {
+        return;
+    };
+    let uid_gid = current_uid_gid().expect("uid:gid on unix");
+    let want_uid = uid_gid.split(':').next().unwrap().to_string();
+    assert_ne!(want_uid, "0", "test must not run as root to be meaningful");
+
+    let fx = Fixture::new("docker-user");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "id -u".into()]);
+    let res = exec_as(&sb, &cmd, &fx, Some(&uid_gid));
+    assert_eq!(res.outcome, ExecOutcome::Passed, "id -u failed: {res:?}");
+    assert_eq!(
+        res.stdout.trim(),
+        want_uid,
+        "container did not run as the requested uid; got {:?}",
+        res.stdout
+    );
+}
+
+/// Gate 2 (container) — writes confined to the overlay bind mount; the rest of the container fs is
+/// read-only (`--read-only`), so a write outside the overlay fails.
+#[test]
+#[ignore = "live Docker; needs daemon + JITGEN_TEST_DOCKER_IMAGE"]
+fn docker_confines_writes_to_overlay() {
+    let Some(image) = docker_test_image() else {
+        return;
+    };
+    let Some(sb) = docker_sandbox(image) else {
+        return;
+    };
+    let uid_gid = current_uid_gid();
+    let fx = Fixture::new("docker-write");
+
+    // Write outside the overlay (root fs is --read-only) must fail.
+    let cmd = SpawnRequest::argv(
+        "/bin/sh",
+        ["-c".into(), "printf x > /etc/jitgen-escape".into()],
+    );
+    let res = exec_as(&sb, &cmd, &fx, uid_gid.as_deref());
+    assert_ne!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "write to read-only container fs should fail; got {res:?}"
+    );
+
+    // Write inside the overlay bind mount (same path in/out) succeeds and lands on the host.
+    let inside = fx.overlay.join("docker_ok.txt");
+    let cmd = SpawnRequest::argv(
+        "/bin/sh",
+        ["-c".into(), format!("printf x > {}", inside.display())],
+    );
+    let res = exec_as(&sb, &cmd, &fx, uid_gid.as_deref());
+    assert_eq!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "in-overlay write failed: {res:?}"
+    );
+    assert!(
+        inside.exists(),
+        "in-overlay file not written to host overlay"
     );
 }
