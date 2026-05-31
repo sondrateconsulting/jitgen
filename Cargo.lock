@@ -402,6 +402,7 @@ dependencies = [
 name = "jitgen-sandbox"
 version = "0.1.0"
 dependencies = [
+ "jitgen-context",
  "jitgen-core",
  "thiserror",
 ]

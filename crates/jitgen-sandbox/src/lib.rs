@@ -6,32 +6,38 @@
 //! execution **requires** an OS sandbox or container; with no isolation and no explicit opt-in, it
 //! **refuses** ([ADR-0003], [ADR-0010], `docs/security.md` §1).
 //!
-//! ## Stage 1 (this commit): construction only — nothing is spawned
-//! The security-critical pieces are pure and unit-tested offline:
-//! - [`ExecPolicy`] — trusted-only execution policy.
-//! - [`build_env`] — the env **allowlist** (synthetic `HOME`/`TMPDIR`; deny-patterns beat allow).
-//! - [`select`] — **fail-closed** backend selection.
-//! - [`build_plan`] — the exact per-backend launcher argv ([`SandboxPlan`]), incl. the macOS SBPL
-//!   profile ([`sbpl`]) and container flags (`--network=none --read-only --cap-drop ALL …`).
+//! Pipeline: [`detect`] available backends → [`Sandbox::new`] / [`select`] (**fail-closed**) →
+//! [`build_env`] (allowlist; synthetic `HOME`/`TMPDIR`; deny-patterns beat allow) → [`build_plan`]
+//! (per-backend launcher argv: the macOS SBPL profile [`sbpl`]; container
+//! `--network=none --read-only --cap-drop ALL …`) → [`run`] (spawn, std-only watchdog timeout with
+//! whole-process-group/container teardown, output drained off-thread + capped, redaction via
+//! `jitgen_context::redact`, exit→`ExecOutcome`). The high-level [`Sandbox`] ties these together.
 //!
-//! ## Stage 2 (next): runtime
-//! Detection probes, spawning with a wall-clock timeout + whole-process-group teardown, output caps,
-//! redaction via `jitgen_context::redact`, exit→`ExecOutcome` classification, and the per-backend
-//! security conformance suite (network denial, no-write-outside-overlay, env allowlist, fail-closed).
+//! Construction is pure and unit-tested offline. The **live** security conformance suite (network
+//! denial, no-write-outside-overlay, env allowlist) lives in `tests/conformance.rs`, `#[ignore]`d so
+//! it runs on the host (nested sandboxing does not work inside the `cargo`/`bazel` build sandbox).
+//! No `unsafe` (`#![forbid(unsafe_code)]`).
 
 mod backend;
+mod classify;
 mod command;
+mod detect;
 mod env;
 mod error;
 mod policy;
+mod run;
+mod sandbox;
 mod sbpl;
 mod spawn;
 
 pub use backend::{os_candidates, select, Backend, Tier};
 pub use command::{build_plan, PlanInput, SandboxPlan};
+pub use detect::detect;
 pub use env::{build_env, is_denied};
 pub use error::{Result, SandboxError};
 pub use policy::{ExecPolicy, ResourceLimits, DEFAULT_OUTPUT_CAP_BYTES, DEFAULT_TIMEOUT};
+pub use run::run;
+pub use sandbox::{RunRequest, Sandbox};
 pub use sbpl::render_profile;
 pub use spawn::SpawnRequest;
 

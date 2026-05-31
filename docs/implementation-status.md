@@ -145,3 +145,16 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   security **conformance suite** + the security-first (S1) Codex review protocol. 40 sandbox unit
   tests; `./scripts/check.sh` green (cargo + bazel `--lockfile_mode=error`). Added `thiserror` to the
   crate (Bazel `crate_universe` re-pinned). No `unsafe`. **F7 is NOT complete.**
+- 2026-05-31: **F7 Stage 2 (runtime) landed — still `in_progress`; review pending.** `jitgen-sandbox`
+  now executes: `classify` (exit/signal/timeout/build → `ExecOutcome`), `run` (spawn with a std-only
+  watchdog **timeout** + whole-process-group/container teardown via `/bin/kill -KILL -<pgid>` /
+  `docker kill`, off-thread **output caps**, **redaction** via `jitgen_context::redact`), `detect`
+  (live backend probes — constrained-local is never auto-detected), and the high-level `Sandbox`
+  capstone (select → build_env → build_plan → run). **Live security conformance** verified on this
+  host under real `sandbox-exec` (`tests/conformance.rs`, `#[ignore]`d): network denial,
+  no-write-outside-overlay, env-allowlist + synthetic `HOME` (the Docker gate self-skips without a
+  pinned image). Added the `jitgen-context` dep (crate_universe re-pinned). 58 unit + 4 live
+  conformance tests; `./scripts/check.sh` green (cargo + bazel `--lockfile_mode=error`). No `unsafe`.
+  **Remaining for F7 complete:** build-vs-test (`BuildError`) refinement, Docker live conformance with
+  a pinned image + container `--user` uid probe, and the **security-first Codex review protocol**
+  (S1 → T1 → …).

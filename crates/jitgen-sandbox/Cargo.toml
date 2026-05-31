@@ -8,4 +8,5 @@ description = "Fail-closed sandboxed test execution. Pipeline layer 8."
 
 [dependencies]
 jitgen-core.workspace = true
+jitgen-context.workspace = true
 thiserror.workspace = true

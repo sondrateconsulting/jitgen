@@ -160,6 +160,12 @@ pub fn build_env(
     (env, warnings)
 }
 
+/// Snapshot the current process environment (the trusted parent env) for [`build_env`]. The process
+/// env is trusted (a repo cannot influence it); it is filtered/allowlisted by `build_env`.
+pub fn process_env() -> BTreeMap<String, String> {
+    std::env::vars().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
