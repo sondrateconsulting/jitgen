@@ -453,8 +453,9 @@ fn cmd_run(a: RunArgs) -> ExitCode {
     // code. The artifact was already emitted above.
     print_gate_summary(&gate_verdict, a.fail_threshold);
     if gate_verdict.is_failure() {
-        // Exit 3 == "findings gate tripped" — reserved, distinct from 1 (runtime error) and 2 (usage
-        // error). The full exit-code table is task E5 (out of scope here).
+        // Exit 3 == "findings gate tripped" — kept distinct from 1 (runtime error) and 2 (usage
+        // error) so a pipeline can tell "jitgen found a likely bug" from "jitgen itself failed".
+        // Canonical exit-code table: docs/ci.md#exit-codes (and user-guide.md -> Findings gate).
         return ExitCode::from(3);
     }
     ExitCode::SUCCESS

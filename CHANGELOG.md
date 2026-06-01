@@ -24,6 +24,13 @@ run state and report formats.
   keeps [ADR-0011](docs/decisions/0011-overlay-materialization.md). (DX audit finding 4)
 
 ### Added
+- **CI integration guide** ([docs/ci.md](docs/ci.md)): how to run the catch-mode advisory in GitHub
+  Actions and GitLab, upload SARIF to code scanning, and roll the findings gate out from advisory to
+  blocking. Documents the canonical **exit-code table** (`0` ok / `1` runtime / `2` usage / `3`
+  findings-gate; `doctor` `0|1`) — and formalizes the `3` the gate reserved with an in-code pointer to
+  it — plus the real-provider gate-nondeterminism caveat, the fork-PR security model (`pull_request`
+  not `pull_request_target`; same-repo secret gating; protected key), and baseline usage. README and
+  the user guide now link it. (E5 / WS2)
 - **Findings gate for `jitgen run`** (`--fail-on-catch`): a catch-mode run can now fail a CI pipeline
   on a high-confidence catch. The gate is **guarded** — a catch trips it only when its decision is
   `StrongCatch`, its `tp_probability` clears `--fail-threshold` (default `0.9`), and it is not

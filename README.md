@@ -35,6 +35,7 @@ jitgen run     --repo <path> --base <ref> --head <ref>
                  [--mode harden|catch] [--strategy auto|harden|dodgy-diff|intent-aware]
                  [--write | --patch-out <file>]            # harden mode only
                  [--max-tests N] [--format human|json|markdown|patch|junit|sarif]
+                 [--fail-on-catch [--fail-threshold 0..1] [--baseline <file>] [--warn-only]]  # CI gate
 jitgen analyze --repo <path> --base <ref> --head <ref> [--format human|json]   # non-executing plan
 jitgen resume  --run-id <id>
 jitgen report  --run-id <id> [--format human|json|markdown|junit|sarif|patch]
@@ -79,6 +80,7 @@ always-offline gate; `./scripts/audit.sh` is the separate supply-chain audit (co
 ## Documentation
 
 - [User guide](docs/user-guide.md) — commands, modes, strategies, configuration
+- [CI integration](docs/ci.md) — GitHub Actions / GitLab, SARIF upload, the exit-code table, the findings gate
 - [Adapter guide](docs/adapter-guide.md) — the generic `.jitgen.yaml` adapter + the SPI
 - [Troubleshooting](docs/troubleshooting.md) — common issues and fixes
 - [Architecture](docs/architecture.md) · [Security](docs/security.md) · [ADRs](docs/decisions/)

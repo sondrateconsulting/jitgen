@@ -5,7 +5,7 @@ validates them in a **fail-closed sandbox**, classifies the result, and emits a 
 report). It never mutates your repository unless you pass `--write`.
 
 See also: [architecture.md](architecture.md) · [security.md](security.md) ·
-[adapter-guide.md](adapter-guide.md) · [troubleshooting.md](troubleshooting.md).
+[adapter-guide.md](adapter-guide.md) · [ci.md](ci.md) · [troubleshooting.md](troubleshooting.md).
 
 ## Install / build
 
@@ -171,7 +171,8 @@ Harden mode carries no catches, so `--fail-on-catch` is a no-op there (always ex
 
 The gating findings print to **stderr** (stdout stays the clean artifact). Exit codes: **0** = no
 gating findings (or gate off, or `--warn-only`); **3** = findings gate tripped; **1** = runtime error;
-**2** = usage error (the full exit-code table lives in the CI guide).
+**2** = usage error — the full exit-code table and CI recipes (GitHub Actions, GitLab, SARIF upload)
+live in the [CI guide](ci.md#exit-codes).
 
 ### Baseline file
 
