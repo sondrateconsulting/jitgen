@@ -1,0 +1,708 @@
+//! Per-target processing: the body of the JIT generation loop (architecture §"JIT generation loop").
+//!
+//! Generic over the injected `&dyn Executor` and `&dyn LlmProvider`, so the full
+//! generate→classify→repair→flake→assess→accept/reject pipeline is **deterministically testable**
+//! with in-memory doubles (the production path passes the real [`crate::executor::SandboxExecutor`] +
+//! a provider from `jitgen_llm::make_provider`).
+
+use crate::error::Result;
+use crate::targetsel::RankedTarget;
+use jitgen_context::{redact, render_prompt};
+use jitgen_core::{CatchClass, CatchDecision, ContextBundle, Mode, Strategy};
+use jitgen_feedback::{
+    assess, flake_filter_catch, flake_filter_single, generate_candidates, repair_loop,
+    AssessConfig, Executor, FlakeConfig, GenTarget, HarvestedCatch, RepairConfig, RepairOutcome,
+    StrategyConfig, Variant,
+};
+use jitgen_llm::{LlmProvider, LlmRequest};
+use jitgen_materialize::test_path;
+use jitgen_report::{AcceptedTest, CatchReport, MutantInfo, RejectedCandidate};
+use serde::{Deserialize, Serialize};
+
+/// Tunables for a run (all trusted / cost bounds).
+#[derive(Debug, Clone)]
+pub struct RunConfig {
+    pub mode: Mode,
+    pub strategy: Strategy,
+    pub strategy_cfg: StrategyConfig,
+    pub repair_cfg: RepairConfig,
+    pub flake_cfg: FlakeConfig,
+    pub assess_cfg: AssessConfig,
+    /// Consult the LLM judge during assessment (only meaningful with a real provider; the mock
+    /// degrades to rules-only, so we gate it on `real_llm` to keep offline runs deterministic).
+    pub real_llm: bool,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            mode: Mode::Harden,
+            strategy: Strategy::Auto,
+            strategy_cfg: StrategyConfig::default(),
+            repair_cfg: RepairConfig::default(),
+            flake_cfg: FlakeConfig::default(),
+            assess_cfg: AssessConfig::default(),
+            real_llm: false,
+        }
+    }
+}
+
+/// The accepted/rejected results for one target (persisted per target for resume; ADR-0005).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TargetOutcome {
+    pub accepted: Vec<AcceptedTest>,
+    pub catches: Vec<CatchReport>,
+    pub rejected: Vec<RejectedCandidate>,
+    pub candidates_generated: usize,
+}
+
+/// Run the full pipeline for one target.
+pub fn process_target(
+    provider: &dyn LlmProvider,
+    executor: &dyn Executor,
+    rt: &RankedTarget,
+    context: &ContextBundle,
+    prompt_hints: &[String],
+    cfg: &RunConfig,
+) -> Result<TargetOutcome> {
+    let language = rt.target.adapter.as_str();
+    let rel_path = test_path(&rt.target, language);
+    let gen_target = GenTarget {
+        language,
+        symbol: rt.target.symbol.as_deref(),
+        rel_path: &rel_path,
+    };
+
+    let generated = generate_candidates(
+        provider,
+        executor,
+        context,
+        &gen_target,
+        cfg.strategy,
+        cfg.mode,
+        &cfg.strategy_cfg,
+    )?;
+
+    let mut out = TargetOutcome {
+        candidates_generated: generated.candidates.len() + generated.catches.len(),
+        ..TargetOutcome::default()
+    };
+
+    // Strategy A: harden / dodgy-diff produce candidates the orchestrator must run+classify+repair.
+    for candidate in generated.candidates {
+        process_candidate(
+            provider,
+            executor,
+            rt,
+            context,
+            prompt_hints,
+            cfg,
+            candidate,
+            &mut out,
+        )?;
+    }
+
+    // Strategy B: intent-aware already ran+classified each killing test; harvest the weak catches.
+    for harvested in generated.catches {
+        process_harvested(provider, executor, rt, context, cfg, harvested, &mut out)?;
+    }
+
+    Ok(out)
+}
+
+/// Run a harden/dodgy candidate through repair → flake → (assess) → accept/reject.
+#[allow(clippy::too_many_arguments)]
+fn process_candidate(
+    provider: &dyn LlmProvider,
+    executor: &dyn Executor,
+    rt: &RankedTarget,
+    context: &ContextBundle,
+    prompt_hints: &[String],
+    cfg: &RunConfig,
+    candidate: jitgen_core::TestCandidate,
+    out: &mut TargetOutcome,
+) -> Result<()> {
+    let language = rt.target.adapter.as_str();
+    let template = build_template(
+        context,
+        cfg,
+        language,
+        rt.target.symbol.as_deref(),
+        prompt_hints,
+    );
+
+    let report = repair_loop(
+        provider,
+        executor,
+        candidate,
+        &template,
+        cfg.mode,
+        &cfg.repair_cfg,
+    )?;
+    let candidate = report.candidate.clone();
+    let path = candidate.rel_path.clone();
+
+    if report.outcome != RepairOutcome::Accepted {
+        out.rejected.push(reject(
+            rt,
+            &path,
+            match report.outcome {
+                RepairOutcome::Exhausted => "repair budget exhausted before reaching goal",
+                RepairOutcome::Rejected => "failed static validation (dangerous construct)",
+                RepairOutcome::Accepted => unreachable!(),
+            },
+            Some(report.classified.class),
+        ));
+        return Ok(());
+    }
+
+    // Flake filter: rerun to drop nondeterministic results.
+    let stable = match cfg.mode {
+        Mode::Harden => flake_filter_single(executor, &candidate, &Variant::Head, &cfg.flake_cfg)?,
+        Mode::Catch => flake_filter_catch(executor, &candidate, &cfg.flake_cfg)?,
+    };
+    if !stable.stable {
+        out.rejected.push(reject(
+            rt,
+            &path,
+            "flaky (nondeterministic across reruns)",
+            Some(CatchClass::Flaky),
+        ));
+        return Ok(());
+    }
+
+    match (cfg.mode, stable.class()) {
+        (Mode::Harden, CatchClass::HardenPass) => match accept_landable(rt, &candidate, language) {
+            Ok(t) => out.accepted.push(t),
+            Err(reason) => {
+                out.rejected
+                    .push(reject(rt, &path, reason, Some(CatchClass::HardenPass)))
+            }
+        },
+        (Mode::Catch, CatchClass::WeakCatch) => {
+            // Re-derive the observed base+head execution for assessment via one more paired run.
+            let exec = jitgen_core::CatchExecution {
+                base: executor.run_candidate(&candidate, &Variant::Base)?,
+                head: executor.run_candidate(&candidate, &Variant::Head)?,
+            };
+            accept_or_reject_catch(provider, rt, &candidate, &exec, None, context, cfg, out);
+        }
+        (_, class) => {
+            out.rejected.push(reject(
+                rt,
+                &path,
+                "did not reach the goal class",
+                Some(class),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Process an intent-aware harvested catch (already replayed on base+head).
+fn process_harvested(
+    provider: &dyn LlmProvider,
+    executor: &dyn Executor,
+    rt: &RankedTarget,
+    context: &ContextBundle,
+    cfg: &RunConfig,
+    harvested: HarvestedCatch,
+    out: &mut TargetOutcome,
+) -> Result<()> {
+    let path = harvested.candidate.rel_path.clone();
+    if harvested.class != CatchClass::WeakCatch {
+        out.rejected.push(reject(
+            rt,
+            &path,
+            "replay was not a weak catch",
+            Some(harvested.class),
+        ));
+        return Ok(());
+    }
+    // The flake filter must CONFIRM a stable weak catch: `stable.stable` alone is insufficient — an
+    // initial one-off WeakCatch whose confirmation runs are all a stable `NoCatch` is also "stable",
+    // and assessing the original (stale) WeakCatch evidence could manufacture a strong catch (T1/F9).
+    let stable = flake_filter_catch(executor, &harvested.candidate, &cfg.flake_cfg)?;
+    if !(stable.stable && stable.class() == CatchClass::WeakCatch) {
+        out.rejected.push(reject(
+            rt,
+            &path,
+            "did not stably reproduce as a weak catch across reruns",
+            Some(if stable.stable {
+                stable.class()
+            } else {
+                CatchClass::Flaky
+            }),
+        ));
+        return Ok(());
+    }
+    let mutant = MutantInfo {
+        id: harvested.mutant.id.clone(),
+        risk_description: redact(&harvested.mutant.risk_description).text,
+        path: redact(&harvested.mutant.path).text,
+    };
+    // Assess a FRESH confirmed base+head execution (not the original replay) so the evidence the
+    // assessor sees matches the stable confirmation above.
+    let exec = jitgen_core::CatchExecution {
+        base: executor.run_candidate(&harvested.candidate, &Variant::Base)?,
+        head: executor.run_candidate(&harvested.candidate, &Variant::Head)?,
+    };
+    accept_or_reject_catch(
+        provider,
+        rt,
+        &harvested.candidate,
+        &exec,
+        Some(mutant),
+        context,
+        cfg,
+        out,
+    );
+    Ok(())
+}
+
+/// Assess a weak catch and either report it (StrongCatch over threshold) or reject it.
+#[allow(clippy::too_many_arguments)]
+fn accept_or_reject_catch(
+    provider: &dyn LlmProvider,
+    rt: &RankedTarget,
+    candidate: &jitgen_core::TestCandidate,
+    exec: &jitgen_core::CatchExecution,
+    mutant: Option<MutantInfo>,
+    context: &ContextBundle,
+    cfg: &RunConfig,
+    out: &mut TargetOutcome,
+) {
+    let judge: Option<&dyn LlmProvider> = if cfg.real_llm { Some(provider) } else { None };
+    let assessment = assess(exec, true, Some(context), judge, &cfg.assess_cfg);
+    let language = rt.target.adapter.as_str();
+    let path = candidate.rel_path.clone();
+
+    if assessment.decision == CatchDecision::StrongCatch {
+        out.catches.push(CatchReport::from_assessment(
+            rt.target.id.to_string(),
+            language,
+            report_path(&path),
+            redact(&candidate.source).text,
+            &assessment,
+            mutant,
+            redact(&reproduction(language, &candidate.rel_path)).text,
+        ));
+    } else {
+        out.rejected.push(reject(
+            rt,
+            &path,
+            &format!(
+                "assessed {:?} (tp={:.2}); not a reported strong catch",
+                assessment.decision, assessment.tp_probability
+            ),
+            Some(CatchClass::WeakCatch),
+        ));
+    }
+}
+
+fn build_template(
+    context: &ContextBundle,
+    cfg: &RunConfig,
+    language: &str,
+    symbol: Option<&str>,
+    prompt_hints: &[String],
+) -> LlmRequest {
+    let strategy = cfg.strategy.resolve(cfg.mode);
+    LlmRequest {
+        prompt: render_prompt(context, cfg.mode, strategy, language, prompt_hints),
+        mode: cfg.mode,
+        strategy,
+        language: language.to_string(),
+        symbol: symbol.map(|s| s.to_string()),
+        attempt: 0,
+        repair_feedback: None,
+    }
+}
+
+/// Build a **landable** accepted test, or reject it with a reason. The patch / `--write` land EXACTLY
+/// this `source` at EXACTLY this `path`, so they must be the **validated** artifact — not a redacted
+/// display copy. Therefore we refuse a test whose source/path contains a secret-shaped token
+/// (redaction would otherwise make the landed file differ from what the sandbox validated, and insert
+/// path-hostile `[REDACTED:…]` tokens) or whose source is empty (which renders a corrupt patch).
+/// A generated *test* should never legitimately contain a secret, so rejecting it is the safe call —
+/// the accepted source/path are then guaranteed secret-free and land faithfully (T2/F9). `symbol` and
+/// `reproduction` are display-only and stay redacted.
+fn accept_landable(
+    rt: &RankedTarget,
+    candidate: &jitgen_core::TestCandidate,
+    language: &str,
+) -> std::result::Result<AcceptedTest, &'static str> {
+    if candidate.source.trim().is_empty() {
+        return Err("generated test source is empty; refusing to land it");
+    }
+    if redact(&candidate.source).redacted {
+        return Err("generated test source contains a secret-shaped token; refusing to land it");
+    }
+    if redact(&candidate.rel_path).redacted {
+        return Err("generated test path contains a secret-shaped token; refusing to land it");
+    }
+    // Fidelity: the patch exporter strips control bytes from source/path for terminal safety while
+    // `--write` writes raw bytes and the sandbox validated raw bytes — so a control-bearing test would
+    // land DIFFERENT content/path via patch vs `--write`. Refuse anything patch sanitization would
+    // alter, so all three representations (validated / patch / --write) are byte-identical. A
+    // legitimate test has none of these (only `\n`/`\t`, which every path keeps) (T3/F9).
+    if jitgen_report::strip_controls(&candidate.source) != candidate.source {
+        return Err("generated test source contains control characters; refusing to land it");
+    }
+    if !path_is_landable(&candidate.rel_path) {
+        return Err("generated test path contains control characters; refusing to land it");
+    }
+    Ok(AcceptedTest {
+        target: rt.target.id.to_string(),
+        symbol: rt.target.symbol.as_deref().map(|s| redact(s).text),
+        language: language.to_string(),
+        path: candidate.rel_path.clone(), // raw — verified secret-free ⇒ faithful patch/--write
+        source: candidate.source.clone(), // raw — matches exactly what the sandbox validated
+        class: CatchClass::HardenPass,
+        reproduction: redact(&reproduction(language, &candidate.rel_path)).text,
+    })
+}
+
+fn reject(
+    rt: &RankedTarget,
+    path: &str,
+    reason: &str,
+    class: Option<CatchClass>,
+) -> RejectedCandidate {
+    RejectedCandidate {
+        target: rt.target.id.to_string(),
+        path: report_path(path),
+        reason: redact(reason).text,
+        class,
+    }
+}
+
+/// Redact a path before it enters a report (conformance #6): a target file's directory is
+/// attacker-controlled and may, in the pathological case, contain a secret-shaped segment. Redaction
+/// is a no-op for ordinary paths; control/ANSI neutralization is the renderers' job (per format).
+fn report_path(rel_path: &str) -> String {
+    redact(rel_path).text
+}
+
+/// Whether a path survives the patch exporter's `sanitize_path` (strip controls + drop `\n` + trim a
+/// leading `/`) **unchanged**, so the patch references exactly the path `--write` writes. Used only to
+/// gate landable (harden) tests.
+fn path_is_landable(p: &str) -> bool {
+    jitgen_report::strip_controls(p) == p
+        && !p.contains('\n')
+        && !p.contains('\t')
+        && !p.starts_with('/')
+}
+
+fn reproduction(language: &str, rel_path: &str) -> String {
+    format!(
+        "Apply the test file `{rel_path}` into the repository and run the {language} test suite \
+         (jitgen ran it in a no-network sandbox against the head revision)."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jitgen_core::{
+        AdapterId, ExecOutcome, ExecutionResult, LineRange, RiskScore, SymbolKind, Target,
+        TargetId, TestCandidate,
+    };
+    use jitgen_llm::MockProvider;
+
+    fn result(outcome: ExecOutcome, stderr: &str) -> ExecutionResult {
+        ExecutionResult {
+            outcome,
+            exit_code: Some(0),
+            duration_ms: 1,
+            truncated: false,
+            stdout: String::new(),
+            stderr: stderr.into(),
+        }
+    }
+
+    fn ranked(kind: SymbolKind) -> RankedTarget {
+        RankedTarget {
+            target: Target {
+                id: TargetId::new("t0"),
+                adapter: AdapterId::new("rust"),
+                path: "src/a.rs".into(),
+                symbol: Some("add".into()),
+                kind,
+                span: LineRange::new(1, 1).unwrap(),
+                risk: RiskScore::new(0.7).unwrap(),
+            },
+            score: 0.7,
+            rationale: "x".into(),
+        }
+    }
+
+    fn ctx() -> ContextBundle {
+        crate::context::build_context(
+            &jitgen_adapters::RepoSnapshot::new(
+                ["src/a.rs".to_string()],
+                [("src/a.rs".to_string(), b"pub fn add(){}".to_vec())],
+            ),
+            &ranked(SymbolKind::Function).target,
+            &jitgen_core::ChangeSet {
+                base: jitgen_core::RevisionId::new("b"),
+                head: jitgen_core::RevisionId::new("h"),
+                files: vec![],
+            },
+            Mode::Harden,
+            jitgen_core::ContextBudget::default(),
+        )
+    }
+
+    /// Always-pass executor (the mock's harden test passes on head).
+    struct PassExec;
+    impl Executor for PassExec {
+        fn run_candidate(
+            &self,
+            _c: &TestCandidate,
+            _v: &Variant,
+        ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+            Ok(result(ExecOutcome::Passed, ""))
+        }
+        fn run_existing(
+            &self,
+            _v: &Variant,
+        ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+            Ok(result(ExecOutcome::Passed, ""))
+        }
+    }
+
+    /// Weak-catch executor: passes on base, fails (assertion) on head.
+    struct WeakCatchExec;
+    impl Executor for WeakCatchExec {
+        fn run_candidate(
+            &self,
+            _c: &TestCandidate,
+            v: &Variant,
+        ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+            Ok(match v {
+                Variant::Base => result(ExecOutcome::Passed, ""),
+                _ => result(ExecOutcome::Failed, "assertion failed: expected 2, got 3"),
+            })
+        }
+        fn run_existing(
+            &self,
+            _v: &Variant,
+        ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+            Ok(result(ExecOutcome::Passed, ""))
+        }
+    }
+
+    #[test]
+    fn harden_accepts_a_passing_candidate() {
+        let cfg = RunConfig {
+            mode: Mode::Harden,
+            strategy: Strategy::Harden,
+            ..RunConfig::default()
+        };
+        let out = process_target(
+            &MockProvider::new(),
+            &PassExec,
+            &ranked(SymbolKind::Function),
+            &ctx(),
+            &[],
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(out.accepted.len(), 1);
+        assert!(out.catches.is_empty());
+        assert_eq!(out.accepted[0].class, CatchClass::HardenPass);
+        assert!(out.accepted[0].source.contains("#[test]"));
+    }
+
+    #[test]
+    fn catch_dodgy_diff_reports_strong_catch_without_real_judge() {
+        let cfg = RunConfig {
+            mode: Mode::Catch,
+            strategy: Strategy::DodgyDiff,
+            ..RunConfig::default()
+        };
+        let out = process_target(
+            &MockProvider::new(),
+            &WeakCatchExec,
+            &ranked(SymbolKind::Function),
+            &ctx(),
+            &[],
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(out.catches.len(), 1, "{out:?}");
+        assert_eq!(out.catches[0].decision, CatchDecision::StrongCatch);
+        assert!(out.accepted.is_empty());
+    }
+
+    #[test]
+    fn harvested_weak_catch_that_does_not_reproduce_is_rejected() {
+        use jitgen_core::{CatchExecution, Mutant, MutantStatus};
+        use jitgen_feedback::HarvestedCatch;
+
+        // The flake-filter reruns both PASS ⇒ a stable NoCatch, so the original one-off WeakCatch
+        // must NOT be reported as a strong catch (T1/F9).
+        struct PassBothExec;
+        impl Executor for PassBothExec {
+            fn run_candidate(
+                &self,
+                _c: &TestCandidate,
+                _v: &Variant,
+            ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+                Ok(result(ExecOutcome::Passed, ""))
+            }
+            fn run_existing(
+                &self,
+                _v: &Variant,
+            ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+                Ok(result(ExecOutcome::Passed, ""))
+            }
+        }
+        let harvested = HarvestedCatch {
+            candidate: TestCandidate {
+                target: TargetId::new("t0"),
+                rel_path: "tests/c.rs".into(),
+                source: "x".into(),
+                test_name: None,
+                attempt: 0,
+            },
+            mutant: Mutant {
+                id: "m0".into(),
+                risk_description: "r".into(),
+                path: "src/a.rs".into(),
+                diff: "d".into(),
+                status: MutantStatus::Valid,
+            },
+            // Original replay looked like a weak catch…
+            execution: CatchExecution {
+                base: result(ExecOutcome::Passed, ""),
+                head: result(ExecOutcome::Failed, "assertion failed"),
+            },
+            class: CatchClass::WeakCatch,
+        };
+        let cfg = RunConfig {
+            mode: Mode::Catch,
+            strategy: Strategy::IntentAware,
+            ..RunConfig::default()
+        };
+        let mut out = TargetOutcome::default();
+        process_harvested(
+            &MockProvider::new(),
+            &PassBothExec,
+            &ranked(SymbolKind::Function),
+            &ctx(),
+            &cfg,
+            harvested,
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            out.catches.is_empty(),
+            "non-reproducing catch must not be reported: {out:?}"
+        );
+        assert_eq!(out.rejected.len(), 1);
+    }
+
+    #[test]
+    fn accept_landable_lands_raw_validated_source_for_clean_tests() {
+        // A clean test lands EXACTLY the validated source/path (not a redacted copy) — T2/F9.
+        let rt = ranked(SymbolKind::Function);
+        let candidate = TestCandidate {
+            target: TargetId::new("t0"),
+            rel_path: "tests/jitgen_add.rs".into(),
+            source: "#[test] fn t() { assert_eq!(1+1, 2); }".into(),
+            test_name: None,
+            attempt: 0,
+        };
+        let t = accept_landable(&rt, &candidate, "rust").unwrap();
+        assert_eq!(
+            t.source, candidate.source,
+            "landed source must equal validated source"
+        );
+        assert_eq!(
+            t.path, candidate.rel_path,
+            "landed path must equal validated path"
+        );
+    }
+
+    #[test]
+    fn accept_landable_refuses_secret_or_empty_sources() {
+        let rt = ranked(SymbolKind::Function);
+        let mk = |source: &str, path: &str| TestCandidate {
+            target: TargetId::new("t0"),
+            rel_path: path.into(),
+            source: source.into(),
+            test_name: None,
+            attempt: 0,
+        };
+        // Empty source → refused (would render a corrupt patch).
+        assert!(accept_landable(&rt, &mk("   \n", "tests/a.rs"), "rust").is_err());
+        // Secret-shaped token in the source → refused (don't land a secret; keep landed == validated).
+        let secret = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        assert!(accept_landable(&rt, &mk(&format!("// {secret}"), "tests/a.rs"), "rust").is_err());
+        // Secret-shaped token in the path → refused.
+        assert!(accept_landable(
+            &rt,
+            &mk("#[test] fn t(){}", &format!("tests/{secret}.rs")),
+            "rust"
+        )
+        .is_err());
+        // Control byte (ESC) in source → refused (patch strips it, --write keeps it → inconsistent).
+        assert!(accept_landable(&rt, &mk("fn t(){}\u{1b}[2J", "tests/a.rs"), "rust").is_err());
+        // Control byte in the path → refused.
+        assert!(accept_landable(
+            &rt,
+            &mk("#[test] fn t(){}", "tests/\u{1b}evil/a.rs"),
+            "rust"
+        )
+        .is_err());
+        // A clean test with ordinary newlines/tabs is still landable.
+        assert!(accept_landable(&rt, &mk("#[test]\n\tfn t() {}\n", "tests/a.rs"), "rust").is_ok());
+    }
+
+    #[test]
+    fn report_path_redacts_secret_shaped_segments() {
+        // A target file's directory is attacker-controlled; a secret-shaped segment must not reach a
+        // report (conformance #6, S1/F9). Redaction is a no-op for ordinary paths.
+        let leak = report_path("pkg/ghp_0123456789abcdefghijABCDEFGHIJ012345/test.py");
+        assert!(!leak.contains("ghp_0123456789"), "{leak}");
+        assert_eq!(report_path("tests/jitgen_add.rs"), "tests/jitgen_add.rs");
+    }
+
+    #[test]
+    fn harden_rejects_when_candidate_never_passes() {
+        struct FailExec;
+        impl Executor for FailExec {
+            fn run_candidate(
+                &self,
+                _c: &TestCandidate,
+                _v: &Variant,
+            ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+                Ok(result(ExecOutcome::Failed, "assertion failed"))
+            }
+            fn run_existing(
+                &self,
+                _v: &Variant,
+            ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+                Ok(result(ExecOutcome::Passed, ""))
+            }
+        }
+        let cfg = RunConfig {
+            mode: Mode::Harden,
+            strategy: Strategy::Harden,
+            ..RunConfig::default()
+        };
+        let out = process_target(
+            &MockProvider::new(),
+            &FailExec,
+            &ranked(SymbolKind::Function),
+            &ctx(),
+            &[],
+            &cfg,
+        )
+        .unwrap();
+        assert!(out.accepted.is_empty());
+        assert_eq!(out.rejected.len(), 1);
+    }
+}

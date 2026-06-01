@@ -16,7 +16,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F6 | Candidate materialization & rendering (overlay-confined) | ✅ complete | `039a80a` | T1·S1·T2·T3 ✅ |
 | F7 | Sandboxed execution & classification [MAX SCRUTINY] | ✅ complete | `ba7c13c` | S1·T1·S2·T1·T2 ✅ |
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ✅ complete | `a09ac03` | T1·S1·T2 ✅ |
-| F9 | End-to-end CLI + exporters | ⬜ | — | — |
+| F9 | End-to-end CLI + exporters | ✅ complete | `pending` | T1·S1·T2·T3·T4 ✅ |
 | F10 | Hardening, audits, docs, packaging, mid-run resume test | ⬜ | — | — |
 
 ## Environmental constraints discovered (this host, 2026-05-30)
@@ -226,3 +226,24 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   76 unit + 5 integration tests; `./scripts/check.sh` `REAL_GATE_EXIT=0` (cargo fmt/clippy `-D warnings`/
   test/release + bazel build+test `--lockfile_mode=error`); `#![forbid(unsafe_code)]`. Artifacts:
   [reviews/F8/](reviews/F8/) (round-1..3).
+- 2026-05-31: **F9 complete.** End-to-end CLI + exporters across three layers. **`jitgen-report`**
+  (layer 10): the serde report **data contract** + exporters **patch** (default, harden) / **JSON** /
+  **Markdown** / **JUnit** / **SARIF** / **human**, all routing untrusted strings through `escape`
+  (ANSI/control stripping, per-format escaping — Markdown/HTML, XML, SARIF/JSON — length caps;
+  conformance #8/#10). **`jitgen-orchestrator`** (layer 2): the real **`jitgen_feedback::Executor`**
+  (`SandboxExecutor`: Variant→confined revision checkout (+ a fail-closed unified-diff applier for
+  mutants, never shelled) → F6 materialize → adapter `TestCommand` → F7 `Sandbox::run`, fresh per-exec
+  overlay, fail-closed selection), trusted/untrusted **config resolution** (CLI+`JITGEN_*`+`--config`
+  outside-repo vs repo `.jitgen.yaml`), explainable risk-ranked target selection, bounded context,
+  the **`run_jit_generation`** loop (generate→repair→flake→assess→accept/reject) with durable
+  **per-target checkpointing + resume** (deterministic run-id, OID re-verification, reload-vs-reprocess),
+  and **non-executing `analyze`**. **`jitgen-cli`** (layer 1): `clap` `run`/`analyze`/`resume`/`report`
+  (+ F2 `doctor`), **catch is report-only** (`--write`/`--patch-out` rejected on the resolved mode),
+  `--strategy auto` resolution, version parity preserved (`(data-contract v1)`). Added `clap` (Bazel
+  `crate_universe` re-pinned). Offline/deterministic (mock + injected seams) with **real constrained-
+  local sandbox** e2e (harden→patch, catch→report-no-mutation, resume); native TS/Rust + container
+  Java/Python gated per ADR-0009. Codex review **T1**(6 P3+)·**S1**(5 P3+)·**T2**(3 P3+)·**T3**(1 P3)·
+  **T4**(clean): **15 P3+ resolved, 0 unresolved**; S1 confirmed renderer escaping solid, fixes were
+  producer-side redaction + trusted-path-outside-repo + landable-artifact fidelity (validated == patch
+  == --write). ~96 unit/integration tests across the three crates; `./scripts/check.sh`
+  `REAL_GATE_EXIT=0`; `#![forbid(unsafe_code)]`. Artifacts: [reviews/F9/](reviews/F9/) (round-1..5).

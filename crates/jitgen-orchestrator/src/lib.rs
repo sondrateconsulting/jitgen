@@ -1,12 +1,39 @@
 #![forbid(unsafe_code)]
 //! `jitgen-orchestrator` — run manager / orchestrator driving the JIT loop. Pipeline layer 2.
 //!
-//! F2 adds the `doctor` environment report and trusted state-root resolution. The full run loop is
-//! wired in later phases. See `docs/architecture.md` and `docs/implementation-plan.md`.
+//! F9 wires the full `run_jit_generation` loop (F3 git intake → F4 discovery → F5 context/LLM →
+//! F6 materialize → F7 sandbox → F8 feedback), implements the real [`SandboxExecutor`] (the F8
+//! `Executor` seam), resolves the trusted/untrusted config split, drives a **resumable** run with
+//! per-target checkpointing, and the non-executing [`analyze`]. See `docs/architecture.md`.
 
 pub mod doctor;
 
+mod analyze;
+mod checkout;
+mod config;
+mod context;
+mod error;
+mod executor;
+mod patchapply;
+mod process;
+mod run;
+mod targetsel;
+
+#[cfg(test)]
+mod e2e_tests;
+#[cfg(test)]
+mod test_repo;
+
+pub use analyze::{analyze, AnalyzeOptions, AnalyzeReport};
+pub use config::{load_repo_config, parse_backend, parse_strategy, resolve_trusted, TrustedFlags};
 pub use doctor::{run_doctor, DoctorReport};
+pub use error::{OrchestratorError, Result};
+pub use executor::SandboxExecutor;
+pub use process::{process_target, RunConfig, TargetOutcome};
+pub use run::{
+    apply_to_repo, load_report, resume_run, run_jit_generation, state_root_for, RunOptions,
+};
+pub use targetsel::{select as select_targets, RankedTarget};
 
 /// Resolve the durable-state root from **trusted** sources (ADR-0005/0010), without creating it.
 ///

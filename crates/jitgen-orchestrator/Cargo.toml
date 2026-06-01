@@ -8,5 +8,17 @@ description = "Run manager / orchestrator driving the JIT loop. Pipeline layer 2
 
 [dependencies]
 jitgen-core.workspace = true
+jitgen-state.workspace = true
+jitgen-gitintake.workspace = true
+jitgen-adapters.workspace = true
+jitgen-context.workspace = true
+jitgen-llm.workspace = true
+jitgen-materialize.workspace = true
+jitgen-sandbox.workspace = true
+jitgen-feedback.workspace = true
+jitgen-report.workspace = true
+git2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true

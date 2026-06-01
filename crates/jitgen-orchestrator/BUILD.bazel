@@ -3,8 +3,20 @@ load("//bazel:defs.bzl", "jitgen_rust_library")
 jitgen_rust_library(
     name = "jitgen-orchestrator",
     deps = [
+        "//crates/jitgen-adapters",
+        "//crates/jitgen-context",
         "//crates/jitgen-core",
+        "//crates/jitgen-feedback",
+        "//crates/jitgen-gitintake",
+        "//crates/jitgen-llm",
+        "//crates/jitgen-materialize",
+        "//crates/jitgen-report",
+        "//crates/jitgen-sandbox",
+        "//crates/jitgen-state",
+        "@crates//:git2",
         "@crates//:serde",
         "@crates//:serde_json",
+        "@crates//:serde_yaml",
+        "@crates//:thiserror",
     ],
 )

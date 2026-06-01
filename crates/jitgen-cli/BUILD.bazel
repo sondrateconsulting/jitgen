@@ -5,6 +5,8 @@ jitgen_rust_binary(
     deps = [
         "//crates/jitgen-core",
         "//crates/jitgen-orchestrator",
+        "//crates/jitgen-report",
+        "@crates//:clap",
         "@crates//:serde_json",
     ],
 )
