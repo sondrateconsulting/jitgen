@@ -39,11 +39,14 @@ Layout:
 - **Atomic artifact publication:** temp-write in the destination dir → `fsync` → `rename`; the run
   index row is updated in the same step transaction so the index never points at a half-written run.
 
-**State-dir trust hardening** (per F0/S1 review #13):
-- The state root is created/verified as a **private `0700`** directory **outside the target repo**,
-  with **no symlink ancestors**.
+**State-dir trust hardening** (per F0/S1 review #13; resume/report gap closed in F10/S1):
+- The state root is a **private `0700`** directory **outside the target repo**; `run`, `resume`, and
+  `report` refuse a state root that resolves inside the repo — including via a repo-planted symlink
+  ancestor — *before* trusting any stored config. (Symlink ancestors of a **trusted, outside-repo**
+  state root are followed: an accepted residual, since legitimate system paths are symlinks; see
+  security.md "Residual risks".)
 - Artifacts are addressed by **relative IDs** within the run dir, never attacker-influenced absolute
-  paths; `resume`/`report` **validate** every stored path (within the run dir, no symlink ancestors)
+  paths; `resume`/`report` **validate** every stored artifact path (relative, within the run dir)
   before reading/writing.
 - A retention policy bounds on-disk run state; redaction (security §3) is applied before persistence.
 

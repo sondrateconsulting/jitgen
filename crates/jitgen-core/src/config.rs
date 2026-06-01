@@ -40,6 +40,8 @@ pub const FORBIDDEN_REPO_KEYS: &[&str] = &[
     "mode",
     "strategy",
     "max_tests",
+    "docker_image",
+    "docker-image",
 ];
 
 /// tree-sitter grammar names a repo `.jitgen.yaml` may reference. Grammars are compiled into the
@@ -192,6 +194,11 @@ pub struct TrustedConfig {
     pub state_dir: Option<String>,
     /// Max candidate tests per run (cost/DoS bound).
     pub max_tests: u32,
+    /// Digest-pinned container image (`name@sha256:<64 hex>`) for the Docker/Podman sandbox tier.
+    /// **Trusted-only** (a repo cannot redirect execution to an attacker image); the sandbox refuses
+    /// any non-digest-pinned reference at run time (ADR-0009, security §8). `None` ⇒ container tiers
+    /// require the operator to supply one (else execution fails closed with `MissingImage`).
+    pub docker_image: Option<String>,
 }
 
 impl Default for TrustedConfig {
@@ -206,6 +213,7 @@ impl Default for TrustedConfig {
             unsafe_local_execution: false,
             state_dir: None,
             max_tests: 20,
+            docker_image: None,
         }
     }
 }

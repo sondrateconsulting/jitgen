@@ -77,8 +77,9 @@ patch/overlay; mutate the target repo only when `--write` is passed.
 ### 2 — Orchestration / Run-State (`jitgen-orchestrator` + `jitgen-state`)
 Drives the JIT generation loop. State lives under a **state root** resolved as: `--state-dir` flag →
 `JITGEN_STATE_DIR` → `$XDG_STATE_HOME/jitgen` → `~/.local/state/jitgen` (macOS: `~/Library/Application
-Support/jitgen`), **outside the target repo** (a private **`0700`** dir, no symlink ancestors). The
-state root holds a **global run index**
+Support/jitgen`), **outside the target repo** — a private **`0700`** dir; `run`, `resume`, and
+`report` all refuse a state root that resolves inside the repo (incl. via a repo-planted symlink
+ancestor), before trusting any stored config. The state root holds a **global run index**
 (`index.sqlite`: run-id → repo, refs, mode, status, created_at) so `jitgen resume --run-id <id>` and
 `jitgen report --run-id <id>` can locate a run **without** the caller re-specifying the repo. Per-run
 state is `…/runs/<run-id>/state.sqlite` with: step id, inputs, content hashes, status
@@ -196,39 +197,32 @@ content is always rendered as data, never markup or terminal controls.
 
 ## Adapter SPI
 
-The SPI threads an **`AdapterContext`** through every method so adapters see the repo snapshot,
-detection profile, resolved config, mode, and the base/head revisions. `id()` returns an **owned
-`AdapterId`** so the generic adapter can carry a dynamic id from `.jitgen.yaml`. Classification is
-**split**: `classify_single` for one execution (harden mode / individual runs) and `classify_catch`
-for the **paired base+head** execution that catch mode requires. (Revised per F0/T1 review #5.)
+The SPI threads an **`AdapterContext`** (repo snapshot, resolved config, mode, pinned base/head
+revisions) through each adapter call. `id()` returns an **owned `AdapterId`** so the generic adapter
+can carry a dynamic id from `.jitgen.yaml`. The implemented trait is deliberately **small**: an adapter
+**detects** its language and **maps changes to targets + an argv test command**. Everything else —
+context packaging (layer 5), candidate materialization (layer 7), sandboxed execution (layer 8), and
+result **classification** incl. the paired base+head `CatchClass` (layer 9) — is owned by dedicated
+layers and the orchestrator, not by adapter methods.
 
 ```rust
 pub struct AdapterContext<'a> {
-    pub repo: &'a RepoSnapshot,        // files/blobs at a revision (read-only)
-    pub profile: &'a DetectionProfile, // languages, build tools, test runners discovered
-    pub config: &'a ResolvedConfig,    // trusted ⊕ untrusted (typed split; see config-trust tiers)
-    pub mode: Mode,                    // Harden | Catch
-    pub base: RevisionId,
-    pub head: RevisionId,
+    pub repo: &'a RepoSnapshot,     // files/blobs at the head revision (read-only)
+    pub config: &'a ResolvedConfig, // trusted ⊕ untrusted (typed split; see config-trust tiers)
+    pub mode: Mode,                 // Harden | Catch
+    pub base: RevisionId,           // parent OID
+    pub head: RevisionId,           // changed OID
 }
 
 pub trait LanguageAdapter {
-    fn id(&self) -> AdapterId;                                   // owned; dynamic for generic
+    fn id(&self) -> AdapterId;                                              // owned; dynamic for generic
     fn detect(&self, repo: &RepoSnapshot) -> DetectionResult;
     fn analyze_changes(&self, ctx: &AdapterContext, changes: &ChangeSet) -> Vec<Target>;
-    fn collect_context(&self, ctx: &AdapterContext, target: &Target, budget: ContextBudget)
-        -> ContextBundle;
-    fn render_test(&self, ctx: &AdapterContext, candidate: &TestCandidate) -> MaterializedTest;
-    fn test_command(&self, ctx: &AdapterContext, target: &Target, overlay: &Overlay) -> TestCommand;
-    fn validate_generated_test(&self, test: &MaterializedTest) -> ValidationResult;
-    /// One execution (harden mode, or a single run).
-    fn classify_single(&self, result: &ExecutionResult) -> ClassifiedResult;
-    /// Paired base+head execution (catch mode) -> CatchClass.
-    fn classify_catch(&self, exec: &CatchExecution) -> ClassifiedResult; // CatchExecution{base,head}
+    fn test_command(&self, ctx: &AdapterContext, target: &Target) -> Option<TestCommand>;
 }
 ```
 
-`TestCommand` is always an **argv list** (`{ program, args, cwd_rel }`) — it carries **no environment
+`TestCommand` is always an **argv list** (`{ program, args, cwd_rel, shell }`) — it carries **no environment
 authority**. The execution environment is owned solely by the sandbox (a hardcoded allowlist +
 synthetic `HOME`, plus any additions from `TrustedConfig`); an adapter/repo cannot widen it (F0/T2
 review #1). A shell string is only produced when **trusted** config sets `shell: true` (flagged
@@ -284,12 +278,12 @@ generate_candidates(context, ctx, mode, strategy):
 
 run_and_classify(candidate, target, base, head, mode):
   overlay_head = materialize(candidate, head)                       # confined to allowed roots
-  result_head  = sandbox.run(adapter.test_command(ctx, target, overlay_head))
+  result_head  = sandbox.run(adapter.test_command(ctx, target), overlay_head)   # overlay → sandbox, not adapter
   if mode == catch:
     overlay_base = materialize(candidate, base)
-    result_base  = sandbox.run(adapter.test_command(ctx, target, overlay_base))
-    return adapter.classify_catch(CatchExecution{base: result_base, head: result_head})
-  return adapter.classify_single(result_head)
+    result_base  = sandbox.run(adapter.test_command(ctx, target), overlay_base)
+    return classify_catch(CatchExecution{base: result_base, head: result_head})   # feedback layer (9)
+  return classify_single(result_head)                                            # feedback layer (9)
 ```
 
 ## CLI surface

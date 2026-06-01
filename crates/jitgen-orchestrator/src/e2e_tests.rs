@@ -8,7 +8,7 @@
 //! `#[ignore]`d `native` tests below, which record the path used (ADR-0009).
 
 use crate::test_repo::TempRepo;
-use crate::{analyze, run_jit_generation, AnalyzeOptions, RunOptions};
+use crate::{analyze, resume_run, run_jit_generation, AnalyzeOptions, RunOptions};
 use jitgen_core::{Mode, SandboxBackend, Strategy, TrustedConfig};
 use jitgen_report::{render, ReportFormat};
 
@@ -185,6 +185,201 @@ fn run_refuses_state_dir_inside_the_repo() {
         err.unwrap_err().to_string().contains("OUTSIDE"),
         "error should explain the outside-repo rule"
     );
+}
+
+/// A generic fixture with **two** changed files → two ranked targets, so the resume test can prove a
+/// completed target is reloaded while an interrupted one is reprocessed.
+fn two_target_repo() -> (TempRepo, git2::Oid, git2::Oid) {
+    let repo = TempRepo::new();
+    let yaml = "id: demo\nextensions: [txt]\nargv: [\"/bin/sh\", \"-c\", \"exit 0\"]\n";
+    let base = repo.commit_files(&[(".jitgen.yaml", yaml), ("a.txt", "a1\n"), ("b.txt", "b1\n")]);
+    let head = repo.commit_files(&[("a.txt", "a1\na2\n"), ("b.txt", "b1\nb2\n")]);
+    (repo, base, head)
+}
+
+/// **The F10 headline deliverable.** Start a real run, inject a crash part-way through (the second
+/// target is left mid-flight, its step `running`), then resume via the real [`resume_run`] and prove
+/// it (a) continues from the last safe checkpoint, (b) does NOT reprocess the completed target
+/// (reloads its artifact), (c) re-verifies the pinned base/head OIDs, and (d) produces a correct final
+/// report. Runs through the **real** [`crate::SandboxExecutor`] on the **constrained-local** sandbox
+/// tier (the path recorded by the module: no nested OS sandbox under `cargo test`/`bazel test`) +
+/// the deterministic `MockProvider`. The crash is injected by the `#[cfg(test)]`-only `CrashGuard`
+/// (compiled out of production), which mirrors a SIGKILL: target-0 checkpointed `succeeded` with its
+/// artifact on disk, target-1 left `running`, no report, the run index never `completed`.
+#[test]
+fn mid_run_crash_then_resume_completes_from_last_checkpoint() {
+    use jitgen_state::{RunStore, StepStatus};
+
+    let (repo, base, head) = two_target_repo();
+    let state = repo.scratch("state");
+    let opts = RunOptions {
+        repo: repo.path(),
+        base: base.to_string(),
+        head: head.to_string(),
+        trusted: trusted(&state, Mode::Harden, Strategy::Harden),
+    };
+
+    // --- Phase 1: crash mid-run, with target index 1 left in-flight. ---
+    let run_id = {
+        let _crash = crate::run::CrashGuard::at_target(1);
+        let err = run_jit_generation(&opts);
+        assert!(err.is_err(), "the injected crash must abort the run");
+        // No report was returned; recover the deterministic run-id from the durable index.
+        let store = RunStore::open(&state).unwrap();
+        let runs = store.list_runs().unwrap();
+        assert_eq!(runs.len(), 1, "exactly one run was created");
+        runs[0].run_id.clone()
+    };
+
+    // The durable on-disk state matches a real crash: index not `completed`, target-0 checkpointed
+    // succeeded (artifact written), target-1 left `running`, and no report can be served.
+    {
+        let store = RunStore::open(&state).unwrap();
+        assert_ne!(
+            store.get_run(&run_id).unwrap().unwrap().status,
+            "completed",
+            "a crashed run is never marked completed"
+        );
+        assert!(
+            crate::load_report(&state, &run_id).is_err(),
+            "report must refuse a non-completed (crashed) run"
+        );
+        let run = store.open_run(&run_id).unwrap();
+        let steps = run.steps().unwrap();
+        let t: Vec<_> = steps.iter().filter(|s| s.kind == "target").collect();
+        assert_eq!(t.len(), 2, "both target steps were recorded: {steps:?}");
+        assert_eq!(t[0].status, StepStatus::Succeeded, "target-0 checkpointed");
+        assert_eq!(t[1].status, StepStatus::Running, "target-1 left mid-flight");
+        // target-0's artifact is durably present (it will be reloaded, not reprocessed, on resume).
+        assert!(
+            run.dir().join("targets/t0.json").exists(),
+            "target-0 artifact persisted before the crash"
+        );
+    }
+
+    // --- Phase 2: the REAL resume entry point (`jitgen resume`) recovers the run. ---
+    // resume_run re-verifies the pinned base/head OIDs (c) before continuing; it succeeds here because
+    // they still resolve (the negative case is `resume_refuses_when_pinned_oid_is_absent`).
+    //
+    // (b) made airtight: re-arm the crash injector at target index 0. The injector fires only AFTER a
+    // target's `begin_step` — i.e. only if that target is actually (re)processed. Because the completed
+    // target-0 is RELOADED (its `is_done` check short-circuits to `continue` before `begin_step`), the
+    // injector at index 0 never fires and resume completes; had target-0 been reprocessed, resume would
+    // error here instead. The interrupted target-1 (index 1) is reprocessed normally (injector at 0).
+    let resumed = {
+        let _no_reprocess_completed = crate::run::CrashGuard::at_target(0);
+        resume_run(&state, &run_id)
+            .expect("resume completes; completed target-0 was reloaded, not reprocessed")
+    };
+
+    // (d) Correct final report: both targets produced an accepted harden test; the patch renders.
+    assert_eq!(resumed.run_id, run_id);
+    assert_eq!(resumed.mode, Mode::Harden);
+    assert_eq!(
+        resumed.accepted.len(),
+        2,
+        "both targets accepted after resume: {resumed:?}"
+    );
+    assert_eq!(resumed.summary.targets_selected, 2);
+    let patch = render(&resumed, ReportFormat::Patch);
+    assert!(patch.contains("diff --git"), "{patch}");
+
+    // (a)/(b) Checkpoint accounting: target-0 was RELOADED (retry stayed 0), target-1 reran EXACTLY
+    // once on resume (begin_step bumped its retry from the interrupted `running` state).
+    {
+        let store = RunStore::open(&state).unwrap();
+        assert_eq!(
+            store.get_run(&run_id).unwrap().unwrap().status,
+            "completed",
+            "resume marks the run completed"
+        );
+        let run = store.open_run(&run_id).unwrap();
+        let steps = run.steps().unwrap();
+        let t: Vec<_> = steps.iter().filter(|s| s.kind == "target").collect();
+        assert_eq!(t[0].status, StepStatus::Succeeded);
+        assert_eq!(
+            t[0].retry_count, 0,
+            "completed target-0 was reloaded, not reprocessed"
+        );
+        assert_eq!(t[1].status, StepStatus::Succeeded);
+        assert_eq!(
+            t[1].retry_count, 1,
+            "interrupted target-1 reran exactly once on resume"
+        );
+    }
+
+    // Non-destructive throughout: no accepted test was landed in the repo (no --write).
+    for acc in &resumed.accepted {
+        assert!(
+            !repo.path().join(&acc.path).exists(),
+            "resume must not write into the repo without --write"
+        );
+    }
+}
+
+/// (c) in isolation: `resume_run` re-verifies the pinned base/head OIDs before continuing, so a moving
+/// or gc'd ref cannot swap content mid-run (security.md §TOCTOU). A run whose stored head OID is no
+/// longer present in the repository is refused.
+#[test]
+fn resume_refuses_when_pinned_oid_is_absent() {
+    use jitgen_state::{RunMeta, RunStore, STATE_SCHEMA_VERSION};
+
+    let repo = TempRepo::new();
+    let real = repo.commit_files(&[("x.txt", "x\n")]);
+    let state = repo.scratch("state");
+    let store = RunStore::open(&state).unwrap();
+    // A syntactically-valid OID that does not exist in this repo (the head was "lost").
+    let absent = "0123456789abcdef0123456789abcdef01234567";
+    store
+        .create_run(&RunMeta {
+            run_id: "run-absent-oid".into(),
+            repo_path: repo.path().to_string_lossy().into_owned(),
+            base_ref: real.to_string(),
+            head_ref: absent.into(),
+            mode: "harden".into(),
+            schema_version: STATE_SCHEMA_VERSION,
+            status: "running".into(),
+        })
+        .unwrap();
+
+    let err = resume_run(&state, "run-absent-oid").expect_err("absent OID must be refused");
+    assert!(
+        err.to_string().contains("no longer present"),
+        "error should flag the missing pinned OID, got: {err}"
+    );
+}
+
+/// SECURITY (S1/F10): `resume`/`report` must refuse a state store located INSIDE the run's repo. The
+/// state store holds the persisted **trusted** config that governs execution; a hostile repo could
+/// ship an in-repo store enabling `unsafe_local_execution` and, via `resume --state-dir <in-repo>`,
+/// turn resume into unsandboxed execution. Both entry points enforce the same outside-repo invariant
+/// `run` does, BEFORE trusting any stored config.
+#[test]
+fn resume_and_report_refuse_a_state_store_inside_the_repo() {
+    use jitgen_state::{RunMeta, RunStore, STATE_SCHEMA_VERSION};
+
+    let repo = TempRepo::new();
+    let _ = repo.commit_files(&[("a.txt", "x\n")]);
+    // An attacker-planted state store *inside* the repo, governing this very repo's execution.
+    let inside = repo.path().join(".jitgen-state");
+    let store = RunStore::open(&inside).unwrap();
+    store
+        .create_run(&RunMeta {
+            run_id: "run-evil".into(),
+            repo_path: repo.path().to_string_lossy().into_owned(),
+            base_ref: "b".into(),
+            head_ref: "h".into(),
+            mode: "harden".into(),
+            schema_version: STATE_SCHEMA_VERSION,
+            status: "completed".into(),
+        })
+        .unwrap();
+
+    let err = resume_run(&inside, "run-evil").expect_err("in-repo state store must be refused");
+    assert!(err.to_string().contains("OUTSIDE"), "resume: {err}");
+    let err2 =
+        crate::load_report(&inside, "run-evil").expect_err("in-repo state store must be refused");
+    assert!(err2.to_string().contains("OUTSIDE"), "report: {err2}");
 }
 
 /// Count regular files under a directory tree (excluding `.git`).

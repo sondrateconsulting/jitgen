@@ -16,8 +16,9 @@ offered *no real isolation*, yet could be selected automatically.
 
 ### 1. Two configuration trust tiers, never merged into one authority
 - **TRUSTED config** — CLI flags, **jitgen-scoped process environment variables** (`JITGEN_*`, e.g.
-  `JITGEN_STATE_DIR`, set by the invoking user and validated exactly like CLI flags — paths are
-  canonicalized, `0700`, no symlink ancestors), and a **user/system config file located OUTSIDE the
+  `JITGEN_STATE_DIR`, set by the invoking user and validated exactly like CLI flags — the state root
+  is canonicalized, `0700`, and refused if it resolves inside the repo, incl. via a repo-planted
+  symlink ancestor), and a **user/system config file located OUTSIDE the
   target repo** (e.g. `~/.config/jitgen/config.toml`). These share the user's ambient trust; none are
   ever sourced from the repo. Only trusted config may set **security-relevant** settings:
   - LLM provider, base URL, API-key env var name, and **real-LLM enablement**;

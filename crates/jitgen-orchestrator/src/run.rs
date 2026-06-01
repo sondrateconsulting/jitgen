@@ -106,6 +106,12 @@ pub fn resume_run(state_root: &Path, run_id: &str) -> Result<RunReport> {
             what: "run-id",
             detail: format!("no run {run_id:?} in the state index"),
         })?;
+    // SECURITY (S1/F10): the durable state store governs execution policy — `resume` loads the
+    // persisted **trusted** config (which can enable `unsafe_local_execution`). A hostile repo could
+    // ship an in-repo state store with attacker-authored config and, via `resume --state-dir <in-repo>`,
+    // turn resume into UNSANDBOXED execution. Enforce the same invariant `run` does *before* trusting
+    // any stored config: the state root must live OUTSIDE the run's repo.
+    crate::config::ensure_outside_repo(state_root, Path::new(&meta.repo_path), "--state-dir")?;
     let repo = open_repo(Path::new(&meta.repo_path))?;
     let base_oid = parse_oid(&meta.base_ref)?;
     let head_oid = parse_oid(&meta.head_ref)?;
@@ -265,6 +271,10 @@ where
         }
 
         run.begin_step(&step_id)?;
+        // Test-only fault injection point (no-op in production builds): lets the F10 mid-run-crash +
+        // resume e2e simulate a SIGKILL the instant target `i` begins — its step left `running`, no
+        // artifact, the run index never `completed` — then prove the real `resume_run` recovers.
+        maybe_inject_crash(i)?;
         match process(rt) {
             Ok(outcome) => {
                 let bytes = encode_outcome(&outcome)?;
@@ -279,6 +289,58 @@ where
         }
     }
     Ok(outcomes)
+}
+
+/// Fault-injection hook for [`drive_targets`]. **Production build: a no-op** — `drive_targets` is
+/// byte-identical to a version without it — so the seam cannot fire outside `cfg(test)`.
+#[cfg(not(test))]
+#[inline(always)]
+fn maybe_inject_crash(_idx: usize) -> Result<()> {
+    Ok(())
+}
+
+/// Test build: returns a simulated-interruption error when the injector is armed for target `idx`
+/// (see [`CrashGuard`]), reproducing the on-disk state a real crash mid-target leaves.
+#[cfg(test)]
+fn maybe_inject_crash(idx: usize) -> Result<()> {
+    if CRASH_AT_TARGET.with(|c| c.get()) == Some(idx) {
+        return Err(OrchestratorError::Invalid {
+            what: "interrupted",
+            detail: format!("simulated mid-run crash while processing target index {idx}"),
+        });
+    }
+    Ok(())
+}
+
+// Test-only fault injection for the F10 mid-run-crash + resume e2e: when armed with `Some(k)`,
+// `drive_targets` aborts the instant it begins processing target index `k` (after `begin_step` marks
+// the step `running`, before any work), leaving target `k`'s step `running`, no per-target artifact,
+// and the run index never `completed` — exactly the durable state a SIGKILL would leave. The
+// subsequent real `resume_run` must then recover. Compiled out of non-test builds.
+#[cfg(test)]
+thread_local! {
+    static CRASH_AT_TARGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// RAII setter for [`CRASH_AT_TARGET`] that clears the injector on drop, so a fault armed by one test
+/// can never leak into another test scheduled on the same thread.
+#[cfg(test)]
+pub(crate) struct CrashGuard;
+
+#[cfg(test)]
+impl CrashGuard {
+    /// Arm the injector to crash when target index `idx` begins processing.
+    pub(crate) fn at_target(idx: usize) -> Self {
+        CRASH_AT_TARGET.with(|c| c.set(Some(idx)));
+        CrashGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for CrashGuard {
+    fn drop(&mut self) {
+        CRASH_AT_TARGET.with(|c| c.set(None));
+    }
 }
 
 /// Write the accepted (redacted) test files into the target repo. Used by `--write` (harden only).
@@ -326,6 +388,9 @@ pub fn load_report(state_root: &Path, run_id: &str) -> Result<RunReport> {
             what: "run-id",
             detail: format!("no run {run_id:?} in the state index"),
         })?;
+    // SECURITY (S1/F10): refuse to serve a report from a state store INSIDE the run's repo (an
+    // attacker-planted store must never be treated as authoritative), consistent with `resume_run`.
+    crate::config::ensure_outside_repo(state_root, Path::new(&meta.repo_path), "--state-dir")?;
     if meta.status != "completed" {
         return Err(OrchestratorError::Invalid {
             what: "run-id",

@@ -27,6 +27,8 @@ pub struct TrustedFlags {
     pub real_llm: Option<bool>,
     /// Extra env var names to allowlist into the sandbox (still subject to deny-patterns).
     pub env_allowlist_extra: Option<Vec<String>>,
+    /// Digest-pinned container image for the Docker/Podman tier (trusted-only; `name@sha256:...`).
+    pub docker_image: Option<String>,
 }
 
 /// Resolve the trusted configuration: config file (base) → `JITGEN_*` env → CLI flags (highest).
@@ -159,6 +161,11 @@ where
             cfg.state_dir = Some(v);
         }
     }
+    if let Some(v) = env("JITGEN_DOCKER_IMAGE") {
+        if !v.is_empty() {
+            cfg.docker_image = Some(v);
+        }
+    }
     Ok(())
 }
 
@@ -191,6 +198,11 @@ fn apply_flags(cfg: &mut TrustedConfig, flags: &TrustedFlags) {
     }
     if let Some(extra) = &flags.env_allowlist_extra {
         cfg.env_allowlist_extra = extra.clone();
+    }
+    if let Some(img) = &flags.docker_image {
+        if !img.is_empty() {
+            cfg.docker_image = Some(img.clone());
+        }
     }
 }
 
@@ -314,6 +326,23 @@ mod tests {
         let cfg = resolve_trusted(&flags, no_repo(), env).unwrap();
         // Flag (harden) beats env (catch).
         assert_eq!(cfg.mode, Mode::Harden);
+    }
+
+    #[test]
+    fn docker_image_resolves_from_env_and_flag_overrides() {
+        let pinned = "node@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        // env supplies the trusted (digest-pinned) container image…
+        let env = env_from(&[("JITGEN_DOCKER_IMAGE", pinned)]);
+        let cfg = resolve_trusted(&TrustedFlags::default(), no_repo(), &env).unwrap();
+        assert_eq!(cfg.docker_image.as_deref(), Some(pinned));
+        // …and a CLI flag overrides it (highest precedence).
+        let other = "node@sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        let flags = TrustedFlags {
+            docker_image: Some(other.to_string()),
+            ..TrustedFlags::default()
+        };
+        let cfg = resolve_trusted(&flags, no_repo(), &env).unwrap();
+        assert_eq!(cfg.docker_image.as_deref(), Some(other));
     }
 
     #[test]

@@ -9,6 +9,10 @@ rust-version = "1.80"
 license = "Apache-2.0"
 description = "jitgen — Just-in-Time test generation for changed code in a git repository"
 repository = "https://example.invalid/jitgen"
+# App-internal workspace — these crates are never published to crates.io (the repository URL is a
+# placeholder). `publish = false` also lets cargo-deny's `allow-wildcard-paths` exempt the internal
+# path deps while still denying wildcard requirements on external crates (deny.toml, F10).
+publish = false
 
 # Intra-workspace dependencies (path-based) + pinned external crates (introduced in F2).
 [workspace.dependencies]
@@ -23,8 +27,9 @@ thiserror = "2.0.11"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 sha2 = "0.10.8"
 # libgit2 bindings (ADR-0006), vendored + no ssh/https features: local diff/blob reads only,
-# hermetic, no system libgit2/openssl. We never invoke repo hooks/filters.
-git2 = { version = "0.19.0", default-features = false, features = ["vendored-libgit2"] }
+# hermetic, no system libgit2/openssl. We never invoke repo hooks/filters. Pinned >=0.20.4 to clear
+# RUSTSEC-2026-0008 (git2 <0.20.4 `Buf` null-deref unsoundness); resolved in F10 via cargo audit/deny.
+git2 = { version = "0.20.4", default-features = false, features = ["vendored-libgit2"] }
 # Force statically-built (vendored) zlib so libgit2-sys never probes/links system zlib via
 # pkg-config (F3/S1 review #5). Requires a C toolchain at build time (already needed for libgit2).
 libz-sys = { version = "1.1.20", features = ["static"] }

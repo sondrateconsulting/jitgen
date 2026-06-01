@@ -95,8 +95,12 @@ exfiltrate env".
 - **Materialization, F7 conformance requirement:** full `openat`-style dirfd traversal with
   `O_NOFOLLOW` on every component and post-open `fstat` (regular-file + within the overlay
   device/inode root), closing the above TOCTOU windows, plus preflight resource budgets.
-- The **state root** is a private `0700` directory **outside the repo** with **no symlink ancestors**;
-  artifacts are addressed by **relative IDs**, not attacker-influenced absolute paths.
+- The **state root** is a private `0700` directory **outside the repo**; `run`, `resume`, and `report`
+  all refuse a state root that resolves **inside** the repo — including via a repo-planted symlink
+  ancestor (a lexical-plus-canonical check, before any stored config is trusted). Artifacts are
+  addressed by **relative IDs**, not attacker-influenced absolute paths. (Symlink *ancestors* of a
+  **trusted, outside-repo** state root are followed — an accepted residual; see "Residual risks" and
+  the F10 carry-over triage.)
 
 ### 5. Command injection
 - **argv arrays only.** The generic command is an explicit `argv` list with a fixed allowlist of
@@ -134,8 +138,10 @@ exfiltrate env".
   and overall run budgets.
 
 ### 10. Unsafe persistence / logging / report injection
-- State DB + overlays live under the private `0700` state root **outside** the repo; resume/report
-  **validate** stored paths (relative IDs, no symlink ancestors) before reading/writing.
+- State DB + overlays live under the private `0700` state root **outside** the repo; `resume`/`report`
+  refuse a state root inside the repo (before trusting stored config) and **validate** stored
+  artifact paths (relative IDs within the run dir) before reading/writing. (Symlink ancestors of a
+  trusted outside-repo state root are an accepted residual — see "Residual risks".)
 - **Report/log injection:** test names, failures, rationale, and paths are **escaped per output
   format** (Markdown/HTML, XML for JUnit, JSON for SARIF), **control/ANSI characters stripped**, and
   length-capped; untrusted content is always rendered as **data**, never markup/markup-controls.
@@ -223,3 +229,56 @@ These MUST exist and pass before the relevant phase is complete (built security-
   guarantees stand independently — **API keys are read only from the trusted-named env var (never repo
   config/logs), model output is never executed, and execution is sandboxed** (threats #1/#3,
   ADR-0008/0010). Reviewed across F5/S1·T2·T3·T4·T5·T6·T7.
+
+## F10 hardening — carry-over triage (final phase)
+
+F10 ran the supply-chain audits and triaged every recorded carry-over. Each is either **fixed** or
+**accepted as a residual** with rationale here (no carry-over is silently dropped).
+
+- **Supply-chain advisory `RUSTSEC-2026-0008` (`git2` < 0.20.4 `Buf` null-deref unsoundness) —
+  FIXED.** Resolved by upgrading `git2` to `0.20.4` (libgit2-sys `0.18.5+1.9.4`), not suppressed.
+  `cargo audit` and `cargo deny check` are clean; the Bazel `crate_universe` lockfile was repinned and
+  `--lockfile_mode=error` passes. Audits run via `scripts/audit.sh` (config in `deny.toml`); they are
+  dev/CI tools, not crate dependencies. Kept out of the offline `scripts/check.sh` because they fetch
+  the RustSec advisory DB.
+
+- **State-path symlink-ancestor / per-component `openat` traversal (deferred from F9/round-2) —
+  ACCEPTED RESIDUAL.** The **reachable, repo-controlled** vector is closed: a `--state-dir` that
+  textually descends into the repo, or reaches it through a repo-planted symlink ancestor, is refused
+  by the lexical-plus-canonical outside-repo check **before** any state is created (F9/S1). What
+  remains is that symlink *ancestors* of a **trusted, outside-repo** state root are still followed —
+  deliberately, because legitimate system paths are symlinks (macOS `/tmp`→`/private/tmp`, `/var`),
+  and `--state-dir` is trusted config a hostile repo cannot set (ADR-0005). Full per-component
+  `openat`/`O_NOFOLLOW` traversal of the state path would only harden against a *local* attacker who
+  can plant symlinks under the user's own trusted state root — outside the hostile-repo threat model.
+
+- **Bazel↔Cargo toolchain version pin + checksum-pinned bazelisk (F1 P4) — DOCUMENTED DECISION.**
+  `.bazelversion` pins Bazel `7.4.1`; `rust-toolchain.toml` pins Rust `1.95.0` for the Cargo/dev
+  build; Bazel uses the `rules_rust` **default** toolchain (which ships with guaranteed download
+  integrity hashes) at the same edition (2021). The Rust-version divergence is intentional: pinning
+  Bazel to an exact Rust version `rules_rust 0.70.0` does not bundle would require hand-supplied
+  integrity hashes and *reduce* hermeticity. Version **parity of the product** is what's contracted
+  and verified — `jitgen 0.1.0 (data-contract v1)` is byte-identical under Cargo and Bazel. Fully
+  checksum-pinning the bazelisk *launcher* is a CI-provisioning step (the Bazel version it fetches is
+  already pinned by `.bazelversion`).
+
+- **Digest-pinned container images + live `#[ignore]` conformance suite (ADR-0009) — VERIFIED.**
+  Digest-pinning is **enforced in code**: the container backend requires `name@sha256:<64 hex>` and
+  rejects floating tags / short or upper-case digests (`command.rs::is_digest_pinned`), and never
+  pulls during a run. The concrete image digest is a **trusted input** — supplied to the product CLI
+  via `--docker-image`/`JITGEN_DOCKER_IMAGE` (added in F10) or to the conformance suite via
+  `JITGEN_TEST_DOCKER_IMAGE` — never baked into source (so it can't rot); a local
+  `postgres@sha256:951bfda4603…` exercised the Docker tier in F7.
+  The live conformance suite (`crates/jitgen-sandbox/tests/conformance.rs`, `#[ignore]`d) was re-run
+  on-host in F10: the `sandbox-exec` tier (network denial, write-confinement, env-allowlist + synthetic
+  `HOME`) passes; the Docker cases self-skip loudly without `JITGEN_TEST_DOCKER_IMAGE`. "Skipped: no
+  toolchain" never counts as coverage.
+
+- **`serde_yaml 0.9.34` archived/unmaintained (F2) — ACCEPTED RESIDUAL.** It parses **only** the
+  size-capped, untrusted `.jitgen.yaml` (a pre-sandbox DoS bound; ADR-0010), never security-relevant
+  config, and has no failing RustSec advisory today. Tracked in `deny.toml`: if an `unmaintained`
+  advisory is published it becomes an explicit, reasoned acceptance rather than a silent gate break.
+
+- **Secret-redaction heuristic (F5) — REAFFIRMED.** Unchanged; the false-positive/false-negative
+  tradeoff is documented in the Residual risks above. The primary guarantees stand independently (keys
+  read only from the trusted-named env var, model output never executed, execution sandboxed).

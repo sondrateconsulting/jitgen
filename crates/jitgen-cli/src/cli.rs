@@ -72,6 +72,9 @@ struct RunArgs {
     /// Sandbox backend (TRUSTED).
     #[arg(long, value_enum)]
     sandbox: Option<SandboxArg>,
+    /// Digest-pinned container image for the Docker/Podman tier, `name@sha256:...` (TRUSTED).
+    #[arg(long, value_name = "REF")]
+    docker_image: Option<String>,
     /// Permit the no-isolation local sandbox tier (loud, recorded; TRUSTED).
     #[arg(long)]
     unsafe_local_execution: bool,
@@ -298,6 +301,7 @@ fn cmd_run(a: RunArgs) -> ExitCode {
         max_tests: a.max_tests,
         real_llm: flag(a.real_llm),
         env_allowlist_extra: None,
+        docker_image: a.docker_image,
     };
     let trusted = match resolve_trusted(&flags, &a.repo, env_lookup) {
         Ok(t) => t,

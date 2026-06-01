@@ -89,7 +89,8 @@ impl ExecPolicy {
             timeout: DEFAULT_TIMEOUT,
             output_cap_bytes: DEFAULT_OUTPUT_CAP_BYTES,
             limits: ResourceLimits::default(),
-            docker_image: None,
+            // Trusted-only container image; the sandbox still enforces digest-pinning at run time.
+            docker_image: t.docker_image.clone(),
         }
     }
 }

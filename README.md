@@ -11,11 +11,12 @@ arXiv:2601.22832 — see [docs/research/paper-notes.md](docs/research/paper-note
 - **`catch`** — tests that **fail** on your change while **passing** on its parent (a *weak catch*),
   then assessed for whether they reveal a real bug (*strong catch*).
 
-> **Status:** under active, phased construction. See
-> [docs/implementation-status.md](docs/implementation-status.md) for what works today and
-> [docs/implementation-plan.md](docs/implementation-plan.md) for the roadmap. The build is
-> **resumable**: it records progress in `progress.json` + a SQLite run-state DB and continues from
-> the last safe checkpoint.
+> **Status:** the phased build is **complete** (F0–F10). See
+> [docs/final-report.md](docs/final-report.md) for the full wrap-up,
+> [docs/implementation-status.md](docs/implementation-status.md) for the per-phase record, and
+> [docs/user-guide.md](docs/user-guide.md) to get started. Runs are **resumable**: jitgen records
+> per-target progress in a SQLite run-state DB and continues from the last safe checkpoint after an
+> interruption (`jitgen resume`).
 
 ## Highlights
 
@@ -27,16 +28,16 @@ arXiv:2601.22832 — see [docs/research/paper-notes.md](docs/research/paper-note
 - **Bazel (Bzlmod)** canonical build + Cargo workspace for dev ergonomics.
 - **Non-destructive by default** — emits a patch/overlay; never mutates your repo without `--write`.
 
-## CLI (planned surface)
+## CLI
 
 ```text
 jitgen run     --repo <path> --base <ref> --head <ref>
                  [--mode harden|catch] [--strategy auto|harden|dodgy-diff|intent-aware]
                  [--write | --patch-out <file>]            # harden mode only
-                 [--language <id>] [--max-tests N]
+                 [--max-tests N] [--format human|json|markdown|patch|junit|sarif]
 jitgen analyze --repo <path> --base <ref> --head <ref> [--format human|json]   # non-executing plan
 jitgen resume  --run-id <id>
-jitgen report  --run-id <id> [--format human|json|markdown|junit|sarif]
+jitgen report  --run-id <id> [--format human|json|markdown|junit|sarif|patch]
 jitgen doctor
 
 # Trusted options (CLI / user config outside the repo only): --state-dir, --config,
@@ -44,7 +45,8 @@ jitgen doctor
 ```
 
 `--write`/`--patch-out` apply to **harden** mode only; **catch** mode is report-only (catching tests
-fail by design and cannot land).
+fail by design and cannot land). Full usage in the [user guide](docs/user-guide.md); generic-language
+config in the [adapter guide](docs/adapter-guide.md); fixes in [troubleshooting](docs/troubleshooting.md).
 
 ## Architecture
 
@@ -52,23 +54,34 @@ A ten-layer pipeline (CLI → orchestration → git intake → adapters → cont
 sandbox → feedback/assessors → reporting). See [docs/architecture.md](docs/architecture.md) for the
 diagram and per-layer ADRs.
 
-## Building & testing (dev)
-
-> Available **after the F1 scaffold** lands (the Cargo/Bazel workspace is created in F1; see
-> [docs/implementation-status.md](docs/implementation-status.md) for current phase).
+## Building & testing
 
 ```bash
+cargo build --release            # release binary → target/release/jitgen
 cargo build --workspace          # dev build
 cargo test  --workspace          # offline; uses the deterministic mock LLM (no API keys)
-./scripts/check.sh               # fmt + clippy + tests
-# Bazel (canonical; provisioned in F1):
+./scripts/check.sh               # fmt + clippy + tests + release build (+ Bazel if present)
+./scripts/audit.sh               # supply-chain: cargo-audit + cargo-deny (needs the advisory DB)
+
+# Bazel (canonical build) produces the identical binary + version string:
 bazel build //...
 bazel test  //...
+bazel run //:jitgen -- --version   # jitgen 0.1.0 (data-contract v1) — same under Cargo
 ```
 
 All tests run **offline** with a deterministic mock LLM provider; real providers are opt-in via
-`JITGEN_REAL_LLM=true` and environment-provided API keys only.
+trusted config (`--real-llm`) and environment-provided API keys only. `./scripts/check.sh` is the
+always-offline gate; `./scripts/audit.sh` is the separate supply-chain audit (config in
+[`deny.toml`](deny.toml)).
+
+## Documentation
+
+- [User guide](docs/user-guide.md) — commands, modes, strategies, configuration
+- [Adapter guide](docs/adapter-guide.md) — the generic `.jitgen.yaml` adapter + the SPI
+- [Troubleshooting](docs/troubleshooting.md) — common issues and fixes
+- [Architecture](docs/architecture.md) · [Security](docs/security.md) · [ADRs](docs/decisions/)
+- [Final report](docs/final-report.md) — the complete build wrap-up
 
 ## License
 
-A `LICENSE` file is added during F10 (packaging).
+Licensed under the [Apache License, Version 2.0](LICENSE).

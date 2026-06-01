@@ -17,7 +17,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F7 | Sandboxed execution & classification [MAX SCRUTINY] | ✅ complete | `ba7c13c` | S1·T1·S2·T1·T2 ✅ |
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ✅ complete | `a09ac03` | T1·S1·T2 ✅ |
 | F9 | End-to-end CLI + exporters | ✅ complete | `8435649` | T1·S1·T2·T3·T4 ✅ |
-| F10 | Hardening, audits, docs, packaging, mid-run resume test | ⬜ | — | — |
+| F10 | Hardening, audits, docs, packaging, mid-run resume test | ✅ complete | `pending` | T1·S1·T2·T3·T4·T5 ✅ |
 
 ## Environmental constraints discovered (this host, 2026-05-30)
 
@@ -247,3 +247,29 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   producer-side redaction + trusted-path-outside-repo + landable-artifact fidelity (validated == patch
   == --write). ~96 unit/integration tests across the three crates; `./scripts/check.sh`
   `REAL_GATE_EXIT=0`; `#![forbid(unsafe_code)]`. Artifacts: [reviews/F9/](reviews/F9/) (round-1..5).
+- 2026-06-01: **F10 COMPLETE — the FINAL phase; the jitgen build is DONE.** Hardening, audits, docs,
+  packaging + the explicit mid-run-failure + resume e2e. **Supply chain:** resolved `RUSTSEC-2026-0008`
+  by upgrading `git2`→`0.20.4` (Bazel `crate_universe` repinned), not suppressed; added
+  [deny.toml](../deny.toml) (permissive license allowlist; `unsound`/`unmaintained = "all"`;
+  `multiple-versions = "deny"` + one justified `hashbrown` skip; crates.io-only) + `scripts/audit.sh`
+  (cargo-audit + cargo-deny, kept OUT of the offline `check.sh` since they fetch the advisory DB);
+  member crates marked `publish = false`. **Headline test** (`mid_run_crash_then_resume_completes_from_
+  last_checkpoint`): a real 2-target run on the constrained-local sandbox + MockProvider, crash
+  injected mid-target (step left `running`, no artifact, index never `completed`), recovered by the
+  real `resume_run` — proving continue-from-checkpoint, an **airtight reload-not-reprocess** proof
+  (re-arm the `#[cfg(test)]` crash injector at the completed target; it fires only on reprocess), OID
+  re-verification, and a correct final report; + negative OID-reverify and in-repo-state-store-refusal
+  tests. **New trusted surface:** `--docker-image`/`JITGEN_DOCKER_IMAGE` (digest-pinned, trusted-only,
+  forbidden in repo config) so the container tier is usable from the CLI (sandbox still enforces the
+  digest pin). **Packaging:** Apache-2.0 [LICENSE](../LICENSE); `--version` parity holds under Cargo &
+  Bazel (`jitgen 0.1.0 (data-contract v1)`). **Docs:** README + [user](user-guide.md)/[adapter](adapter-guide.md)/[troubleshooting](troubleshooting.md)
+  guides + [final-report.md](final-report.md), cross-linked; SPI docs aligned to the real 4-method
+  `LanguageAdapter` trait. **Carry-overs triaged** in [security.md](security.md): state-path
+  symlink-ancestor (repo-controlled vector closed in `run`/`resume`/`report`; trusted outside-repo
+  ancestors = accepted residual), serde_yaml-archived + Bazel/Cargo toolchain pin = accepted residuals;
+  digest-pin enforcement + live `sandbox-exec` conformance verified on-host. Codex review **T1**(5 P3+)·
+  **S1**(3 P3+, incl. a **P1-class** resume/report state-root-outside-repo gap → fixed)·**T2**(3 P3)·
+  **T3**(3 P3, authoritative-doc/closeout consistency)·**T4**(1 P3, last stale SPI pseudocode ref)·**T5**
+  (clean sign-off): **15 P3+ resolved, 0 unresolved**. `./scripts/check.sh` `REAL_GATE_EXIT=0` (423 cargo
+  tests + bazel `--lockfile_mode=error`); `#![forbid(unsafe_code)]`. Artifacts:
+  [reviews/F10/](reviews/F10/) (round-1..6).

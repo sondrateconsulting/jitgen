@@ -1,0 +1,65 @@
+# cargo-deny configuration — jitgen supply-chain gate (F10).
+#
+# Run via `scripts/audit.sh` (NOT `scripts/check.sh`): cargo-deny + cargo-audit are dev/CI tools that
+# fetch the RustSec advisory DB over the network, so they are kept out of the always-offline gate.
+# They are NOT crate dependencies (no Cargo.toml/BUILD.bazel entry; no Bazel crate_universe repin).
+#
+# Schema: cargo-deny >= 0.18 (advisories & licenses use the deny-by-default / explicit-allowlist
+# model). Docs: https://embarkstudios.github.io/cargo-deny/.
+
+[graph]
+all-features = true
+
+# --- Security advisories (RustSec) -------------------------------------------------------------
+# `unmaintained` and `unsound` default to `workspace` scope, which would miss a *transitive* advisory,
+# so we widen both to `all` (every dependency in the graph). `vulnerability` advisories are errors by
+# default (verified: the pre-F10 `git2` unsound advisory failed this gate). `yanked` is denied. An
+# advisory is ignored ONLY with a written rationale below, so an accepted residual is explicit and a
+# new finding fails the gate instead of passing silently.
+[advisories]
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = [
+  # (empty) — RUSTSEC-2026-0008 (git2 <0.20.4 `Buf` null-deref unsoundness) was RESOLVED in F10 by
+  # upgrading git2 to >=0.20.4, not suppressed. serde_yaml 0.9.34 is archived but has no failing
+  # advisory today; if an `unmaintained` advisory is published, accept it here with the rationale in
+  # docs/security.md (we parse only size-capped, untrusted `.jitgen.yaml` — DoS-bounded, ADR-0010).
+]
+
+# --- Licenses ----------------------------------------------------------------------------------
+# Explicit allowlist of the permissive licenses actually present in the tree (verified via
+# `cargo deny list` in F10). No copyleft is pulled in: LGPL/MPL appear only as OR-alternatives we
+# satisfy permissively, and `... AND Unicode-3.0` is covered by allowing Unicode-3.0.
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "Unlicense",
+]
+confidence-threshold = 0.9
+
+# --- Bans / duplicate versions -----------------------------------------------------------------
+# Duplicate crate versions are DENIED by default; the only known-and-justified duplicate is skipped
+# explicitly below, so a NEW duplicate (of any other, possibly more sensitive crate) fails the gate.
+[bans]
+multiple-versions = "deny"
+# The sole accepted duplicate: two `hashbrown` majors are pulled transitively (v0.14 via
+# rusqlite→hashlink; v0.17 via serde_yaml→indexmap). Unavoidable without forcing sub-dependency
+# versions, and benign (no shared types cross the boundary).
+skip = [{ crate = "hashbrown", reason = "two majors pulled transitively (rusqlite/hashlink vs serde_yaml/indexmap); benign, no shared types cross the boundary" }]
+# Forbid wildcard (`*`) version requirements on EXTERNAL crates (a real supply-chain risk), while
+# allowing the workspace's own path-based internal deps (`jitgen-*`), which are intentionally
+# version-less.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# --- Sources -----------------------------------------------------------------------------------
+# Only crates.io is trusted as a source (no unknown registries or git dependencies).
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

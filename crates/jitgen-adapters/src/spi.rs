@@ -1,8 +1,9 @@
 //! The `LanguageAdapter` SPI and its context/command types.
 //!
-//! F4 implements the detection + change-analysis + test-command surface; `collect_context`,
-//! `render_test`, and result classification arrive in F5/F6/F7 (the SPI grows by phase, as noted in
-//! `docs/architecture.md`).
+//! The adapter surface is intentionally **small** — detection, change-analysis, and the argv
+//! test-command. Context packaging, candidate materialization, sandboxed execution, and result
+//! classification are owned by dedicated layers (`jitgen-context` / `-materialize` / `-sandbox` /
+//! `-feedback`) and the orchestrator, NOT by adapter methods. See `docs/architecture.md`.
 
 use crate::snapshot::RepoSnapshot;
 use jitgen_core::{AdapterId, ChangeSet, Mode, ResolvedConfig, RevisionId, Target};
