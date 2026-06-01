@@ -15,7 +15,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F5 | LLM provider abstraction + context packager | ✅ complete | `e4ff52d` | T1·S1·T2·T3·T4·T5·T6·T7 ✅ |
 | F6 | Candidate materialization & rendering (overlay-confined) | ✅ complete | `039a80a` | T1·S1·T2·T3 ✅ |
 | F7 | Sandboxed execution & classification [MAX SCRUTINY] | ✅ complete | `ba7c13c` | S1·T1·S2·T1·T2 ✅ |
-| F8 | Feedback/repair/minimization/flake-filter + assessors | ✅ complete | `pending` | T1·S1·T2 ✅ |
+| F8 | Feedback/repair/minimization/flake-filter + assessors | ✅ complete | `a09ac03` | T1·S1·T2 ✅ |
 | F9 | End-to-end CLI + exporters | ⬜ | — | — |
 | F10 | Hardening, audits, docs, packaging, mid-run resume test | ⬜ | — | — |
 
