@@ -8,10 +8,11 @@ edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
 description = "jitgen — Just-in-Time test generation for changed code in a git repository"
-repository = "https://example.invalid/jitgen"
-# App-internal workspace — these crates are never published to crates.io (the repository URL is a
-# placeholder). `publish = false` also lets cargo-deny's `allow-wildcard-paths` exempt the internal
-# path deps while still denying wildcard requirements on external crates (deny.toml, F10).
+repository = "https://github.com/sondrateconsulting/jitgen"
+# App-internal workspace — these crates are never published to crates.io. `publish = false` also lets
+# cargo-deny's `allow-wildcard-paths` exempt the internal path deps while still denying wildcard
+# requirements on external crates (deny.toml, F10). Repo is currently PRIVATE; see
+# docs/designs/jitgen-dogfood-sequencing.md for the private-now-public-later plan.
 publish = false
 
 # Intra-workspace dependencies (path-based) + pinned external crates (introduced in F2).
