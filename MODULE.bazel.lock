@@ -1605,7 +1605,7 @@
         "bzlTransitiveDigest": "il2IyDDd5VB0NGt95ipw7MsRL0lHP7p/2aQtprAXLBQ=",
         "usagesDigest": "vj1T6ahHemmDk0t32/epqUsnRSr3tP6QxcKjwKLHrQY=",
         "recordedFileInputs": {
-          "@@//Cargo.toml": "5f33218519a94632a27b47b315991b9b0f7e098bdc281cae9cf9a83a2c7db9a3",
+          "@@//Cargo.toml": "3e0475f828f07f55f702be6ac143120bf53d3882bb941d2d64536d5e034d0ad8",
           "@@//crates/jitgen-context/Cargo.toml": "207e1e6a5bee103aad0f0488b69d5c47b0af1e3292ac3c2a4425fd0103fabcd0",
           "@@//crates/jitgen-materialize/Cargo.toml": "177c2892941ab456b51ed4c0b58cd66d95710124fbddb60001ce0703b30de47e",
           "@@//crates/jitgen-sandbox/Cargo.toml": "d01c0e826a2755349f78a915fe8979012056b34e1edcbe52b44e90dd69419a9b",
