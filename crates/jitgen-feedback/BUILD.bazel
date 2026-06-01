@@ -2,5 +2,11 @@ load("//bazel:defs.bzl", "jitgen_rust_library")
 
 jitgen_rust_library(
     name = "jitgen-feedback",
-    deps = ["//crates/jitgen-core"],
+    deps = [
+        "//crates/jitgen-context",
+        "//crates/jitgen-core",
+        "//crates/jitgen-llm",
+        "@crates//:serde_json",
+        "@crates//:thiserror",
+    ],
 )

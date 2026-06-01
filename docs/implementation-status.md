@@ -15,7 +15,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F5 | LLM provider abstraction + context packager | ✅ complete | `e4ff52d` | T1·S1·T2·T3·T4·T5·T6·T7 ✅ |
 | F6 | Candidate materialization & rendering (overlay-confined) | ✅ complete | `039a80a` | T1·S1·T2·T3 ✅ |
 | F7 | Sandboxed execution & classification [MAX SCRUTINY] | ✅ complete | `ba7c13c` | S1·T1·S2·T1·T2 ✅ |
-| F8 | Feedback/repair/minimization/flake-filter + assessors | ⬜ | — | — |
+| F8 | Feedback/repair/minimization/flake-filter + assessors | ✅ complete | `pending` | T1·S1·T2 ✅ |
 | F9 | End-to-end CLI + exporters | ⬜ | — | — |
 | F10 | Hardening, audits, docs, packaging, mid-run resume test | ⬜ | — | — |
 
@@ -210,3 +210,19 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   (`security.md`, `sbpl.rs`): macOS AS/NPROC limits + `setsid`-escapee output bound (container tier is
   the full fix); broad SBPL `file-read*`/`mach-lookup` (mitigated by no-network + redaction +
   synthetic HOME).
+- 2026-05-31: **F8 complete.** `jitgen-feedback` (layer 9): bounded **repair loop**
+  (generate→fail→repair→pass, static-validation-gated, redacted+fenced feedback), **flake filter**
+  (rerun → `Flaky`), test **minimization** (bounded greedy delta-reduction, byte-exact when no
+  reduction), the rule+LLM **assessor ensemble** → `WeakCatchAssessment` (ADR-0002: `StrongCatch` only
+  when a deterministic **rule gate** passes — clean base-pass/head-**assertion**, stable — AND
+  `tp ≥ threshold`; the strict-JSON LLM judge can only **lower** via `rule_prob.min(judge_score)`,
+  never raise/flip; default `Uncertain`), and the generation **strategies** `harden`, `dodgy-diff`, and
+  the full **intent-aware** pipeline (infer risks → mutants → validate [build + pass existing tests] →
+  mutant-killing tests [pass parent, fail mutant] → replay on head → harvest weak catches). Decoupled
+  from the execution stack via an injected `Executor` seam (real impl is F9) + the F5 `LlmProvider`; all
+  offline/deterministic (mock + scripted doubles). Added `jitgen-llm`/`jitgen-context`/`serde_json`/
+  `thiserror` edges (Bazel `crate_universe` re-pinned twice). Codex review **T1**(5 P3+)·**S1**(2 P3, big
+  assessor-injection invariant confirmed solid)·**T2**(clean sign-off): **7 P3+ resolved, 0 unresolved**.
+  76 unit + 5 integration tests; `./scripts/check.sh` `REAL_GATE_EXIT=0` (cargo fmt/clippy `-D warnings`/
+  test/release + bazel build+test `--lockfile_mode=error`); `#![forbid(unsafe_code)]`. Artifacts:
+  [reviews/F8/](reviews/F8/) (round-1..3).

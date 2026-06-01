@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Repair / minimization / flake-filter / assessors. Pipeline layer 9."
+description = "Repair / minimization / flake-filter / assessors + generation strategies. Pipeline layer 9."
 
 [dependencies]
 jitgen-core.workspace = true
+jitgen-llm.workspace = true
+jitgen-context.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
