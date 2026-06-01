@@ -1614,7 +1614,7 @@
           "@@//crates/jitgen-cli/Cargo.toml": "b62bcbda90cf2a9fb5f88cf7a9410eff99cdfdce0f1a7f936c66e48a9935c08b",
           "@@//crates/jitgen-adapters/Cargo.toml": "ad4927b8a0c9cd0f75188a6bd44f4e6288b07e3e3b0a24c8bdd1d1de092abf3a",
           "@@//crates/jitgen-gitintake/Cargo.toml": "7b65a0810dd09d7eff09142cb5872e6699ff2073ff5b8e737b3a85b2dfe4d0d9",
-          "@@//crates/jitgen-llm/Cargo.toml": "2e22fd94e6921949dbfea801c02cd1dc9bac10834982aeb5e65c9289dd13db57",
+          "@@//crates/jitgen-llm/Cargo.toml": "5359521cabe94a1192304eadb01111b1456b9cc7c38463dd22b39d95ca90fa17",
           "@@//crates/jitgen-report/Cargo.toml": "73d904f4870150946b8522f01c026fd0d5f1b5b42ad23d5c6bd161ad1ccd754d",
           "@@//Cargo.lock": "4db34101e6f6b10f9303e7d38423ec4ffc74a5ada737c0b4c8ad4da13ea1f890",
           "@@//crates/jitgen-orchestrator/Cargo.toml": "aece20727d4a04dd97399051d96a78bf3227f5e0fd424fbaab525a85ef559868",
