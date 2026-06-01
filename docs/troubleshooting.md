@@ -44,6 +44,25 @@ before any state is created).
   applies to a `--config` file. See [ADR-0005](decisions/0005-sqlite-durable-state.md) and
   [security.md](security.md).
 
+## "repository boundary escape" from `jitgen run`/`analyze`
+
+jitgen opens **exactly** the repository you point `--repo` at and refuses to silently read git objects
+from somewhere else.
+
+- **Cause:** the repo's `.git` redirects its git data to a *foreign* repository, the repo uses object
+  **alternates** (an external object store), or a critical git-storage entry (`objects`/`refs`/`HEAD`)
+  is a symlink. These are the escape vectors jitgen fails closed on (a repo is treated as hostile).
+- **Not this:** ordinary **`git worktree`** checkouts that live *inside* their main repository's tree
+  are supported (e.g. Claude Code's `.claude/worktrees/<name>`). A worktree whose common dir
+  (`<main>/.git`) is an ancestor of the worktree is accepted.
+- **Worktree limitation:** a worktree created *outside* its main repo's tree (`git worktree add
+  /elsewhere`) is intentionally rejected in the hostile-input model — jitgen can't prove an arbitrary
+  external `.git` is the one you meant. **Fix:** point `--repo` at the **main working tree** for such
+  worktrees.
+- **Fix (general):** point `--repo` at a normal working tree, or a nested worktree, of the repo you
+  actually want to analyze; don't analyze a directory whose `.git` was hand-edited to point elsewhere.
+  See [security.md](security.md) ("Git intake boundary").
+
 ## "run … is not in a completed state" from `jitgen report`
 
 `report` refuses to serve a run that isn't `completed` — e.g. it's mid-run, or a re-run started and

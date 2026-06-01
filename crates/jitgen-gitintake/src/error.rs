@@ -5,8 +5,11 @@ use thiserror::Error;
 /// Errors from repository intake / diff analysis.
 #[derive(Debug, Error)]
 pub enum GitError {
-    /// Underlying libgit2 error.
-    #[error("git error: {0}")]
+    /// Underlying libgit2 error. Display uses only `git2::Error::message()` — the human-readable
+    /// part — NOT the full `Display`, which appends libgit2 internals (`; class=Os (2); code=NotFound
+    /// (-3)`) that leak into user-facing errors as noise (F10/DX-3). The class/code carry no
+    /// actionable signal for a jitgen user.
+    #[error("git error: {}", .0.message())]
     Git(#[from] git2::Error),
     /// Filesystem error.
     #[error("io error: {0}")]

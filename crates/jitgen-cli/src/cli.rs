@@ -7,12 +7,13 @@
 //! per mode downstream, and `analyze` is non-executing.
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use jitgen_core::{Mode, SandboxBackend, Strategy};
+use jitgen_core::{Mode, ProviderKind, SandboxBackend, Strategy};
 use jitgen_orchestrator::{
     analyze, apply_to_repo, load_report, resolve_trusted, resume_run, run_jit_generation,
     state_root_for, AnalyzeOptions, RunOptions, TrustedFlags,
 };
 use jitgen_report::{render, sanitize, ReportFormat};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -351,7 +352,47 @@ fn cmd_run(a: RunArgs) -> ExitCode {
     } else {
         print!("{}", render(&report, a.format.into()));
     }
+
+    // First-run guidance: the offline default uses a deterministic mock LLM that exercises the whole
+    // pipeline but does not land tests. When it produced nothing, explain that `0 accepted` is the
+    // EXPECTED mock result (not "jitgen is broken") — without pointing at real-provider config, which
+    // isn't wired in this build. Gated on the ACTUAL provider selection (`kind == Mock`, the signal
+    // `make_provider` uses — not the `real_llm` flag, which can diverge) and on harden mode (catch's
+    // "0 catches" is a valid result, not confusion).
+    // Printed to STDERR, best-effort, so stdout (patch/json/sarif) stays a clean pipeable artifact
+    // and a broken stderr never turns a successful run into a panic (F10/DX-2, T-codex P2/P3).
+    let provider_was_mock = opts.trusted.provider.kind == ProviderKind::Mock;
+    let is_harden = report.mode == Mode::Harden;
+    let produced_output = !report.accepted.is_empty() || !report.catches.is_empty();
+    if let Some(hint) = mock_empty_run_hint(provider_was_mock, is_harden, produced_output) {
+        let _ = writeln!(std::io::stderr(), "{hint}");
+    }
     ExitCode::SUCCESS
+}
+
+/// Hint shown when the **mock** provider produced nothing landable on a harden run. Returns `None`
+/// unless all of: the mock provider actually ran, the mode is harden (catch's empty result is
+/// valid), and nothing was produced — so the hint never nags a configured or useful run. Pure for
+/// testability; printed to stderr by the caller.
+///
+/// The copy is deliberately honest about this build: real LLM-backed generation is not wired
+/// (`make_provider` returns a deferred provider that errors `NotEnabled` for every non-mock kind),
+/// so the hint must NOT tell users to "configure a real provider" — that would send them to a wall
+/// (T-codex-r2 P2/P3). Its job is to explain that `0 accepted` from the mock is expected, not a bug.
+fn mock_empty_run_hint(
+    provider_was_mock: bool,
+    is_harden: bool,
+    produced_output: bool,
+) -> Option<&'static str> {
+    if !provider_was_mock || !is_harden || produced_output {
+        return None;
+    }
+    Some(
+        "note: this run used jitgen's built-in mock LLM (the deterministic, offline default) — it \
+         exercises the full pipeline but doesn't synthesize real tests, so `0 accepted` is expected \
+         here, not a failure. Real LLM-backed generation isn't wired in this build yet (non-mock \
+         providers return \"not enabled\").",
+    )
 }
 
 fn cmd_analyze(a: AnalyzeArgs) -> ExitCode {
@@ -428,7 +469,102 @@ fn cmd_doctor(a: DoctorArgs) -> ExitCode {
 
 fn fail(msg: &str) -> ExitCode {
     eprintln!("{msg}");
+    // Every runtime error gets a one-line, actionable next step (DX first principle: an error states
+    // the problem AND the fix). Best-effort to stderr so it never touches a stdout artifact.
+    let _ = writeln!(std::io::stderr(), "{}", user_hint(msg));
     ExitCode::from(1)
+}
+
+/// The jitgen subcommand a `fail()` message came from, parsed from the `jitgen <cmd>: …` prefix that
+/// every `cmd_*` uses. Lets hints stay command-appropriate (e.g. sandbox/image remedies are run-time
+/// trusted flags that `resume` cannot accept — it reloads the original run's persisted config).
+fn command_of(msg: &str) -> &str {
+    msg.strip_prefix("jitgen ")
+        .and_then(|rest| rest.split(':').next())
+        .map(str::trim)
+        .unwrap_or("")
+}
+
+/// Map a user-facing error message to a one-line fix hint, with a `docs/troubleshooting.md` pointer.
+///
+/// Matches on stable, multi-word substrings of jitgen's OWN error envelopes (verified against the
+/// typed intake/orchestrator/sandbox errors in this workspace). It is a deliberately small, contained
+/// mapping for a terminal-only affordance; threading a machine-readable hint code through every error
+/// variant across crates is the robust-but-heavier alternative. Soundness rests on three properties:
+/// (1) the authoritative error is ALWAYS printed above the hint, so a mis-keyed hint is cosmetic, not
+/// wrong behavior; (2) **ordering** — every error that embeds an arbitrary user value (run id, state
+/// path, revspec, repo path) is matched BEFORE any keyword-only branch, so a crafted `--run-id
+/// digest-pinned` or a revspec containing `boundary escape` can't fall through to the wrong hint (the
+/// collisions codex flagged); the revision branch is anchored on its `git intake:` envelope; (3) an
+/// unmatched message degrades to a safe generic pointer (never a wrong fix).
+fn user_hint(msg: &str) -> &'static str {
+    let resume_like = command_of(msg) == "resume";
+
+    // --- (A) errors that embed an arbitrary user value: matched FIRST so the embedded value can't
+    //         trigger a later keyword-only branch. ---
+    // Match ONLY the unique "run not found in the index" envelope, NOT a bare "invalid run-id":
+    // `OrchestratorError::Invalid` is a catch-all that ALSO prefixes the stale-OID and
+    // not-completed errors with "invalid run-id:", so a broad match would steal their specific
+    // hints (T-codex-r3 P3). The run id is embedded after `no run "…"`, before `in the state index`.
+    if msg.contains("invalid run-id: no run ") && msg.contains("in the state index") {
+        return "→ check the run id; `resume`/`report` locate runs via the global run index (no \
+                --repo needed). See docs/troubleshooting.md.";
+    }
+    if msg.contains("is not in a completed state") {
+        return "→ finish the run first with `jitgen resume --run-id <id>`, then report. See \
+                docs/troubleshooting.md.";
+    }
+    if msg.contains("must be OUTSIDE") || msg.contains("must live outside") {
+        // `--state-dir`/`--config` path is embedded after "(resolved under …)".
+        return "→ point --state-dir/--config at a path OUTSIDE the target repo (or omit it for the \
+                XDG default). See docs/troubleshooting.md.";
+    }
+    if msg.contains("git intake: invalid revision") {
+        // Anchored on the `git intake:` envelope so a *boundary* path containing "invalid revision"
+        // can't match here; the revspec itself is in the trailing quotes.
+        return "→ check --base/--head: each must resolve to a commit (a branch, tag, or revspec like \
+                `HEAD` or `HEAD~1`) reachable in the repo. See docs/troubleshooting.md.";
+    }
+    if msg.contains("failed to resolve path")
+        || msg.contains("could not find repository")
+        || msg.contains("not a git repository")
+    {
+        return "→ check --repo points to an existing git working tree. Run `jitgen doctor` to \
+                sanity-check your environment. See docs/troubleshooting.md.";
+    }
+
+    // --- (B) keyword-only envelopes (no embedded user value). ---
+    if msg.contains("boundary escape") {
+        return "→ jitgen reads only the repo you point --repo at. A normal `git worktree` must be \
+                nested in its main repo; a hand-edited `.git`/alternates/symlinked storage is \
+                refused. See docs/troubleshooting.md (\"repository boundary escape\").";
+    }
+    if msg.contains("no isolating sandbox available") {
+        return if resume_like {
+            "→ no isolating sandbox. `resume` reloads the original run's trusted config, so re-run \
+             `jitgen run …` with --unsafe-local-execution (trusted hosts) or a container runtime. \
+             Run `jitgen doctor`. See docs/troubleshooting.md."
+        } else {
+            "→ start a container runtime or run where an OS sandbox exists; or, on a trusted host, \
+             pass --unsafe-local-execution. Run `jitgen doctor` to see what's detected. See \
+             docs/troubleshooting.md."
+        };
+    }
+    if msg.contains("digest-pinned") {
+        return if resume_like {
+            "→ the container tier needs a digest-pinned image, which `resume` can't take; re-run \
+             `jitgen run …` with --docker-image name@sha256:… (or set JITGEN_DOCKER_IMAGE). See \
+             docs/troubleshooting.md."
+        } else {
+            "→ pass --docker-image name@sha256:… (or set JITGEN_DOCKER_IMAGE). See \
+             docs/troubleshooting.md."
+        };
+    }
+    if msg.contains("no longer present") {
+        return "→ the pinned base/head commits were rewritten or GC'd; start a fresh `jitgen run` \
+                against current revisions. See docs/troubleshooting.md.";
+    }
+    "→ see docs/troubleshooting.md for common causes and fixes."
 }
 
 #[cfg(test)]
@@ -466,6 +602,121 @@ mod tests {
     fn flag_maps_present_to_some_true_absent_to_none() {
         assert_eq!(flag(true), Some(true));
         assert_eq!(flag(false), None);
+    }
+
+    #[test]
+    fn user_hint_routes_known_errors_and_falls_back_safely() {
+        // Keyed off stable, REAL error envelopes produced in this workspace.
+        assert!(
+            user_hint("jitgen run: git intake: repository boundary escape: gitdir ...")
+                .contains("worktree")
+        );
+        // The real SandboxError::NoIsolationAvailable text (must match — the old substrings didn't).
+        assert!(user_hint(
+            "jitgen run: no isolating sandbox available (OS sandbox / container required); \
+             refusing to execute untrusted commands without --unsafe-local-execution"
+        )
+        .contains("--unsafe-local-execution"));
+        assert!(user_hint(
+            "jitgen run: container image is not digest-pinned (expected name@sha256:...): \"x\""
+        )
+        .contains("--docker-image"));
+        assert!(user_hint(
+            "jitgen run: --config must be OUTSIDE the target repo (resolved under /r)"
+        )
+        .contains("OUTSIDE"));
+        // `OrchestratorError::Invalid` wraps completed-state and stale-OID errors under the SAME
+        // "invalid run-id:" prefix as the not-found error; each must still route to its OWN hint, not
+        // the generic run-id one (the round-3 catch-all-prefix regression).
+        assert!(user_hint(
+            "jitgen report: invalid run-id: run \"run-x\" is not in a completed state (status: failed)"
+        )
+        .contains("resume"));
+        assert!(user_hint(
+            "jitgen resume: invalid run-id: the run's base/head OIDs are no longer present in the repository"
+        )
+        .contains("fresh"));
+        // The genuine not-found envelope still routes to the run-id hint.
+        assert!(
+            user_hint("jitgen resume: invalid run-id: no run \"x\" in the state index")
+                .contains("run id")
+        );
+        assert!(
+            user_hint("jitgen analyze: git intake: invalid revision 'nope'").contains("revspec")
+        );
+        assert!(
+            user_hint("jitgen run: git intake: git error: failed to resolve path '/x'")
+                .contains("--repo points to")
+        );
+        // Unknown messages degrade to the safe generic pointer (never a wrong fix).
+        assert!(user_hint("totally unexpected error").contains("common causes"));
+    }
+
+    #[test]
+    fn user_hint_is_command_aware_for_sandbox_remedies() {
+        // `resume` reloads the original run's config, so run-time trusted flags don't apply: the hint
+        // must say "re-run jitgen run", not offer the flags directly (T-codex P3).
+        let resume_sandbox = user_hint(
+            "jitgen resume: no isolating sandbox available (OS sandbox / container required); \
+             refusing to execute untrusted commands without --unsafe-local-execution",
+        );
+        assert!(
+            resume_sandbox.contains("re-run `jitgen run"),
+            "got: {resume_sandbox}"
+        );
+        let run_sandbox = user_hint(
+            "jitgen run: no isolating sandbox available (OS sandbox / container required); \
+             refusing to execute untrusted commands without --unsafe-local-execution",
+        );
+        assert!(
+            !run_sandbox.contains("re-run `jitgen run"),
+            "got: {run_sandbox}"
+        );
+    }
+
+    #[test]
+    fn user_hint_user_value_cannot_trigger_wrong_branch() {
+        // A revspec literally containing another branch's keyword must STILL get the revision hint
+        // (value-bearing errors are matched first, anchored on the `git intake:` envelope).
+        let h = user_hint("jitgen analyze: git intake: invalid revision 'boundary escape'");
+        assert!(h.contains("revspec"), "got: {h}");
+        assert!(
+            !h.contains("worktree"),
+            "must not be the boundary hint: {h}"
+        );
+
+        // A run id literally containing "digest-pinned" must get the run-id hint, not the docker one
+        // (the run-id branch is checked before the keyword branches) — the round-2 collision.
+        let r =
+            user_hint("jitgen report: invalid run-id: no run \"digest-pinned\" in the state index");
+        assert!(r.contains("run id"), "got: {r}");
+        assert!(
+            !r.contains("--docker-image"),
+            "must not be the docker hint: {r}"
+        );
+
+        // A run id containing the sandbox phrase must still get the run-id hint, not the sandbox one.
+        let s = user_hint(
+            "jitgen resume: invalid run-id: no run \"no isolating sandbox available\" in the state index",
+        );
+        assert!(s.contains("run id"), "got: {s}");
+        assert!(
+            !s.contains("--unsafe-local-execution"),
+            "must not be the sandbox hint: {s}"
+        );
+    }
+
+    #[test]
+    fn mock_hint_shows_only_for_an_empty_mock_harden_run() {
+        // (provider_was_mock, is_harden, produced_output)
+        // Mock + harden + nothing ⇒ hint (the "0 accepted didn't mean broken" case).
+        assert!(mock_empty_run_hint(true, true, false).is_some());
+        // Mock + harden but something produced ⇒ no hint (don't nag a useful run).
+        assert!(mock_empty_run_hint(true, true, true).is_none());
+        // Mock + CATCH mode + nothing ⇒ no hint (0 catches is a valid catch result, not confusion).
+        assert!(mock_empty_run_hint(true, false, false).is_none());
+        // Real provider (kind != Mock) + harden + nothing ⇒ no hint (genuine empty, not a mock artifact).
+        assert!(mock_empty_run_hint(false, true, false).is_none());
     }
 
     #[test]

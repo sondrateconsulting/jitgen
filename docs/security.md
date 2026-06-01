@@ -186,11 +186,29 @@ These MUST exist and pass before the relevant phase is complete (built security-
 - **Git intake boundary (F3):** `open_repo` opens exactly the requested root (`NO_SEARCH`) and
   verifies the gitdir, commondir, object store are under it, **refuses object alternates** entirely,
   and **rejects symlinked critical git-storage entries** (`objects`/`refs`/`packed-refs`/`HEAD`).
-  Exhaustively mirroring every internal path libgit2 may traverse (e.g. a symlink inside an individual
-  loose-object fanout dir) is **not** fully validated at `open()`. Bounded because intake is
-  **read-only** — it reads git objects only, never executes hooks/filters/commands (verified in
-  F3/S1) — so the worst case is reading git objects already present on the host; code execution is
-  contained by the F7 sandbox.
+  **Linked worktrees** (`git worktree add`) are the one allowed exception to "gitdir under root":
+  their gitdir lives at `<commondir>/worktrees/<name>` by design. The security-critical condition is
+  **locality** — the common dir must be the `.git` of an *ancestor of `root`*, i.e. the worktree
+  lives inside its main repository's tree (the common Claude Code `.claude/worktrees/<name>` case).
+  That is what keeps the relaxation safe: a hostile repo cannot point the object/ref store at an
+  arbitrary external location (e.g. a victim's repo), because `root` must be nested under the common
+  dir's parent — the structural/marker/binding checks alone cannot distinguish a genuine worktree
+  from a hand-crafted self-consistent fake, so they are defense-in-depth, not the boundary. Worktrees
+  that live *outside* their main repo's tree (`git worktree add /elsewhere`) are **not** supported in
+  this hostile-input model (point `--repo` at the main working tree). The alternate guard and the
+  symlink-storage guard — now extended to loose-object fanout dirs, pack/idx files, and the whole
+  `refs/` tree — apply to the worktree's common dir unchanged.
+  The remaining residual is narrow: an **individual loose-object** file symlink
+  (`objects/ab/<40-hex> -> …`) is not validated at `open()` (the fanout count is unbounded), and the
+  validate-then-libgit2-reads window is **TOCTOU**-prone if the git storage is mutated mid-run.
+  Bounded because intake is **read-only** — it reads git objects only, never executes
+  hooks/filters/commands (verified in F3/S1) — so the worst case is reading git objects already
+  present on the host; code execution is contained by the F7 sandbox. **Worktree-locality caveat:**
+  the locality rule places a worktree's object/ref store under an *ancestor* of `root`, not under
+  `root` itself. So if you point `--repo` at a worktree **nested inside a different, sensitive
+  repository**, jitgen will read that ancestor repository's object/ref store. Don't run jitgen on a
+  worktree nested inside a repo you don't intend to expose; point `--repo` at the worktree's own main
+  working tree instead.
 - `--unsafe-local-execution` exists for hosts without any sandbox; it is **off by default**, loud,
   and recorded. macOS `sandbox-exec` is Apple-deprecated though functional. Redaction is heuristic
   (minimize context + exclude secret files; cannot guarantee zero leakage of novel secret formats).
