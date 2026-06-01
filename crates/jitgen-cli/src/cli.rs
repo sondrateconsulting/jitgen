@@ -319,7 +319,9 @@ fn cmd_run(a: RunArgs) -> ExitCode {
     // Validate the catch-mode rule against the EFFECTIVE mode (after env/config resolution), so a
     // catch run set via JITGEN_MODE also rejects --write/--patch-out (decision-0002).
     if let Err(msg) = validate_output_rules(trusted.mode, a.write, a.patch_out.is_some()) {
-        eprintln!("jitgen run: {msg}");
+        // `msg` is jitgen-authored today, but route it through the same sink hardening so a future
+        // edit that interpolates an untrusted value can't reintroduce terminal injection here.
+        eprintln!("{}", safe_for_terminal(&format!("jitgen run: {msg}")));
         return ExitCode::from(2);
     }
     let opts = RunOptions {
@@ -463,10 +465,27 @@ fn cmd_doctor(a: DoctorArgs) -> ExitCode {
     }
 }
 
+/// Cap on a sanitized error message printed to the terminal. Generous for any real jitgen error
+/// envelope (a provider's own error text is already snippet-capped far below this upstream); tight
+/// enough to bound a hostile flood.
+const ERROR_MSG_CAP: usize = 8 * 1024;
+
+/// Make an error message safe to print to the terminal. An error's `Display` can embed untrusted
+/// repo/LLM content (a repo path or ref, a libgit2 message, a provider's own error text), so strip
+/// ANSI/control sequences and flatten newlines/tabs: a hostile value must not be able to recolor the
+/// terminal, move the cursor, set the window title (OSC), or forge a second "line" of output.
+/// Applied at the single CLI error sink, so every current and future error variant is covered without
+/// per-call-site flattening (mirrors `checkout::safe_path_for_error`; security review F1).
+fn safe_for_terminal(msg: &str) -> String {
+    sanitize(msg, ERROR_MSG_CAP).replace(['\n', '\t'], " ")
+}
+
 fn fail(msg: &str) -> ExitCode {
-    eprintln!("{msg}");
+    eprintln!("{}", safe_for_terminal(msg));
     // Every runtime error gets a one-line, actionable next step (DX first principle: an error states
-    // the problem AND the fix). Best-effort to stderr so it never touches a stdout artifact.
+    // the problem AND the fix). The hint is keyed off the RAW msg (its match keywords are control-free)
+    // and is itself a static, jitgen-authored string, so printing it verbatim is safe. Best-effort to
+    // stderr so it never touches a stdout artifact.
     let _ = writeln!(std::io::stderr(), "{}", user_hint(msg));
     ExitCode::from(1)
 }
@@ -506,6 +525,33 @@ mod tests {
     fn flag_maps_present_to_some_true_absent_to_none() {
         assert_eq!(flag(true), Some(true));
         assert_eq!(flag(false), None);
+    }
+
+    #[test]
+    fn error_output_is_sanitized_for_the_terminal() {
+        // An error whose Display embeds a hostile repo path must be neutralized before it reaches
+        // stderr via `fail()` (security review F1): no ESC/CSI recolor, no OSC window-title/BEL, and
+        // no newline-forged second line such as a fake "success" the operator might trust.
+        let hostile =
+            "jitgen run: git intake: unsafe path: a\u{1b}[31mb\u{1b}]0;pwned\u{7}\nfake: SUCCESS";
+        let safe = safe_for_terminal(hostile);
+        assert!(!safe.contains('\u{1b}'), "ESC survived: {safe:?}");
+        assert!(!safe.contains('\u{7}'), "BEL survived: {safe:?}");
+        assert!(
+            !safe.contains('\n'),
+            "newline survived (forged line): {safe:?}"
+        );
+        assert!(!safe.contains('\t'), "tab survived: {safe:?}");
+        // The textual content is preserved (flattened), just rendered inert.
+        assert!(safe.contains("unsafe path"), "content dropped: {safe:?}");
+        assert!(safe.contains("fake: SUCCESS"), "content dropped: {safe:?}");
+    }
+
+    #[test]
+    fn safe_for_terminal_leaves_clean_messages_unchanged() {
+        // A normal single-line error must pass through verbatim (no spurious edits).
+        let clean = "jitgen run: invalid base: no such revision";
+        assert_eq!(safe_for_terminal(clean), clean);
     }
 
     #[test]
