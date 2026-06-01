@@ -46,6 +46,7 @@ jitgen run     --repo <path> --base <ref> --head <ref>
                  [--mode harden|catch] [--strategy auto|harden|dodgy-diff|intent-aware]
                  [--write | --patch-out <file>]            # harden mode only
                  [--max-tests N] [--format human|json|markdown|patch|junit|sarif]
+                 [--fail-on-catch [--fail-threshold 0..1] [--baseline <file>] [--warn-only]]  # CI findings gate
 jitgen analyze --repo <path> --base <ref> --head <ref> [--format human|json]   # non-executing plan
 jitgen resume  --run-id <id> [--state-dir <path>] [--format ...]
 jitgen report  --run-id <id> [--state-dir <path>] [--format human|json|markdown|junit|sarif|patch]
@@ -137,6 +138,57 @@ If `--strategy`/`--mode` are unset, `JITGEN_*` env vars and a trusted config fil
 `patch` (default for `run`), `human`, `json`, `markdown`, `junit`, `sarif`. Every untrusted string
 (test names, paths, failures, rationale) is **escaped per format** with control/ANSI characters
 stripped and lengths capped — output is always data, never markup or terminal controls.
+
+## Findings gate (`--fail-on-catch`)
+
+By default `jitgen run` exits **0** on any successful run, so it never fails a CI job on its own
+findings. Opt into a **findings gate** with `--fail-on-catch`: a `--mode catch` run then exits
+**non-zero (code 3)** when it surfaced a high-confidence catch, so a pipeline can fail on a likely real
+bug.
+
+```bash
+# The SARIF is written even when the gate trips — upload it regardless of the exit code.
+jitgen run --repo . --base "$BASE" --head "$HEAD" --mode catch --format sarif --fail-on-catch \
+  > jitgen.sarif
+```
+
+The gate is **guarded**, not "fail on any catch". A catch's strong-vs-weak verdict is model-assessed
+(a `tp_probability`), so it is *nondeterministic* with a real provider — a naive gate would flake
+builds run-to-run. A catch gates only when **all** of:
+
+- its decision is **`StrongCatch`** — a `StrictlyWeak` test defect or an `Uncertain` verdict never gates; and
+- its `tp_probability` is **≥ `--fail-threshold`** (default `0.9`); and
+- it is **not suppressed by `--baseline`**.
+
+Harden mode carries no catches, so `--fail-on-catch` is a no-op there (always exit 0).
+
+| Flag | Effect |
+|------|--------|
+| `--fail-on-catch` | Arm the gate (off by default; `run` is otherwise unchanged). |
+| `--fail-threshold <0.0–1.0>` | Minimum probability a strong catch must reach (default `0.9`). |
+| `--baseline <file>` | Suppress already-triaged catches (see below). |
+| `--warn-only` | Surface gating findings but still exit 0 (advisory). Use it to roll the gate out before it blocks. |
+
+The gating findings print to **stderr** (stdout stays the clean artifact). Exit codes: **0** = no
+gating findings (or gate off, or `--warn-only`); **3** = findings gate tripped; **1** = runtime error;
+**2** = usage error (the full exit-code table lives in the CI guide).
+
+### Baseline file
+
+A baseline suppresses catches you have already triaged. It is a text file, **one fingerprint per
+line**; blank lines and `#` comments are ignored:
+
+```text
+# known, already-tracked catches — see TICKET-1234
+t3 src/auth/session.rs
+t7 src/billing/invoice.rs
+```
+
+Each fingerprint is the stable identity jitgen prints for a gated catch (the `tp=… <fingerprint>` line
+on stderr): the **target** plus the **mutated file path**. It is deliberately **not** keyed on the
+generated-test source, which a real provider rewrites each run — so a baseline keeps matching across
+runs. Copy the printed fingerprint verbatim. A missing, oversized, or malformed baseline is a runtime
+error (exit 1) with a one-line fix hint; see [troubleshooting.md](troubleshooting.md).
 
 ## Configuration: trusted vs repo
 

@@ -51,6 +51,24 @@ Catch mode is **report-only** by design: catching tests fail on `head`, so they 
 - **Fix:** drop `--write`/`--patch-out` for catch runs, or use `--mode harden` if you want landable
   tests. This rule is enforced against the *effective* mode (after `JITGEN_MODE`/config resolution).
 
+## "baseline file is unreadable / too large / malformed" from `jitgen run`
+
+`--fail-on-catch --baseline <file>` reads a list of catch fingerprints to suppress from the findings
+gate. jitgen parses it as untrusted boundary input and fails closed with a typed error:
+
+- **`unreadable`** — the path doesn't exist or can't be read. Check `--baseline` points at the right
+  file (a CI job's working directory may differ from where the file lives).
+- **`too large`** — the file exceeds the 1 MiB cap. A baseline is a short fingerprint list, not a data
+  file; you likely pointed `--baseline` at the wrong path.
+- **`malformed`** — a line is non-UTF-8, contains a control character, is longer than 4096 bytes, or
+  there are more than 50,000 entries. The error names the offending line number, never its contents.
+
+**Format:** one fingerprint per line; blank lines and `#` comments are ignored. A fingerprint is the
+`target mutated/path` token jitgen prints for each gated catch (the `tp=… <fingerprint>` line on
+stderr) — copy it verbatim. The key is the catch's stable identity (target + mutated path), **not** the
+generated-test source, so a baseline keeps matching even though a real provider rewrites the test each
+run. See [user-guide.md → Findings gate](user-guide.md#findings-gate---fail-on-catch).
+
 ## "the state directory must be OUTSIDE the repo"
 
 The durable run-state root must live outside the target repository (it's a private `0700` dir; a

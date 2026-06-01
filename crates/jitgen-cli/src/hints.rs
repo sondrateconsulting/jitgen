@@ -35,6 +35,18 @@ pub(crate) fn user_hint(msg: &str) -> &'static str {
 
     // --- (A) errors that embed an arbitrary user value: matched FIRST so the embedded value can't
     //         trigger a later keyword-only branch. ---
+    // The `--baseline` errors (E4) embed the operator-supplied baseline PATH, which could itself
+    // contain another branch's keyword. Anchored on the distinctive jitgen phrase "baseline file"
+    // (shared by all three GateError Display strings) and placed FIRST in section (A), so a hostile
+    // baseline path containing e.g. "boundary escape" still routes here. The residual is purely
+    // cosmetic and bounded (per this module's soundness note): a NON-baseline error whose embedded
+    // value literally contains "baseline file" would mis-hint — the authoritative error prints above.
+    if msg.contains("baseline file") {
+        return "→ --baseline wants a readable UTF-8 file of catch fingerprints, one per line (`#` \
+                comments and blank lines allowed); copy the fingerprint jitgen prints for a gated \
+                catch. Check the path exists, is text, and is within the size cap. See \
+                docs/troubleshooting.md.";
+    }
     // The overlay/snapshot DoS caps (file-count, per-file, aggregate, walk) embed the offending repo
     // PATH, which could itself contain another branch's keyword. Match FIRST in section (A), requiring
     // the `invalid overlay:`/`invalid snapshot:` envelope AND `checkout cap`: every genuine cap error
@@ -146,6 +158,26 @@ pub(crate) fn mock_empty_run_hint(
          exercises the full pipeline but doesn't synthesize real tests, so `0 accepted` is expected \
          here, not a failure. To generate real tests, set a provider in a trusted config file and \
          pass --real-llm (see docs/user-guide.md → Real providers).",
+    )
+}
+
+/// Note shown when a findings-gate **modifier** (`--warn-only`/`--baseline`) was passed but the
+/// `--fail-on-catch` master switch was not, so the gate never engaged and those flags did nothing.
+/// Returns `None` when the gate is on (the modifiers are live) or when no modifier was passed (nothing
+/// to explain). Pure for testability; printed to stderr by the caller. `--fail-threshold` is omitted
+/// from the trigger because it always carries its default value (we can't tell if it was passed).
+pub(crate) fn gate_modifiers_without_master_note(
+    fail_on_catch: bool,
+    warn_only: bool,
+    has_baseline: bool,
+) -> Option<&'static str> {
+    if fail_on_catch || (!warn_only && !has_baseline) {
+        return None;
+    }
+    Some(
+        "note: --warn-only/--baseline/--fail-threshold only take effect with --fail-on-catch; the \
+         findings gate is off, so this run does not gate on catches (see docs/user-guide.md → \
+         Findings gate).",
     )
 }
 
@@ -321,6 +353,45 @@ mod tests {
             !hostile.contains("--repo points to"),
             "hostile path must not steal the repo-path hint: {hostile}"
         );
+    }
+
+    #[test]
+    fn user_hint_routes_baseline_errors_and_keeps_ordering() {
+        // All three GateError Display strings share the "baseline file" anchor and route to the
+        // --baseline hint.
+        assert!(user_hint(
+            "jitgen run: baseline file is unreadable: /tmp/known.txt (No such file or directory)"
+        )
+        .contains("--baseline wants"));
+        assert!(user_hint(
+            "jitgen run: baseline file is too large: it exceeds the 1048576-byte cap (/b)"
+        )
+        .contains("size cap"));
+        assert!(user_hint(
+            "jitgen run: baseline file is malformed: line 2 contains a control character (in /b)"
+        )
+        .contains("--baseline wants"));
+        // Ordering: the baseline branch is FIRST in section (A), so a hostile baseline PATH that
+        // embeds another branch's keyword still routes to the baseline hint, not that branch.
+        let hostile =
+            user_hint("jitgen run: baseline file is unreadable: /tmp/boundary escape/x (denied)");
+        assert!(hostile.contains("--baseline wants"), "got: {hostile}");
+        assert!(
+            !hostile.contains("worktree"),
+            "hostile path must not steal the boundary hint: {hostile}"
+        );
+    }
+
+    #[test]
+    fn gate_modifiers_note_only_fires_for_a_modifier_without_the_master_switch() {
+        // (fail_on_catch, warn_only, has_baseline)
+        // Modifier present, master off ⇒ note (the silent-no-op case we want to surface).
+        assert!(gate_modifiers_without_master_note(false, true, false).is_some());
+        assert!(gate_modifiers_without_master_note(false, false, true).is_some());
+        // Master on ⇒ no note (the modifiers are live).
+        assert!(gate_modifiers_without_master_note(true, true, true).is_none());
+        // No modifier at all ⇒ nothing to explain.
+        assert!(gate_modifiers_without_master_note(false, false, false).is_none());
     }
 
     #[test]

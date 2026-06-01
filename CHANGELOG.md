@@ -24,6 +24,17 @@ run state and report formats.
   keeps [ADR-0011](docs/decisions/0011-overlay-materialization.md). (DX audit finding 4)
 
 ### Added
+- **Findings gate for `jitgen run`** (`--fail-on-catch`): a catch-mode run can now fail a CI pipeline
+  on a high-confidence catch. The gate is **guarded** — a catch trips it only when its decision is
+  `StrongCatch`, its `tp_probability` clears `--fail-threshold` (default `0.9`), and it is not
+  suppressed by `--baseline` — because catch classification is model-assessed and nondeterministic, so
+  a plain "any catch fails" gate would flake builds. `--warn-only` surfaces findings but still exits 0
+  (advisory rollout). A new **distinct exit code 3** signals "findings gate tripped" (separate from 1
+  = runtime error, 2 = usage error). The report/SARIF artifact is always emitted **before** the gate
+  decides the exit code, so CI can upload it even on a gate failure. `--baseline` takes a file of catch
+  fingerprints (one per line, `#` comments allowed) keyed on each catch's stable identity (target +
+  mutated path), not the run-to-run generated-test source. See
+  [user-guide.md → Findings gate](docs/user-guide.md#findings-gate---fail-on-catch). (E4 / WS2)
 - This changelog. (DX audit finding 3)
 
 ## [0.1.0] — 2026-06-01

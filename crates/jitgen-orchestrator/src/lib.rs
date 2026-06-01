@@ -14,6 +14,7 @@ mod config;
 mod context;
 mod error;
 mod executor;
+mod gate;
 mod patchapply;
 mod process;
 mod run;
@@ -29,6 +30,10 @@ pub use config::{load_repo_config, parse_backend, parse_strategy, resolve_truste
 pub use doctor::{describe_provider, run_doctor, DoctorReport};
 pub use error::{OrchestratorError, Result};
 pub use executor::SandboxExecutor;
+pub use gate::{
+    catch_fingerprint, gate_exit_code, Baseline, GateError, GateVerdict, GatingFinding,
+    DEFAULT_FAIL_THRESHOLD,
+};
 pub use process::{process_target, RunConfig, TargetOutcome};
 pub use run::{
     apply_to_repo, load_report, resume_run, run_jit_generation, state_root_for, RunOptions,

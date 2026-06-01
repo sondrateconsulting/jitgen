@@ -6,16 +6,17 @@
 //! (`--write`/`--patch-out` rejected with `--mode catch`; decision-0002), `--strategy auto` resolves
 //! per mode downstream, and `analyze` is non-executing.
 
-use crate::hints::{mock_empty_run_hint, user_hint};
+use crate::hints::{gate_modifiers_without_master_note, mock_empty_run_hint, user_hint};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use jitgen_core::{Mode, ProviderKind, SandboxBackend, Strategy};
 use jitgen_orchestrator::{
-    analyze, apply_to_repo, load_report, resolve_trusted, resume_run, run_jit_generation,
-    state_root_for, AnalyzeOptions, RunOptions, TrustedFlags,
+    analyze, apply_to_repo, gate_exit_code, load_report, resolve_trusted, resume_run,
+    run_jit_generation, state_root_for, AnalyzeOptions, Baseline, GateVerdict, RunOptions,
+    TrustedFlags, DEFAULT_FAIL_THRESHOLD,
 };
-use jitgen_report::{render, sanitize_line, ReportFormat};
+use jitgen_report::{render, sanitize_line, ReportFormat, RunReport};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// Top-level CLI.
@@ -95,6 +96,23 @@ struct RunArgs {
     /// Output format when printing to stdout (ignored with --write/--patch-out).
     #[arg(long, value_enum, default_value_t = FormatArg::Patch)]
     format: FormatArg,
+    /// Exit non-zero (code 3) when the run surfaces a high-confidence catch — a CI **findings gate**.
+    /// Off by default, so a normal run is unaffected. Guarded by --fail-threshold/--baseline/
+    /// --warn-only: catch classification is model-assessed (nondeterministic with a real provider), so
+    /// a plain "any catch fails" gate would flake builds. Catch mode only (harden carries no catches).
+    #[arg(long)]
+    fail_on_catch: bool,
+    /// Minimum true-positive probability [0.0–1.0] a strong catch must reach to trip --fail-on-catch.
+    #[arg(long, value_name = "PROB", default_value_t = DEFAULT_FAIL_THRESHOLD, value_parser = parse_fail_threshold)]
+    fail_threshold: f64,
+    /// File of catch fingerprints to suppress from the gate, one per line (`#` comments allowed). Copy
+    /// the fingerprint jitgen prints for a gated catch; it is keyed on the catch's stable identity
+    /// (target + mutated path), not the generated-test source.
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
+    /// Surface gate findings but always exit 0 (advisory; only meaningful with --fail-on-catch).
+    #[arg(long)]
+    warn_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -264,6 +282,17 @@ fn validate_output_rules(
     Ok(())
 }
 
+/// clap value parser for `--fail-threshold`: a probability in `[0.0, 1.0]`. Rejects non-numbers and
+/// out-of-range values as a usage error (exit 2). The message is a static, control-free string and
+/// deliberately does NOT echo the raw input (clap frames the offending value itself).
+fn parse_fail_threshold(s: &str) -> std::result::Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && (0.0..=1.0).contains(&v) => Ok(v),
+        Ok(_) => Err("must be a probability between 0.0 and 1.0".to_string()),
+        Err(_) => Err("must be a number between 0.0 and 1.0".to_string()),
+    }
+}
+
 /// The version string, preserving the F1 build-system parity contract: identical under Cargo & Bazel,
 /// and carrying the core data-contract schema version (`jitgen 0.1.0 (data-contract v1)`).
 fn version_string() -> String {
@@ -338,6 +367,12 @@ fn cmd_run(a: RunArgs) -> ExitCode {
         Err(e) => return fail(&format!("jitgen run: {e}")),
     };
 
+    // Emit the run artifact FIRST (always), so a CI job can upload the report/SARIF regardless of the
+    // findings-gate exit code computed afterwards. `--write`/`--patch-out` are harden-only (catch
+    // rejects them upstream), where there are no catches, so the gate is a guaranteed no-op for those
+    // paths; it is evaluated only on the stdout report path (the CI case, e.g. `--mode catch --format
+    // sarif`) inside `emit_then_gate`, which renders BEFORE it gates.
+    let mut gate_verdict = GateVerdict::Disabled;
     if a.write {
         match apply_to_repo(&opts.repo, &report) {
             Ok(written) => {
@@ -370,7 +405,24 @@ fn cmd_run(a: RunArgs) -> ExitCode {
             safe_for_terminal(&out.display().to_string(), 512)
         );
     } else {
-        print!("{}", render(&report, a.format.into()));
+        let mut stdout = std::io::stdout().lock();
+        match emit_then_gate(
+            &report,
+            a.format.into(),
+            &mut stdout,
+            a.fail_threshold,
+            a.baseline.as_deref(),
+            a.warn_only,
+            a.fail_on_catch,
+        ) {
+            Ok(v) => gate_verdict = v,
+            Err(EmitGateError::Io(e)) => {
+                return fail(&format!("jitgen run: cannot write report: {e}"))
+            }
+            // A bad --baseline is a config error (exit 1), distinct from a gate trip (exit 3). The
+            // artifact was already written to stdout above, so CI can still upload it.
+            Err(EmitGateError::Gate(e)) => return fail(&format!("jitgen run: {e}")),
+        }
     }
 
     // First-run guidance: the offline default uses a deterministic mock LLM that exercises the whole
@@ -388,7 +440,97 @@ fn cmd_run(a: RunArgs) -> ExitCode {
     if let Some(hint) = mock_empty_run_hint(provider_was_mock, is_harden, produced_output) {
         let _ = writeln!(std::io::stderr(), "{hint}");
     }
+
+    // A gate-modifier flag passed without the --fail-on-catch master switch is otherwise a silent
+    // no-op; note it (best-effort, stderr) so the operator isn't surprised the gate didn't engage.
+    if let Some(note) =
+        gate_modifiers_without_master_note(a.fail_on_catch, a.warn_only, a.baseline.is_some())
+    {
+        let _ = writeln!(std::io::stderr(), "{note}");
+    }
+
+    // Findings gate (E4), LAST: surface any gating findings (stderr) and map the verdict to the exit
+    // code. The artifact was already emitted above.
+    print_gate_summary(&gate_verdict, a.fail_threshold);
+    if gate_verdict.is_failure() {
+        // Exit 3 == "findings gate tripped" — reserved, distinct from 1 (runtime error) and 2 (usage
+        // error). The full exit-code table is task E5 (out of scope here).
+        return ExitCode::from(3);
+    }
     ExitCode::SUCCESS
+}
+
+/// Error from [`emit_then_gate`]: the artifact write failed, or the `--baseline` file could not be
+/// loaded. Kept distinct so the CLI can frame each; both still route through `fail()`'s terminal-safe
+/// sink + hint.
+#[derive(Debug)]
+enum EmitGateError {
+    Io(std::io::Error),
+    Gate(jitgen_orchestrator::GateError),
+}
+
+/// The `run` tail for the **stdout report path**: render the artifact to `out`, THEN evaluate the
+/// findings gate — in that order, so the artifact is always emitted before the gate can change the
+/// exit code (CI uploads the SARIF even when the gate trips, or when a bad `--baseline` errors). The
+/// baseline is parsed only when the gate is active, and only AFTER the render. Pure except for `out`;
+/// unit-tested with synthetic reports (the offline mock yields no catches to gate on live).
+fn emit_then_gate(
+    report: &RunReport,
+    format: ReportFormat,
+    out: &mut impl Write,
+    threshold: f64,
+    baseline_path: Option<&Path>,
+    warn_only: bool,
+    fail_on_catch: bool,
+) -> std::result::Result<GateVerdict, EmitGateError> {
+    write!(out, "{}", render(report, format)).map_err(EmitGateError::Io)?;
+    if !fail_on_catch {
+        return Ok(GateVerdict::Disabled);
+    }
+    let baseline = match baseline_path {
+        Some(p) => Baseline::from_file(p).map_err(EmitGateError::Gate)?,
+        None => Baseline::empty(),
+    };
+    Ok(gate_exit_code(
+        report, threshold, &baseline, warn_only, true,
+    ))
+}
+
+/// Print the findings-gate result to **stderr** (for `Advisory`/`Triggered` only), so stdout stays a
+/// clean, pipeable artifact. Every untrusted field (the catch fingerprint) is routed through the
+/// terminal-safe sink — a redacted report value can still embed a hostile path/ref. No-op otherwise.
+fn print_gate_summary(verdict: &GateVerdict, threshold: f64) {
+    let (label, triggered) = match verdict {
+        GateVerdict::Disabled | GateVerdict::Pass => return,
+        GateVerdict::Advisory(_) => (
+            "advisory — findings surfaced (--warn-only), exiting 0",
+            false,
+        ),
+        GateVerdict::Triggered(_) => ("findings gate tripped", true),
+    };
+    let findings = verdict.findings();
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(
+        err,
+        "jitgen: {label}: {} strong catch(es) at or above tp-probability {threshold:.2}, not baselined:",
+        findings.len()
+    );
+    for f in findings {
+        let _ = writeln!(
+            err,
+            "  - tp={:.2}  {}",
+            f.tp_probability,
+            safe_for_terminal(&f.fingerprint, 1024)
+        );
+    }
+    if triggered {
+        let _ = writeln!(
+            err,
+            "jitgen: exit 3 (findings gate). Suppress a known catch by adding its fingerprint to a \
+             --baseline file (one per line), or re-run with --warn-only to keep it advisory. See \
+             docs/troubleshooting.md."
+        );
+    }
 }
 
 fn cmd_analyze(a: AnalyzeArgs) -> ExitCode {
@@ -652,5 +794,215 @@ mod tests {
             Command::Run(a) => assert_eq!(a.sandbox, Some(SandboxArg::SandboxExec)),
             _ => panic!(),
         }
+    }
+
+    // ---- findings gate (E4) ----
+
+    /// A synthetic catch-mode report with one `StrongCatch` at probability `p` (the offline mock
+    /// produces no catches, so the gate path is exercised with a hand-built report).
+    fn report_with_strong_catch(p: f64) -> RunReport {
+        use jitgen_core::{CatchClass, CatchDecision, TpBucket};
+        use jitgen_report::{CatchReport, MutantInfo, RunSummary};
+        RunReport {
+            schema_version: jitgen_report::REPORT_SCHEMA_VERSION,
+            jitgen_version: "0.0.0-test".into(),
+            run_id: "run-1".into(),
+            repo: "/r".into(),
+            base: "base".into(),
+            head: "head".into(),
+            mode: Mode::Catch,
+            strategy: Strategy::IntentAware,
+            summary: RunSummary {
+                catches: 1,
+                ..RunSummary::default()
+            },
+            accepted: vec![],
+            catches: vec![CatchReport {
+                target: "t0".into(),
+                language: "rust".into(),
+                path: "tests/jitgen_x.rs".into(),
+                source: "#[test] fn t() {}".into(),
+                class: CatchClass::WeakCatch,
+                decision: CatchDecision::StrongCatch,
+                tp_probability: p,
+                bucket: TpBucket::from_probability(p),
+                rationale: "r".into(),
+                mutant: Some(MutantInfo {
+                    id: "m".into(),
+                    risk_description: "rd".into(),
+                    path: "src/a.rs".into(),
+                }),
+                reproduction: "cargo test".into(),
+            }],
+            rejected: vec![],
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn parse_fail_threshold_accepts_unit_interval_and_rejects_the_rest() {
+        assert_eq!(parse_fail_threshold("0").unwrap(), 0.0);
+        assert_eq!(parse_fail_threshold("0.9").unwrap(), 0.9);
+        assert_eq!(parse_fail_threshold("1").unwrap(), 1.0);
+        assert!(parse_fail_threshold("1.0001").is_err());
+        assert!(parse_fail_threshold("-0.1").is_err());
+        assert!(parse_fail_threshold("nan").is_err());
+        assert!(parse_fail_threshold("inf").is_err());
+        assert!(parse_fail_threshold("abc").is_err());
+        // The error never echoes the raw input (clap frames the offending value itself).
+        assert!(!parse_fail_threshold("abc").unwrap_err().contains("abc"));
+    }
+
+    #[test]
+    fn clap_parses_the_findings_gate_flags() {
+        let cli = Cli::try_parse_from([
+            "jitgen",
+            "run",
+            "--repo",
+            "/r",
+            "--base",
+            "a",
+            "--head",
+            "b",
+            "--mode",
+            "catch",
+            "--fail-on-catch",
+            "--fail-threshold",
+            "0.75",
+            "--baseline",
+            "/tmp/known.txt",
+            "--warn-only",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::Run(a) => {
+                assert!(a.fail_on_catch);
+                assert_eq!(a.fail_threshold, 0.75);
+                assert_eq!(a.baseline.as_deref(), Some(Path::new("/tmp/known.txt")));
+                assert!(a.warn_only);
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn gate_flags_default_off_with_the_default_threshold() {
+        let cli = Cli::try_parse_from([
+            "jitgen", "run", "--repo", "/r", "--base", "a", "--head", "b",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run(a) => {
+                assert!(!a.fail_on_catch);
+                assert!(!a.warn_only);
+                assert_eq!(a.baseline, None);
+                assert_eq!(a.fail_threshold, DEFAULT_FAIL_THRESHOLD);
+            }
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn clap_rejects_an_out_of_range_fail_threshold() {
+        assert!(Cli::try_parse_from([
+            "jitgen",
+            "run",
+            "--repo",
+            "/r",
+            "--base",
+            "a",
+            "--head",
+            "b",
+            "--fail-threshold",
+            "1.5",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn emit_then_gate_renders_artifact_before_a_failing_verdict() {
+        let report = report_with_strong_catch(0.95);
+        let mut sink = Vec::<u8>::new();
+        let verdict = emit_then_gate(
+            &report,
+            ReportFormat::Sarif,
+            &mut sink,
+            0.9,
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        // The artifact was written to the sink BEFORE the verdict was returned...
+        let rendered = String::from_utf8(sink).expect("utf8");
+        assert!(!rendered.is_empty(), "artifact must be emitted");
+        assert_eq!(
+            rendered,
+            render(&report, ReportFormat::Sarif),
+            "sink holds the full rendered SARIF"
+        );
+        // ...and the verdict would exit the process non-zero.
+        assert!(verdict.is_failure());
+    }
+
+    #[test]
+    fn emit_then_gate_warn_only_emits_and_never_fails() {
+        let report = report_with_strong_catch(0.95);
+        let mut sink = Vec::<u8>::new();
+        let verdict = emit_then_gate(
+            &report,
+            ReportFormat::Json,
+            &mut sink,
+            0.9,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(!sink.is_empty());
+        assert!(matches!(verdict, GateVerdict::Advisory(_)));
+        assert!(!verdict.is_failure());
+    }
+
+    #[test]
+    fn emit_then_gate_disabled_emits_and_passes() {
+        let report = report_with_strong_catch(0.95);
+        let mut sink = Vec::<u8>::new();
+        let verdict = emit_then_gate(
+            &report,
+            ReportFormat::Json,
+            &mut sink,
+            0.9,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!sink.is_empty());
+        assert_eq!(verdict, GateVerdict::Disabled);
+    }
+
+    #[test]
+    fn emit_then_gate_emits_the_artifact_even_when_the_baseline_is_unreadable() {
+        // A bad --baseline errors (the CLI maps it to exit 1), but the artifact must already be on
+        // stdout so CI can upload it regardless.
+        let report = report_with_strong_catch(0.95);
+        let mut sink = Vec::<u8>::new();
+        let missing = Path::new("/nonexistent/jitgen/baseline-xyz.txt");
+        let err = emit_then_gate(
+            &report,
+            ReportFormat::Sarif,
+            &mut sink,
+            0.9,
+            Some(missing),
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, EmitGateError::Gate(_)));
+        assert!(
+            !sink.is_empty(),
+            "the artifact must be emitted before the baseline error"
+        );
     }
 }
