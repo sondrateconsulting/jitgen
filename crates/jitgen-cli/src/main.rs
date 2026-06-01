@@ -6,6 +6,7 @@
 //! rule, and the non-executing `analyze` live in [`cli`]. See `docs/architecture.md`.
 
 mod cli;
+mod hints;
 
 use std::process::ExitCode;
 
