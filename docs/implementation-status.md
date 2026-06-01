@@ -18,7 +18,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ✅ complete | `a09ac03` | T1·S1·T2 ✅ |
 | F9 | End-to-end CLI + exporters | ✅ complete | `8435649` | T1·S1·T2·T3·T4 ✅ |
 | F10 | Hardening, audits, docs, packaging, mid-run resume test | ✅ complete | `575bcec` | T1·S1·T2·T3·T4·T5 ✅ |
-| F11 | Real LLM providers wired (Anthropic + OpenAI-compatible/local) | ✅ complete | `(backfill)` | rust+security review ✅ |
+| F11 | Real LLM providers wired (Anthropic + OpenAI-compatible/local) | ✅ complete | `d3217fb` | rust+security review ✅ |
 
 ## Environmental constraints discovered (this host, 2026-05-30)
 
