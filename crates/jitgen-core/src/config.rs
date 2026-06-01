@@ -22,6 +22,7 @@ pub const FORBIDDEN_REPO_KEYS: &[&str] = &[
     "base-url",
     "api_key_env",
     "api-key-env",
+    "model",
     "real_llm",
     "real-llm",
     "shell",
@@ -149,6 +150,7 @@ pub enum ProviderKind {
 
 /// Trusted provider configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct ProviderConfig {
     /// Which provider.
     pub kind: ProviderKind,
@@ -156,6 +158,10 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     /// Name of the env var holding the API key (key value itself is NEVER stored in config).
     pub api_key_env: Option<String>,
+    /// Model id to request (e.g. `claude-sonnet-4-6`, `gpt-4o`, or a local server's model name).
+    /// Trusted-only. `None` ⇒ a per-provider default (Anthropic) or an error for providers that have
+    /// no safe default (OpenAI-compatible / Local).
+    pub model: Option<String>,
     /// Whether real LLM calls are enabled. Off by default; tests never need it.
     pub real_llm: bool,
 }
@@ -267,6 +273,7 @@ id: mylang
 extensions: [mylang]
 argv: [\"mytool\", \"test\", \"{test_file}\"]
 provider: evilcorp
+model: attacker-model
 shell: true
 state_dir: /tmp/attacker
 real_llm: true
@@ -277,11 +284,30 @@ real_llm: true
         assert_eq!(cfg.extensions, vec!["mylang"]);
         assert_eq!(cfg.test_argv, vec!["mytool", "test", "{test_file}"]);
         // Security keys are dropped and warned about, never honored.
-        for k in ["provider", "shell", "state_dir", "real_llm"] {
+        for k in ["provider", "model", "shell", "state_dir", "real_llm"] {
             assert!(
                 warnings.iter().any(|w| w.contains(k)),
                 "expected warning for '{k}', got {warnings:?}"
             );
+        }
+    }
+
+    #[test]
+    fn provider_config_parses_partial_yaml_and_kind_spellings() {
+        // A trusted config may set only the provider fields it cares about; the rest default.
+        let p: ProviderConfig = serde_yaml::from_str("kind: anthropic\nreal_llm: true\n").unwrap();
+        assert_eq!(p.kind, ProviderKind::Anthropic);
+        assert!(p.real_llm);
+        assert_eq!(p.model, None);
+        // Pin the on-disk spelling of every kind (keeps docs/user-guide.md examples honest).
+        for (s, k) in [
+            ("mock", ProviderKind::Mock),
+            ("anthropic", ProviderKind::Anthropic),
+            ("open_ai_compatible", ProviderKind::OpenAiCompatible),
+            ("local", ProviderKind::Local),
+        ] {
+            let parsed: ProviderConfig = serde_yaml::from_str(&format!("kind: {s}")).unwrap();
+            assert_eq!(parsed.kind, k, "kind: {s}");
         }
     }
 

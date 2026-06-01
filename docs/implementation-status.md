@@ -18,6 +18,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 | F8 | Feedback/repair/minimization/flake-filter + assessors | ✅ complete | `a09ac03` | T1·S1·T2 ✅ |
 | F9 | End-to-end CLI + exporters | ✅ complete | `8435649` | T1·S1·T2·T3·T4 ✅ |
 | F10 | Hardening, audits, docs, packaging, mid-run resume test | ✅ complete | `575bcec` | T1·S1·T2·T3·T4·T5 ✅ |
+| F11 | Real LLM providers wired (Anthropic + OpenAI-compatible/local) | ✅ complete | `(backfill)` | rust+security review ✅ |
 
 ## Environmental constraints discovered (this host, 2026-05-30)
 
@@ -273,3 +274,19 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   (clean sign-off): **15 P3+ resolved, 0 unresolved**. `./scripts/check.sh` `REAL_GATE_EXIT=0` (423 cargo
   tests + bazel `--lockfile_mode=error`); `#![forbid(unsafe_code)]`. Artifacts:
   [reviews/F10/](reviews/F10/) (round-1..6).
+- 2026-06-01: **F11 — real LLM providers wired (post-F10 feature).** A `/devex-review` found the docs
+  advertised `--real-llm` while `make_provider` returned a deferred provider that errored `NotEnabled`
+  for every non-mock kind; this implements them per
+  [ADR-0008](decisions/0008-llm-provider-abstraction.md). **Providers:** Anthropic Messages +
+  OpenAI-compatible (`/chat/completions`, also serving `local` servers via `base_url`). **Client**
+  ([ADR-0011](decisions/0011-real-provider-http-client.md)): `ureq` 3.2.x with default rustls + `ring`
+  + bundled `webpki-roots` — blocking, TLS always on, hermetic CA set, no tokio/aws-lc/native-tls;
+  Bazel `crate_universe` repinned (`MODULE.bazel.lock`); `deny.toml` license allowances added (incl.
+  `webpki-roots` MPL-2.0). **Security:** `real_llm` is the master switch (mock unless on **and** a
+  non-mock kind); the API key is read **only** from a trusted-named env var (never config/logs/errors);
+  HTTPS is enforced except for loopback; provider/base-URL/key-env/`model` are trusted-only (new
+  `model` field added, also to `FORBIDDEN_REPO_KEYS`). **Testability:** an `HttpTransport` seam runs all
+  build/parse/error-map tests offline (no network, no keys). **DX:** `doctor` previews the provider +
+  key-env presence (never the key); error hints + troubleshooting entries for provider config/runtime
+  failures; the mock-empty-run hint now points at real providers. `./scripts/check.sh` green (cargo +
+  bazel `--lockfile_mode=error`); `./scripts/audit.sh` green; `#![forbid(unsafe_code)]` preserved.

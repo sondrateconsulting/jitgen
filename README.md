@@ -69,8 +69,10 @@ bazel test  //...
 bazel run //:jitgen -- --version   # jitgen 0.1.0 (data-contract v1) — same under Cargo
 ```
 
-All tests run **offline** with a deterministic mock LLM provider; real providers are opt-in via
-trusted config (`--real-llm`) and environment-provided API keys only. `./scripts/check.sh` is the
+All tests run **offline** with a deterministic mock LLM provider. Real providers — Anthropic,
+OpenAI-compatible, and local servers (Ollama/LM Studio) — are opt-in via trusted config (`--real-llm`)
+with the API key read only from an environment variable named by that config (see
+[user guide → Real LLM providers](docs/user-guide.md#real-llm-providers)). `./scripts/check.sh` is the
 always-offline gate; `./scripts/audit.sh` is the separate supply-chain audit (config in
 [`deny.toml`](deny.toml)).
 

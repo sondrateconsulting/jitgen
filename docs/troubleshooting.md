@@ -126,3 +126,29 @@ contains control characters, or is empty — a legitimate test never has these.
 
 - **Fix:** usually nothing to do (a real generated test passes the check). If a path segment in your
   repo is secret-shaped, it will be redacted in reports but won't block a clean generated test.
+
+## "LLM provider configuration error" with `--real-llm`
+
+A real provider is selected but something required is missing or unsafe (the run never left the host).
+
+- **API key env not set:** export the variable named by your trusted config — default
+  `ANTHROPIC_API_KEY` (`anthropic`) or `OPENAI_API_KEY` (`open_ai_compatible`), e.g.
+  `export ANTHROPIC_API_KEY=…`. The key is read **only** from that env var, never the config file.
+- **Missing `model`/`base_url`:** `open_ai_compatible` and `local` require both in the trusted config
+  (`anthropic` has defaults). See [user-guide.md → Real LLM providers](user-guide.md#real-llm-providers).
+- **Non-HTTPS endpoint:** remote endpoints must be `https://`; only a loopback address
+  (`localhost`/`127.0.0.1`/`[::1]`) may use `http://` (for a local model server).
+- Preview with `jitgen doctor --config <file> --real-llm` — it reports the selected provider and
+  whether the key env var is set (never the key value).
+
+## "LLM provider error" with `--real-llm`
+
+The provider call reached the network but failed (HTTP status, auth, rate limit, timeout, or an
+unparseable response); the provider's own message follows the envelope.
+
+- **401/403:** the API key is wrong or lacks access — re-check your key env var's value.
+- **429:** rate limited — retry later.
+- **timeout / connection refused:** check connectivity, and that a `local` server is actually running
+  at its `base_url`. jitgen uses bounded connect/total timeouts and always verifies TLS.
+- Real calls require `--real-llm`; without it jitgen uses the offline mock, so `0 accepted` is
+  expected, not a failure.

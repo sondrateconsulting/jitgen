@@ -26,7 +26,7 @@ mod test_repo;
 
 pub use analyze::{analyze, AnalyzeOptions, AnalyzeReport};
 pub use config::{load_repo_config, parse_backend, parse_strategy, resolve_trusted, TrustedFlags};
-pub use doctor::{run_doctor, DoctorReport};
+pub use doctor::{describe_provider, run_doctor, DoctorReport};
 pub use error::{OrchestratorError, Result};
 pub use executor::SandboxExecutor;
 pub use process::{process_target, RunConfig, TargetOutcome};

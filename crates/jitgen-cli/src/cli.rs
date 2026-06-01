@@ -145,6 +145,13 @@ struct ReportArgs {
 struct DoctorArgs {
     #[arg(long, value_enum, default_value_t = AnalyzeFormat::Human)]
     format: AnalyzeFormat,
+    /// Trusted user/system config file outside the cwd (TRUSTED). Lets doctor report which provider
+    /// would be used and whether its API-key env var is set.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Report readiness for real LLM calls (off by default; TRUSTED).
+    #[arg(long)]
+    real_llm: bool,
 }
 
 // ---- value enums --------------------------------------------------------------------------------
@@ -355,13 +362,14 @@ fn cmd_run(a: RunArgs) -> ExitCode {
 
     // First-run guidance: the offline default uses a deterministic mock LLM that exercises the whole
     // pipeline but does not land tests. When it produced nothing, explain that `0 accepted` is the
-    // EXPECTED mock result (not "jitgen is broken") — without pointing at real-provider config, which
-    // isn't wired in this build. Gated on the ACTUAL provider selection (`kind == Mock`, the signal
-    // `make_provider` uses — not the `real_llm` flag, which can diverge) and on harden mode (catch's
-    // "0 catches" is a valid result, not confusion).
+    // EXPECTED mock result (not "jitgen is broken") and point at real-provider config as the next
+    // step. Gated on the EFFECTIVE provider being the mock — which `make_provider` selects whenever
+    // `kind == Mock` OR `real_llm` is off — and on harden mode (catch's "0 catches" is a valid
+    // result, not confusion).
     // Printed to STDERR, best-effort, so stdout (patch/json/sarif) stays a clean pipeable artifact
     // and a broken stderr never turns a successful run into a panic (F10/DX-2, T-codex P2/P3).
-    let provider_was_mock = opts.trusted.provider.kind == ProviderKind::Mock;
+    let provider = &opts.trusted.provider;
+    let provider_was_mock = provider.kind == ProviderKind::Mock || !provider.real_llm;
     let is_harden = report.mode == Mode::Harden;
     let produced_output = !report.accepted.is_empty() || !report.catches.is_empty();
     if let Some(hint) = mock_empty_run_hint(provider_was_mock, is_harden, produced_output) {
@@ -370,15 +378,13 @@ fn cmd_run(a: RunArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Hint shown when the **mock** provider produced nothing landable on a harden run. Returns `None`
-/// unless all of: the mock provider actually ran, the mode is harden (catch's empty result is
-/// valid), and nothing was produced — so the hint never nags a configured or useful run. Pure for
-/// testability; printed to stderr by the caller.
+/// Hint shown when the **effective** provider was the mock (kind == Mock, or `real_llm` off) and a
+/// harden run produced nothing landable. Returns `None` unless all of: the mock actually ran, the
+/// mode is harden (catch's empty result is valid), and nothing was produced — so it never nags a
+/// real-provider or otherwise useful run. Pure for testability; printed to stderr by the caller.
 ///
-/// The copy is deliberately honest about this build: real LLM-backed generation is not wired
-/// (`make_provider` returns a deferred provider that errors `NotEnabled` for every non-mock kind),
-/// so the hint must NOT tell users to "configure a real provider" — that would send them to a wall
-/// (T-codex-r2 P2/P3). Its job is to explain that `0 accepted` from the mock is expected, not a bug.
+/// Real LLM-backed generation IS available in this build (F11), so the hint now points the user at
+/// it: `0 accepted` from the mock is expected, and the next step is a trusted provider + `--real-llm`.
 fn mock_empty_run_hint(
     provider_was_mock: bool,
     is_harden: bool,
@@ -390,8 +396,8 @@ fn mock_empty_run_hint(
     Some(
         "note: this run used jitgen's built-in mock LLM (the deterministic, offline default) — it \
          exercises the full pipeline but doesn't synthesize real tests, so `0 accepted` is expected \
-         here, not a failure. Real LLM-backed generation isn't wired in this build yet (non-mock \
-         providers return \"not enabled\").",
+         here, not a failure. To generate real tests, set a provider in a trusted config file and \
+         pass --real-llm (see docs/user-guide.md → Real providers).",
     )
 }
 
@@ -451,8 +457,20 @@ fn cmd_report(a: ReportArgs) -> ExitCode {
 }
 
 fn cmd_doctor(a: DoctorArgs) -> ExitCode {
+    // Resolve the trusted provider config so doctor can report real-provider readiness. doctor has no
+    // target repo; use the cwd for the "config must be outside" check (a trusted file should not live
+    // in whatever directory you happen to run doctor from).
+    let flags = TrustedFlags {
+        config_file: a.config,
+        real_llm: flag(a.real_llm),
+        ..TrustedFlags::default()
+    };
+    let provider_desc = match resolve_trusted(&flags, std::path::Path::new("."), env_lookup) {
+        Ok(t) => jitgen_orchestrator::describe_provider(&t.provider),
+        Err(e) => return fail(&format!("jitgen doctor: {e}")),
+    };
     let state_root = jitgen_orchestrator::default_state_root();
-    let report = jitgen_orchestrator::run_doctor(&state_root, "mock (default)");
+    let report = jitgen_orchestrator::run_doctor(&state_root, &provider_desc);
     match a.format {
         AnalyzeFormat::Json => match serde_json::to_string_pretty(&report) {
             Ok(s) => println!("{s}"),
@@ -499,6 +517,20 @@ fn command_of(msg: &str) -> &str {
 /// unmatched message degrades to a safe generic pointer (never a wrong fix).
 fn user_hint(msg: &str) -> &'static str {
     let resume_like = command_of(msg) == "resume";
+
+    // --- Real-provider errors (F11). Matched first: their text can embed a provider's own error
+    //     message, which must not fall through to a later keyword branch. The two jitgen envelopes are
+    //     distinct ("…configuration error" never contains "…provider error"). ---
+    if msg.contains("LLM provider configuration error") {
+        return "→ real-provider config: export the API key env var named by your trusted config \
+                (default ANTHROPIC_API_KEY / OPENAI_API_KEY), and set `model` (and `base_url` for \
+                openai-compatible/local) in that config. Run `jitgen doctor`. See docs/troubleshooting.md.";
+    }
+    if msg.contains("LLM provider error") {
+        return "→ the LLM provider call failed (network, auth, rate limit, or a bad/blocked response). \
+                Check the message above, verify the key and connectivity, then retry. Real calls need \
+                --real-llm. See docs/troubleshooting.md.";
+    }
 
     // --- (A) errors that embed an arbitrary user value: matched FIRST so the embedded value can't
     //         trigger a later keyword-only branch. ---
@@ -648,6 +680,21 @@ mod tests {
             user_hint("jitgen run: git intake: git error: failed to resolve path '/x'")
                 .contains("--repo points to")
         );
+        // Real-provider (F11) envelopes route to their own hints.
+        assert!(user_hint(
+            "jitgen run: generation failed: LLM provider configuration error: API key env var `ANTHROPIC_API_KEY` is not set"
+        )
+        .contains("real-provider config"));
+        assert!(user_hint(
+            "jitgen run: generation failed: LLM provider error: HTTP 429: rate limited"
+        )
+        .contains("rate limit"));
+        // Ordering: a provider message that embeds ANOTHER branch's keyword must still route to the
+        // provider hint (it is matched first), not the keyword branch.
+        assert!(user_hint(
+            "jitgen run: generation failed: LLM provider error: HTTP 400: digest-pinned boundary escape"
+        )
+        .contains("provider call failed"));
         // Unknown messages degrade to the safe generic pointer (never a wrong fix).
         assert!(user_hint("totally unexpected error").contains("common causes"));
     }

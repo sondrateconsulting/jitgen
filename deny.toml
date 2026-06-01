@@ -29,28 +29,37 @@ ignore = [
 
 # --- Licenses ----------------------------------------------------------------------------------
 # Explicit allowlist of the permissive licenses actually present in the tree (verified via
-# `cargo deny list` in F10). No copyleft is pulled in: LGPL/MPL appear only as OR-alternatives we
-# satisfy permissively, and `... AND Unicode-3.0` is covered by allowing Unicode-3.0.
+# `cargo deny list`). No copyleft is pulled in: LGPL/MPL appear only as OR-alternatives we satisfy
+# permissively, and `... AND Unicode-3.0` is covered by allowing Unicode-3.0. F11 (real providers,
+# ureq + rustls/ring) adds ISC (ring/rustls-webpki/untrusted), BSD-3-Clause (subtle), and
+# CDLA-Permissive-2.0 (webpki-roots' bundled CA set) — all permissive, no copyleft.
 [licenses]
 allow = [
   "MIT",
   "Apache-2.0",
   "BSD-2-Clause",
+  "BSD-3-Clause",
   "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
   "Unicode-3.0",
   "Unlicense",
 ]
 confidence-threshold = 0.9
 
 # --- Bans / duplicate versions -----------------------------------------------------------------
-# Duplicate crate versions are DENIED by default; the only known-and-justified duplicate is skipped
+# Duplicate crate versions are DENIED by default; the known-and-justified duplicates are skipped
 # explicitly below, so a NEW duplicate (of any other, possibly more sensitive crate) fails the gate.
 [bans]
 multiple-versions = "deny"
-# The sole accepted duplicate: two `hashbrown` majors are pulled transitively (v0.14 via
-# rusqlite→hashlink; v0.17 via serde_yaml→indexmap). Unavoidable without forcing sub-dependency
-# versions, and benign (no shared types cross the boundary).
-skip = [{ crate = "hashbrown", reason = "two majors pulled transitively (rusqlite/hashlink vs serde_yaml/indexmap); benign, no shared types cross the boundary" }]
+# Accepted duplicates (each justified, benign, no shared types cross the boundary):
+#  - `hashbrown`: two majors (v0.14 via rusqlite→hashlink; v0.17 via serde_yaml→indexmap).
+#  - `getrandom`: two majors (v0.2 via ring → rustls/ureq, F11; v0.3 via cc→jobserver build scripts) —
+#    separate users (TLS RNG vs build-time), not forceable without pinning sub-dependencies.
+skip = [
+  { crate = "hashbrown", reason = "two majors pulled transitively (rusqlite/hashlink vs serde_yaml/indexmap); benign, no shared types cross the boundary" },
+  { crate = "getrandom", reason = "two majors: v0.2 via ring (rustls/ureq, F11) vs v0.3 via cc→jobserver build scripts; separate users, benign" },
+]
 # Forbid wildcard (`*`) version requirements on EXTERNAL crates (a real supply-chain risk), while
 # allowing the workspace's own path-based internal deps (`jitgen-*`), which are intentionally
 # version-less.

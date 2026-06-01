@@ -1,8 +1,9 @@
 //! The `LlmProvider` trait, request/response types, and the provider factory (ADR-0008).
 //!
 //! The trait is **synchronous** (CLI batch tool; real providers use blocking HTTP — see ADR-0008).
-//! The default is the deterministic offline mock; real providers (Anthropic/OpenAI-compatible/local)
-//! are selected only by **trusted** config and are wired in F9 (until then they return `NotEnabled`).
+//! The default is the deterministic offline mock. Real providers (Anthropic / OpenAI-compatible /
+//! local) live in [`crate::real`] and are selected **only** by trusted config with `real_llm = true`
+//! (ADR-0010); a repo can never redirect egress, and tests/CI never touch the network.
 
 use jitgen_context::Prompt;
 use jitgen_core::{Mode, ProviderKind, ResolvedConfig, Strategy};
@@ -11,12 +12,13 @@ use thiserror::Error;
 /// Errors from generation.
 #[derive(Debug, Error)]
 pub enum GenerationError {
-    /// The provider failed (network/protocol/etc.).
+    /// The provider failed at run time (network / TLS / timeout / HTTP status / bad response body).
     #[error("LLM provider error: {0}")]
     Provider(String),
-    /// A real provider was requested but is not enabled/implemented in this build/config.
-    #[error("real LLM provider not available: {0}")]
-    NotEnabled(String),
+    /// The provider is misconfigured (missing API-key env var, missing model/base_url, or a non-HTTPS
+    /// remote endpoint). Kept distinct from [`GenerationError::Provider`] so the CLI can hint clearly.
+    #[error("LLM provider configuration error: {0}")]
+    Config(String),
 }
 
 /// Convenience result alias.
@@ -100,33 +102,23 @@ pub trait LlmProvider {
     fn generate(&self, req: &LlmRequest) -> Result<LlmResponse>;
 }
 
-/// Build a provider from resolved (trusted) config. Mock by default; real provider kinds are
-/// deferred to F9 and return [`GenerationError::NotEnabled`] until then.
+/// Whether [`make_provider`] would fall back to the offline [`MockProvider`](crate::MockProvider) for
+/// this config — the **master switch**: true unless `real_llm` is on AND a non-mock kind is selected.
+/// Exposed so callers like `doctor` describe the same effective provider without duplicating the rule.
+pub fn provider_is_mock(provider: &jitgen_core::ProviderConfig) -> bool {
+    !provider.real_llm || provider.kind == ProviderKind::Mock
+}
+
+/// Build a provider from resolved (trusted) config. Returns the offline
+/// [`MockProvider`](crate::MockProvider) whenever [`provider_is_mock`] holds, so a stray `kind` setting
+/// can never cause a network call on its own (ADR-0008). Construction never opens a socket —
+/// misconfiguration surfaces as an error at `generate()` time, and `doctor` previews it.
 pub fn make_provider(config: &ResolvedConfig) -> Box<dyn LlmProvider> {
-    match config.trusted.provider.kind {
-        ProviderKind::Mock => Box::new(crate::mock::MockProvider::new()),
-        other => Box::new(DeferredRealProvider {
-            kind: format!("{other:?}"),
-        }),
+    let provider = &config.trusted.provider;
+    if provider_is_mock(provider) {
+        return Box::new(crate::mock::MockProvider::new());
     }
-}
-
-/// Placeholder for real providers until F9 wires blocking HTTP. Always errors, so tests/CI never
-/// require keys or network.
-struct DeferredRealProvider {
-    kind: String,
-}
-
-impl LlmProvider for DeferredRealProvider {
-    fn name(&self) -> &str {
-        "deferred-real"
-    }
-    fn generate(&self, _req: &LlmRequest) -> Result<LlmResponse> {
-        Err(GenerationError::NotEnabled(format!(
-            "real provider {} (blocking HTTP) is wired in F9; use the mock provider until then",
-            self.kind
-        )))
-    }
+    crate::real::make_real(provider, crate::http::UreqTransport::new())
 }
 
 #[cfg(test)]
@@ -134,11 +126,12 @@ mod tests {
     use super::*;
     use jitgen_core::{ProviderConfig, TrustedConfig};
 
-    fn cfg(kind: ProviderKind) -> ResolvedConfig {
+    fn cfg(kind: ProviderKind, real_llm: bool) -> ResolvedConfig {
         ResolvedConfig::new(
             TrustedConfig {
                 provider: ProviderConfig {
                     kind,
+                    real_llm,
                     ..ProviderConfig::default()
                 },
                 ..TrustedConfig::default()
@@ -150,29 +143,32 @@ mod tests {
 
     #[test]
     fn factory_returns_mock_by_default() {
-        let p = make_provider(&cfg(ProviderKind::Mock));
+        let p = make_provider(&cfg(ProviderKind::Mock, false));
         assert_eq!(p.name(), "mock");
     }
 
     #[test]
-    fn real_provider_is_deferred() {
-        let p = make_provider(&cfg(ProviderKind::Anthropic));
-        let req = LlmRequest {
-            prompt: Prompt {
-                system: "s".into(),
-                user: "u".into(),
-            },
-            mode: Mode::Harden,
-            strategy: Strategy::Harden,
-            language: "rust".into(),
-            symbol: None,
-            attempt: 0,
-            repair_feedback: None,
-        };
-        assert!(matches!(
-            p.generate(&req),
-            Err(GenerationError::NotEnabled(_))
-        ));
+    fn real_llm_off_uses_mock_even_for_a_real_kind() {
+        // The master switch: a stray `kind` without `real_llm` must not select a network provider.
+        let p = make_provider(&cfg(ProviderKind::Anthropic, false));
+        assert_eq!(p.name(), "mock");
+    }
+
+    #[test]
+    fn real_llm_on_selects_the_real_provider() {
+        // Selection only — construction must not open a socket, so we never call `generate` here.
+        assert_eq!(
+            make_provider(&cfg(ProviderKind::Anthropic, true)).name(),
+            "anthropic"
+        );
+        assert_eq!(
+            make_provider(&cfg(ProviderKind::OpenAiCompatible, true)).name(),
+            "openai-compatible"
+        );
+        assert_eq!(
+            make_provider(&cfg(ProviderKind::Local, true)).name(),
+            "local"
+        );
     }
 
     #[test]

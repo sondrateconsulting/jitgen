@@ -168,6 +168,42 @@ The **state root** resolves as: `--state-dir` → `JITGEN_STATE_DIR` → `$XDG_S
 `~/.local/state/jitgen` (Linux) / `~/Library/Application Support/jitgen` (macOS). It is always created
 **outside** the target repo as a private `0700` directory.
 
+## Real LLM providers
+
+By default jitgen uses its offline mock and never calls a network. To generate real tests, select a
+provider in a **trusted config file** (outside the repo) and enable real calls with `--real-llm`
+(or `real_llm: true` in the file, or `JITGEN_REAL_LLM=true`). `--real-llm` is the **master switch**:
+unless it is on *and* a non-mock `kind` is selected, the mock stays in force — a stray `kind` can never
+cause a network call on its own. The connection is **HTTPS with TLS verification always on** (a plain
+`http://` endpoint is refused unless it is a loopback address, for local servers).
+
+```yaml
+# ~/.config/jitgen/trusted.yaml  (anywhere OUTSIDE the repo)
+provider:
+  kind: anthropic            # anthropic | open_ai_compatible | local
+  model: claude-sonnet-4-6   # required for open_ai_compatible/local; defaults for anthropic
+  api_key_env: ANTHROPIC_API_KEY   # NAME of the env var holding the key — never the key itself
+  real_llm: true
+```
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...        # the key lives only in the environment
+jitgen run --repo . --base main --head HEAD --config ~/.config/jitgen/trusted.yaml --real-llm
+jitgen doctor --config ~/.config/jitgen/trusted.yaml --real-llm   # previews provider + key presence
+```
+
+| `kind` | Endpoint | Default key env | `base_url` | `model` |
+|--------|----------|-----------------|------------|---------|
+| `anthropic` | `https://api.anthropic.com/v1/messages` (override via `base_url`) | `ANTHROPIC_API_KEY` | optional | optional (has a default) |
+| `open_ai_compatible` | `{base_url}/chat/completions` | `OPENAI_API_KEY` | **required** | **required** |
+| `local` | `{base_url}/chat/completions` (loopback `http://` allowed) | none (set `api_key_env` if your server needs one) | **required** | **required** |
+
+The API **key is read only from the named environment variable** — never stored in the config file,
+never logged, and never included in an error message (only the env-var *name* may appear). Provider,
+base URL, key-env name, model, and real-LLM enablement are **trusted-only**: a repo's `.jitgen.yaml`
+cannot set them, so a hostile repo can never redirect egress (see [security.md](security.md),
+[ADR-0008](decisions/0008-llm-provider-abstraction.md), [ADR-0011](decisions/0011-real-provider-http-client.md)).
+
 ## Sandbox tiers
 
 Untrusted test commands run **fail-closed**: an OS sandbox (bubblewrap/firejail on Linux,

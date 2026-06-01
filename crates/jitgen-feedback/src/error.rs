@@ -46,7 +46,7 @@ mod tests {
 
     #[test]
     fn generation_error_wraps_and_displays() {
-        let e: FeedbackError = GenerationError::NotEnabled("real provider".into()).into();
+        let e: FeedbackError = GenerationError::Config("real provider".into()).into();
         assert!(e.to_string().contains("generation failed"));
     }
 

@@ -5,6 +5,8 @@ jitgen_rust_library(
     deps = [
         "//crates/jitgen-context",
         "//crates/jitgen-core",
+        "@crates//:serde_json",
         "@crates//:thiserror",
+        "@crates//:ureq",
     ],
 )

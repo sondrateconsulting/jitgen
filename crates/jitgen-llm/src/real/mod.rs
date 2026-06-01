@@ -1,0 +1,225 @@
+//! Real LLM providers (F11): Anthropic Messages + OpenAI-compatible (incl. local servers).
+//!
+//! Selected only by **trusted** config with `real_llm = true` (ADR-0008/ADR-0010): a hostile repo can
+//! never redirect egress. The API key is read **only** from the trusted-named env var, placed in a
+//! single request header, and never stored/logged/returned in errors. Each provider's body-building
+//! and response-parsing is a pure function tested offline via a fake [`HttpTransport`].
+
+use crate::http::HttpTransport;
+use crate::provider::{GenerationError, LlmProvider, Result};
+use jitgen_core::{ProviderConfig, ProviderKind};
+
+mod anthropic;
+mod openai;
+
+/// Default Anthropic model when trusted config does not pin one. Overridable via `provider.model`.
+/// (Current strong coding model; see env/model notes in docs/user-guide.md — bump as models evolve.)
+pub(crate) const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
+/// Default env var names per provider when `api_key_env` is unset.
+const ANTHROPIC_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+/// Anthropic Messages API version header (stable).
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Default Anthropic base URL (overridable via `provider.base_url` for a proxy).
+pub(crate) const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
+/// Bounded output budget (ADR-0008 "requests are bounded"). A single test fits comfortably.
+pub(crate) const MAX_OUTPUT_TOKENS: u32 = 4096;
+/// Cap for an error-body snippet surfaced to the user.
+const SNIPPET_CAP: usize = 256;
+
+/// Build a real provider from trusted config (caller guarantees `real_llm == true && kind != Mock`).
+pub(crate) fn make_real<T: HttpTransport + 'static>(
+    cfg: &ProviderConfig,
+    transport: T,
+) -> Box<dyn LlmProvider> {
+    match cfg.kind {
+        ProviderKind::Anthropic => Box::new(anthropic::AnthropicProvider::new(cfg, transport)),
+        ProviderKind::OpenAiCompatible => {
+            Box::new(openai::OpenAiProvider::new_openai(cfg, transport))
+        }
+        ProviderKind::Local => Box::new(openai::OpenAiProvider::new_local(cfg, transport)),
+        // `make_provider` handles Mock before calling here.
+        ProviderKind::Mock => unreachable!("mock is handled by make_provider, not make_real"),
+    }
+}
+
+/// The env var a provider would read its API key from: the explicit `api_key_env`, else a per-kind
+/// default. `None` means "no key needed/known" (Mock, or a Local server without one). Used by
+/// `make_provider` and by `doctor` (to report key presence **without** reading the value).
+pub fn provider_key_env(cfg: &ProviderConfig) -> Option<String> {
+    cfg.api_key_env
+        .clone()
+        .or_else(|| default_key_env(cfg.kind).map(str::to_string))
+}
+
+fn default_key_env(kind: ProviderKind) -> Option<&'static str> {
+    match kind {
+        ProviderKind::Anthropic => Some(ANTHROPIC_KEY_ENV),
+        ProviderKind::OpenAiCompatible => Some(OPENAI_KEY_ENV),
+        // Local servers usually need no key; Mock never does.
+        ProviderKind::Local | ProviderKind::Mock => None,
+    }
+}
+
+/// Read the API key from the trusted-named env var. The **name** is safe to show (it is config, not
+/// the secret); the **value** is never logged or returned in an error.
+fn read_key(env_var: &str) -> Result<String> {
+    match std::env::var(env_var) {
+        Ok(v) if !v.trim().is_empty() => Ok(v),
+        _ => Err(GenerationError::Config(format!(
+            "API key env var `{env_var}` is not set (or is empty); export it before running with --real-llm"
+        ))),
+    }
+}
+
+/// Turn a non-2xx response into a user-facing message: prefer the provider's own `error.message`,
+/// else a capped body snippet. The API key lives in a request header, never the response body, so a
+/// snippet cannot leak it.
+fn http_error_message(status: u16, body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(msg) = v
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+        {
+            // Cap even the structured message: a provider could return a very long (or input-echoing)
+            // `error.message`, and the whole body is only bounded at 1 MiB.
+            return format!("HTTP {status}: {}", snippet(msg));
+        }
+    }
+    format!("HTTP {status}: {}", snippet(body))
+}
+
+/// First [`SNIPPET_CAP`] characters of `s`, with an ellipsis if truncated. Single pass over `chars`.
+fn snippet(s: &str) -> String {
+    let mut chars = s.chars();
+    let out: String = chars.by_ref().take(SNIPPET_CAP).collect();
+    if chars.next().is_some() {
+        format!("{out}…")
+    } else {
+        out
+    }
+}
+
+#[cfg(test)]
+pub(crate) use testkit::FakeTransport;
+
+#[cfg(test)]
+mod testkit {
+    use crate::http::{Header, HttpOutcome, HttpTransport};
+    use std::cell::RefCell;
+
+    /// What a [`FakeTransport`] saw, so tests can assert the endpoint, headers, and body — including
+    /// that the API key appears **only** in the auth header.
+    pub(crate) struct CapturedRequest {
+        pub url: String,
+        pub headers: Vec<(String, String)>,
+        pub body: String,
+    }
+
+    /// In-memory transport for offline provider tests: records the request, returns a canned outcome.
+    pub(crate) struct FakeTransport {
+        response: Result<(u16, String), String>,
+        pub captured: RefCell<Option<CapturedRequest>>,
+    }
+
+    impl FakeTransport {
+        pub(crate) fn ok(status: u16, body: &str) -> Self {
+            Self {
+                response: Ok((status, body.to_string())),
+                captured: RefCell::new(None),
+            }
+        }
+        pub(crate) fn fail(msg: &str) -> Self {
+            Self {
+                response: Err(msg.to_string()),
+                captured: RefCell::new(None),
+            }
+        }
+        pub(crate) fn captured(&self) -> std::cell::Ref<'_, Option<CapturedRequest>> {
+            self.captured.borrow()
+        }
+    }
+
+    impl HttpTransport for FakeTransport {
+        fn post_json(
+            &self,
+            url: &str,
+            headers: &[Header<'_>],
+            body: &str,
+        ) -> Result<HttpOutcome, String> {
+            *self.captured.borrow_mut() = Some(CapturedRequest {
+                url: url.to_string(),
+                headers: headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                body: body.to_string(),
+            });
+            match &self.response {
+                Ok((status, body)) => Ok(HttpOutcome {
+                    status: *status,
+                    body: body.clone(),
+                }),
+                Err(e) => Err(e.clone()),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_key_env_uses_explicit_then_default() {
+        let mut cfg = ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            ..Default::default()
+        };
+        assert_eq!(provider_key_env(&cfg).as_deref(), Some("ANTHROPIC_API_KEY"));
+        cfg.api_key_env = Some("MY_KEY".into());
+        assert_eq!(provider_key_env(&cfg).as_deref(), Some("MY_KEY"));
+        let local = ProviderConfig {
+            kind: ProviderKind::Local,
+            ..Default::default()
+        };
+        assert_eq!(provider_key_env(&local), None);
+    }
+
+    #[test]
+    fn read_key_errors_when_unset() {
+        let err = read_key("JITGEN_DEFINITELY_UNSET_KEY_ENV_XYZ").unwrap_err();
+        assert!(matches!(err, GenerationError::Config(_)));
+        // The env var NAME may appear (it is config); this name carries no secret.
+        assert!(err
+            .to_string()
+            .contains("JITGEN_DEFINITELY_UNSET_KEY_ENV_XYZ"));
+    }
+
+    #[test]
+    fn read_key_reads_a_set_var() {
+        // Unique name avoids cross-test interference under the parallel test runner.
+        let name = "JITGEN_TEST_KEY_READ_OK";
+        std::env::set_var(name, "sk-secret-value");
+        let got = read_key(name).unwrap();
+        std::env::remove_var(name);
+        assert_eq!(got, "sk-secret-value");
+    }
+
+    #[test]
+    fn http_error_message_prefers_api_message_then_snippet() {
+        let with_msg = http_error_message(401, r#"{"error":{"message":"invalid x-api-key"}}"#);
+        assert_eq!(with_msg, "HTTP 401: invalid x-api-key");
+        let no_json = http_error_message(503, "upstream unavailable");
+        assert_eq!(no_json, "HTTP 503: upstream unavailable");
+    }
+
+    #[test]
+    fn snippet_caps_long_bodies() {
+        let long = "x".repeat(1000);
+        let s = snippet(&long);
+        assert!(s.chars().count() <= SNIPPET_CAP + 1); // +1 for the ellipsis
+        assert!(s.ends_with('…'));
+    }
+}

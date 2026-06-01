@@ -303,9 +303,70 @@ pub fn run_doctor(state_root: &str, provider: &str) -> DoctorReport {
     }
 }
 
+/// One-line description of the EFFECTIVE LLM provider for `doctor`, reporting API-key-env PRESENCE
+/// only (never the value). Mirrors `jitgen_llm::make_provider`'s master switch: the mock is in force
+/// unless `real_llm` is on AND a non-mock kind is selected.
+pub fn describe_provider(provider: &jitgen_core::ProviderConfig) -> String {
+    use jitgen_core::ProviderKind;
+    // Same master switch as `make_provider`, via the shared helper (no drift).
+    if jitgen_llm::provider_is_mock(provider) {
+        return "mock (default; offline & deterministic — set a trusted provider and pass --real-llm \
+                for real generation)"
+            .to_string();
+    }
+    let kind = match provider.kind {
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::OpenAiCompatible => "openai-compatible",
+        ProviderKind::Local => "local",
+        ProviderKind::Mock => unreachable!("mock handled above"),
+    };
+    let model = provider.model.as_deref().unwrap_or("(provider default)");
+    let key = match jitgen_llm::provider_key_env(provider) {
+        Some(env) => {
+            let present = std::env::var(&env).is_ok_and(|v| !v.trim().is_empty());
+            if present {
+                format!("{env} is set")
+            } else {
+                format!("{env} NOT set — export it before running")
+            }
+        }
+        None => "no API key required".to_string(),
+    };
+    format!("{kind} (real_llm enabled; model: {model}; {key})")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jitgen_core::{ProviderConfig, ProviderKind};
+
+    #[test]
+    fn describe_provider_reports_mock_then_key_presence() {
+        // real_llm off ⇒ effective mock, regardless of kind.
+        let off = ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            real_llm: false,
+            ..Default::default()
+        };
+        assert!(describe_provider(&off).starts_with("mock"));
+
+        let env = "JITGEN_TEST_DOCTOR_KEY";
+        std::env::remove_var(env);
+        let real = ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            real_llm: true,
+            api_key_env: Some(env.into()),
+            ..Default::default()
+        };
+        let absent = describe_provider(&real);
+        assert!(absent.contains("anthropic") && absent.contains("NOT set"));
+
+        std::env::set_var(env, "sk-secret");
+        let present = describe_provider(&real);
+        std::env::remove_var(env);
+        // Reports presence, never the value.
+        assert!(present.contains("is set") && !present.contains("sk-secret"));
+    }
 
     fn report_with(tools: Vec<ToolStatus>) -> DoctorReport {
         DoctorReport {
