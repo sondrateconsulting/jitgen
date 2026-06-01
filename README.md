@@ -83,6 +83,7 @@ always-offline gate; `./scripts/audit.sh` is the separate supply-chain audit (co
 - [Troubleshooting](docs/troubleshooting.md) — common issues and fixes
 - [Architecture](docs/architecture.md) · [Security](docs/security.md) · [ADRs](docs/decisions/)
 - [Final report](docs/final-report.md) — the complete build wrap-up
+- [Changelog](CHANGELOG.md) — notable changes per version
 
 ## License
 

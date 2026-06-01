@@ -202,7 +202,7 @@ The API **key is read only from the named environment variable** — never store
 never logged, and never included in an error message (only the env-var *name* may appear). Provider,
 base URL, key-env name, model, and real-LLM enablement are **trusted-only**: a repo's `.jitgen.yaml`
 cannot set them, so a hostile repo can never redirect egress (see [security.md](security.md),
-[ADR-0008](decisions/0008-llm-provider-abstraction.md), [ADR-0011](decisions/0011-real-provider-http-client.md)).
+[ADR-0008](decisions/0008-llm-provider-abstraction.md), [ADR-0012](decisions/0012-real-provider-http-client.md)).
 
 ## Sandbox tiers
 

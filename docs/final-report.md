@@ -37,7 +37,7 @@ into trusted vs untrusted-repo tiers ([ADR-0010](decisions/0010-config-trust-and
 
 | Phase | Deliverable | Commit |
 |-------|-------------|--------|
-| **F0** | Research, architecture, plan, ADRs 0001–0011, normative `security.md`, resumable status/`progress.json` | `c9cd845` |
+| **F0** | Research, architecture, plan, ADRs 0001–0012, normative `security.md`, resumable status/`progress.json` | `c9cd845` |
 | **F1** | Monorepo scaffold: Bazel Bzlmod + `rules_rust` + Cargo workspace + 12 crate skeletons; `scripts/check.sh`; version parity | `2a10058` |
 | **F2** | Core domain + data contract (`SCHEMA_VERSION`); `.jitgen.yaml` typed trust split; `rusqlite` durable/resumable store (global index, atomic publish); `doctor` | `11aaaae` |
 | **F3** | Git intake via libgit2: peel to immutable OIDs, filtered diff, blob-based safe overlay, path-traversal/symlink safety | `aa3bcf3` |

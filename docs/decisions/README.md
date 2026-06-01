@@ -15,3 +15,5 @@ immutable once `Accepted`; supersede rather than edit.
 | [0008](0008-llm-provider-abstraction.md) | LLM provider trait with deterministic mock default | Accepted |
 | [0009](0009-hermetic-toolchains-ci.md) | Hermetic, containerized toolchains for first-class language e2e | Accepted |
 | [0010](0010-config-trust-and-fail-closed.md) | Configuration trust tiers (untrusted repo vs trusted user) & fail-closed execution | Accepted |
+| [0011](0011-overlay-materialization.md) | Overlay-confined materialization without `unsafe` (`O_EXCL` + per-component symlink rejection) | Accepted |
+| [0012](0012-real-provider-http-client.md) | HTTP client for real LLM providers (ureq + rustls/ring + webpki-roots) | Accepted |

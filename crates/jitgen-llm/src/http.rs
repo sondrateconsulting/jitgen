@@ -1,4 +1,4 @@
-//! Blocking HTTP transport for real providers (F11; ADR-0008 sync trait, ADR-0011 client choice).
+//! Blocking HTTP transport for real providers (F11; ADR-0008 sync trait, ADR-0012 client choice).
 //!
 //! The network call is isolated behind [`HttpTransport`] so each provider's request-building and
 //! response-parsing logic is unit-tested **offline** with a fake transport — no keys, no network.

@@ -35,6 +35,22 @@ pub(crate) fn user_hint(msg: &str) -> &'static str {
 
     // --- (A) errors that embed an arbitrary user value: matched FIRST so the embedded value can't
     //         trigger a later keyword-only branch. ---
+    // The overlay/snapshot DoS caps (file-count, per-file, aggregate, walk) embed the offending repo
+    // PATH, which could itself contain another branch's keyword. Match FIRST in section (A), requiring
+    // the `invalid overlay:`/`invalid snapshot:` envelope AND `checkout cap`: every genuine cap error
+    // carries both, so a hostile path containing e.g. "not a git repository" still routes here, not to
+    // the repo branch below. The residual is purely cosmetic and bounded: a NON-cap envelope error
+    // (e.g. "non-regular file blocks checkout at <path>") whose PATH happens to contain "checkout cap"
+    // would mis-hint — acceptable per this module's soundness note (the authoritative error prints
+    // above the hint). (codex impl-review P2/P3/P4.)
+    if (msg.contains("invalid overlay:") || msg.contains("invalid snapshot:"))
+        && msg.contains("checkout cap")
+    {
+        return "→ a repo file (or the whole tree) is too large to materialize into the sandbox for \
+                test runs. Large generated/vendored/data files are not needed to generate tests — \
+                remove, move, or ignore the file named in the error (or split a genuinely huge source \
+                file). See docs/troubleshooting.md.";
+    }
     // Match ONLY the unique "run not found in the index" envelope, NOT a bare "invalid run-id":
     // `OrchestratorError::Invalid` is a catch-all that ALSO prefixes the stale-OID and
     // not-completed errors with "invalid run-id:", so a broad match would steal their specific
@@ -251,6 +267,59 @@ mod tests {
         assert!(
             !s.contains("--unsafe-local-execution"),
             "must not be the sandbox hint: {s}"
+        );
+    }
+
+    #[test]
+    fn user_hint_routes_checkout_cap_errors_and_keeps_ordering() {
+        // All three overlay-budget envelopes (per-file size, aggregate size, file-count) share the
+        // "checkout cap" anchor and route to the materialization hint.
+        let per_file = user_hint(
+            "jitgen run: feedback: execution failed: invalid overlay: file is 4256186 bytes, \
+             exceeding the 67108864-byte per-file checkout cap (at docs/reviews/F4/_t3_raw.txt)",
+        );
+        assert!(
+            per_file.contains("materialize into the sandbox"),
+            "got: {per_file}"
+        );
+        assert!(user_hint(
+            "jitgen run: feedback: execution failed: invalid overlay: checkout total exceeds the \
+             2147483648-byte checkout cap (at data/huge.bin)"
+        )
+        .contains("materialize into the sandbox"));
+        assert!(user_hint(
+            "jitgen run: feedback: execution failed: invalid overlay: tree exceeds the 50000-file checkout cap"
+        )
+        .contains("materialize into the sandbox"));
+        // The snapshot (language-detection) cap path routes via the `invalid snapshot:` envelope too.
+        assert!(user_hint(
+            "jitgen run: feedback: execution failed: invalid snapshot: tree walk exceeds the 2000000-entry checkout cap"
+        )
+        .contains("materialize into the sandbox"));
+        // A run-id literally containing "checkout cap" still routes to the run-id hint: the
+        // checkout-cap branch requires BOTH "invalid overlay:" AND "checkout cap", and this run-id
+        // error carries only the latter, so it falls through to the run-id branch.
+        let crafted =
+            user_hint("jitgen report: invalid run-id: no run \"checkout cap\" in the state index");
+        assert!(crafted.contains("run id"), "got: {crafted}");
+        assert!(
+            !crafted.contains("materialize into the sandbox"),
+            "must not be the checkout-cap hint: {crafted}"
+        );
+        // The reverse collision: a hostile over-cap FILENAME containing another branch's keyword
+        // ("not a git repository") still routes to the checkout hint, because the dual-anchored
+        // checkout-cap branch is matched FIRST in section (A) (codex impl-review P2).
+        let hostile = user_hint(
+            "jitgen run: feedback: execution failed: invalid overlay: file is 70000000 bytes, \
+             exceeding the 67108864-byte per-file checkout cap (at data/not a git repository.bin)",
+        );
+        assert!(
+            hostile.contains("materialize into the sandbox"),
+            "got: {hostile}"
+        );
+        assert!(
+            !hostile.contains("--repo points to"),
+            "hostile path must not steal the repo-path hint: {hostile}"
         );
     }
 

@@ -279,7 +279,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   for every non-mock kind; this implements them per
   [ADR-0008](decisions/0008-llm-provider-abstraction.md). **Providers:** Anthropic Messages +
   OpenAI-compatible (`/chat/completions`, also serving `local` servers via `base_url`). **Client**
-  ([ADR-0011](decisions/0011-real-provider-http-client.md)): `ureq` 3.2.x with default rustls + `ring`
+  ([ADR-0012](decisions/0012-real-provider-http-client.md)): `ureq` 3.2.x with default rustls + `ring`
   + bundled `webpki-roots` — blocking, TLS always on, hermetic CA set, no tokio/aws-lc/native-tls;
   Bazel `crate_universe` repinned (`MODULE.bazel.lock`); `deny.toml` license allowances added (incl.
   `webpki-roots` MPL-2.0). **Security:** `real_llm` is the master switch (mock unless on **and** a

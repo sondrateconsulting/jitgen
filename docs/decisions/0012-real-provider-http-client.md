@@ -1,4 +1,4 @@
-# ADR-0011: HTTP client for real LLM providers (ureq + rustls/ring + webpki-roots)
+# ADR-0012: HTTP client for real LLM providers (ureq + rustls/ring + webpki-roots)
 
 - **Status:** Accepted
 - **Date:** 2026-06-01

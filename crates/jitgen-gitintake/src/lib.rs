@@ -13,5 +13,6 @@ mod intake;
 pub use error::{GitError, Result};
 pub use filter::{is_ignored, is_secret_like, is_vendored};
 pub use intake::{
-    diff_revisions, open_repo, read_blob_at, reject_unsafe_rel, resolve_commit, OverlayPlan,
+    blob_size_at, diff_revisions, open_repo, read_blob_at, read_blob_at_capped, reject_unsafe_rel,
+    resolve_commit, OverlayPlan,
 };

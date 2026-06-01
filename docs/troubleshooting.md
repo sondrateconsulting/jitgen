@@ -26,6 +26,24 @@ run).
 - **Fix (live conformance suite):** set `JITGEN_TEST_DOCKER_IMAGE=name@sha256:…`. See
   [ADR-0009](decisions/0009-hermetic-toolchains-ci.md).
 
+## "...exceeds the ...checkout cap" / "tree exceeds the ...-file checkout cap"
+
+To validate generated tests, `jitgen run` materializes a checkout of your revision into an isolated
+sandbox overlay. That checkout is bounded (pre-execution DoS bounds — the repo is treated as
+hostile): a **per-file** size cap (64 MiB), an **aggregate** size budget (2 GiB), a cap of **50,000
+materialized files** (non-ignored), and a backstop on **raw tree entries walked** (2,000,000). Cap
+errors that name a file name the offending file.
+
+- **Cause:** a single file is larger than 64 MiB, the materialized tree is larger than ~2 GiB, it has
+  more than 50,000 non-ignored files, or the raw tree has more than ~2,000,000 entries.
+- **Not the 2 MB cap:** the `blob exceeds size cap (… bytes)` limit you may see during **analysis** is
+  a *separate*, smaller bound on what jitgen **parses**. Checkout uses the larger caps above, so an
+  ordinary large file no longer fails the run (it is copied into the sandbox, not parsed).
+- **Fix:** large generated artifacts, vendored bundles, datasets, or media usually do not belong in
+  the test checkout — remove them, move them out of the tree, or add them to an ignore path (ignored
+  files do not count toward the file or size caps). If it is a genuinely huge **source** file, that
+  revision can't be sandboxed as-is; split or exclude it.
+
 ## "--write/--patch-out are invalid with --mode catch"
 
 Catch mode is **report-only** by design: catching tests fail on `head`, so they cannot land.

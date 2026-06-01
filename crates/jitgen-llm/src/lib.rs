@@ -4,7 +4,7 @@
 //! A synchronous [`LlmProvider`] trait with a deterministic offline [`MockProvider`] default
 //! (no keys/network), a candidate parser, and static candidate validation. Real providers
 //! (Anthropic / OpenAI-compatible / local) are trusted-config-only, gated by `real_llm`, and use
-//! blocking HTTPS. See ADR-0008, ADR-0011, and `docs/security.md`.
+//! blocking HTTPS. See ADR-0008, ADR-0012, and `docs/security.md`.
 
 mod http;
 mod mock;

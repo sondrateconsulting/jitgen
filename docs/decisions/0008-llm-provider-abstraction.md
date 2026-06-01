@@ -45,7 +45,7 @@ explicit instructions that it must never be treated as commands; the model's out
 - Clear, auditable secret handling.
 - **F11:** the real providers are now implemented (Anthropic Messages + OpenAI-compatible/local) via
   blocking HTTPS behind trusted config + `--real-llm`; the HTTP client choice is
-  [ADR-0011](0011-real-provider-http-client.md).
+  [ADR-0012](0012-real-provider-http-client.md).
 
 ## Alternatives considered
 

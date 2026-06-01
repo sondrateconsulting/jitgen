@@ -11,6 +11,6 @@ description = "LLM provider abstraction with a deterministic mock. Pipeline laye
 jitgen-core.workspace = true
 jitgen-context.workspace = true
 thiserror.workspace = true
-# Real providers (F11): blocking HTTPS + JSON request/response. See ADR-0008/ADR-0011.
+# Real providers (F11): blocking HTTPS + JSON request/response. See ADR-0008/ADR-0012.
 ureq.workspace = true
 serde_json.workspace = true

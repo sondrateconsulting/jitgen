@@ -558,9 +558,10 @@ fn collect_file_changes(diff: &git2::Diff<'_>) -> Result<Vec<FileChange>> {
     Ok(acc.into_inner())
 }
 
-/// Read a file's bytes at a revision **from the tree** (a blob object) — never the working tree, so
-/// symlinks are not followed and no filters run. Returns `None` if the path is absent or not a blob.
-pub fn read_blob_at(repo: &Repository, oid: Oid, rel_path: &str) -> Result<Option<Vec<u8>>> {
+/// Resolve a repo-relative path at a revision to its blob OID, applying the path-safety and
+/// ignore/secret policy. `Ok(None)` if the path is absent or is not a blob (directory or gitlink).
+/// Shared by [`read_blob_at_capped`] and [`blob_size_at`] so both enforce the SAME checks (no drift).
+fn resolve_blob_oid(repo: &Repository, oid: Oid, rel_path: &str) -> Result<Option<Oid>> {
     reject_unsafe_rel(rel_path)?;
     // Enforce the ignore/secret policy on the public read path too (F3/T1 review #3): never hand
     // back bytes for vendored/secret files even if a caller asks directly.
@@ -577,14 +578,51 @@ pub fn read_blob_at(repo: &Repository, oid: Oid, rel_path: &str) -> Result<Optio
     if entry.kind() != Some(git2::ObjectType::Blob) {
         return Ok(None);
     }
-    let blob_oid = entry.id();
+    Ok(Some(entry.id()))
+}
+
+/// The byte size of the blob at `rel_path` for revision `oid`, read from the ODB header WITHOUT
+/// loading the blob — so a caller can budget a checkout (per-file + aggregate caps) BEFORE
+/// materializing anything. `Ok(None)` if the path is absent or is not a blob.
+pub fn blob_size_at(repo: &Repository, oid: Oid, rel_path: &str) -> Result<Option<usize>> {
+    match resolve_blob_oid(repo, oid, rel_path)? {
+        Some(blob_oid) => {
+            let (size, _kind) = repo.odb()?.read_header(blob_oid)?;
+            Ok(Some(size))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Read a file's bytes at a revision **from the tree** (a blob object) — never the working tree, so
+/// symlinks are not followed and no filters run — refusing any blob larger than `max_bytes` (checked
+/// via the ODB header, before the blob is loaded). Returns `None` if the path is absent or not a
+/// blob. The cap is a PARAMETER because the sandbox-checkout path materializes files for a test
+/// toolchain to read (not to parse), so it permits larger blobs than the 2 MB *parse* cap that
+/// analysis/context/config reads use via [`read_blob_at`] (the two concerns are distinct; F11-DX).
+pub fn read_blob_at_capped(
+    repo: &Repository,
+    oid: Oid,
+    rel_path: &str,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>> {
+    let blob_oid = match resolve_blob_oid(repo, oid, rel_path)? {
+        Some(blob_oid) => blob_oid,
+        None => return Ok(None),
+    };
     // Check the object size via the ODB header WITHOUT loading the full blob (DoS bound; F3/S1 #3).
     let (size, _kind) = repo.odb()?.read_header(blob_oid)?;
-    if size > MAX_BLOB_BYTES {
+    if size > max_bytes {
         return Err(GitError::TooLarge(size));
     }
     let blob = repo.find_blob(blob_oid)?;
     Ok(Some(blob.content().to_vec()))
+}
+
+/// Read a blob at the default 2 MB *parse* cap (analysis / context / config reads). Sandbox checkout
+/// uses [`read_blob_at_capped`] with a larger cap — see `crates/jitgen-orchestrator/src/checkout.rs`.
+pub fn read_blob_at(repo: &Repository, oid: Oid, rel_path: &str) -> Result<Option<Vec<u8>>> {
+    read_blob_at_capped(repo, oid, rel_path, MAX_BLOB_BYTES)
 }
 
 /// Reject a repo-relative path that is empty, absolute, contains `..`, a backslash, a Windows
@@ -813,6 +851,39 @@ mod tests {
         let head = commit_all(&repo, &dir, "c1", None);
         assert!(matches!(
             read_blob_at(&repo, head, "big.bin"),
+            Err(GitError::TooLarge(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_blob_at_capped_separates_checkout_cap_from_parse_cap() {
+        // The sandbox-checkout path needs to materialize files larger than the 2 MB *parse* cap
+        // (F11-DX). `read_blob_at_capped` parameterizes the bound; `blob_size_at` reports the size
+        // without loading the blob so a caller can budget the checkout first.
+        let dir = temp_dir("capblob");
+        let repo = Repository::init(&dir).unwrap();
+        let size = MAX_BLOB_BYTES + 1024; // just over the 2 MB parse cap
+        std::fs::write(dir.join("mid.bin"), vec![b'x'; size]).unwrap();
+        let head = commit_all(&repo, &dir, "c1", None);
+
+        // Header-only size read (no blob load); absent paths report None.
+        assert_eq!(blob_size_at(&repo, head, "mid.bin").unwrap(), Some(size));
+        assert_eq!(blob_size_at(&repo, head, "absent.bin").unwrap(), None);
+
+        // The default 2 MB parse reader still refuses it...
+        assert!(matches!(
+            read_blob_at(&repo, head, "mid.bin"),
+            Err(GitError::TooLarge(_))
+        ));
+        // ...but a larger (checkout-style) cap reads it faithfully...
+        let bytes = read_blob_at_capped(&repo, head, "mid.bin", size + 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes.len(), size);
+        // ...and the capped reader still enforces its OWN smaller bound.
+        assert!(matches!(
+            read_blob_at_capped(&repo, head, "mid.bin", size - 1),
             Err(GitError::TooLarge(_))
         ));
         let _ = std::fs::remove_dir_all(&dir);
