@@ -15,7 +15,7 @@ mod escape;
 mod exporters;
 mod model;
 
-pub use escape::{cap, md_inline, sanitize, strip_controls, xml_attr, xml_text};
+pub use escape::{cap, md_inline, sanitize, sanitize_line, strip_controls, xml_attr, xml_text};
 pub use model::{
     AcceptedTest, CatchReport, MutantInfo, RejectedCandidate, RunReport, RunSummary,
     REPORT_SCHEMA_VERSION,

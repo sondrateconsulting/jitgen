@@ -13,7 +13,7 @@ use jitgen_orchestrator::{
     analyze, apply_to_repo, load_report, resolve_trusted, resume_run, run_jit_generation,
     state_root_for, AnalyzeOptions, RunOptions, TrustedFlags,
 };
-use jitgen_report::{render, sanitize, ReportFormat};
+use jitgen_report::{render, sanitize_line, ReportFormat};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -321,7 +321,10 @@ fn cmd_run(a: RunArgs) -> ExitCode {
     if let Err(msg) = validate_output_rules(trusted.mode, a.write, a.patch_out.is_some()) {
         // `msg` is jitgen-authored today, but route it through the same sink hardening so a future
         // edit that interpolates an untrusted value can't reintroduce terminal injection here.
-        eprintln!("{}", safe_for_terminal(&format!("jitgen run: {msg}")));
+        eprintln!(
+            "{}",
+            safe_for_terminal(&format!("jitgen run: {msg}"), ERROR_MSG_CAP)
+        );
         return ExitCode::from(2);
     }
     let opts = RunOptions {
@@ -343,9 +346,11 @@ fn cmd_run(a: RunArgs) -> ExitCode {
                     written.len()
                 );
                 for w in &written {
-                    // Sanitize: a generated path can embed an attacker-controlled directory; never
-                    // print raw control/ANSI to the terminal (S1/F9).
-                    println!("  {}", sanitize(w, 512));
+                    // A generated path can embed an attacker-controlled directory. Route it through the
+                    // single-line terminal sink (not bare `sanitize`, which keeps `\n`/`\t`) so a hostile
+                    // path can't print raw control/ANSI or forge an extra listing line (S1/F9; security
+                    // review F1 follow-up — codex P1).
+                    println!("  {}", safe_for_terminal(w, 512));
                 }
             }
             Err(e) => return fail(&format!("jitgen run: --write failed: {e}")),
@@ -358,7 +363,12 @@ fn cmd_run(a: RunArgs) -> ExitCode {
                 out.display()
             ));
         }
-        println!("jitgen: wrote patch to {}", out.display());
+        // `out` is an operator-supplied CLI path (trusted), but echo it through the same single-line
+        // sink as the sibling error path above — uniform terminal-echo hygiene, no asymmetry to audit.
+        println!(
+            "jitgen: wrote patch to {}",
+            safe_for_terminal(&out.display().to_string(), 512)
+        );
     } else {
         print!("{}", render(&report, a.format.into()));
     }
@@ -470,18 +480,18 @@ fn cmd_doctor(a: DoctorArgs) -> ExitCode {
 /// enough to bound a hostile flood.
 const ERROR_MSG_CAP: usize = 8 * 1024;
 
-/// Make an error message safe to print to the terminal. An error's `Display` can embed untrusted
-/// repo/LLM content (a repo path or ref, a libgit2 message, a provider's own error text), so strip
-/// ANSI/control sequences and flatten newlines/tabs: a hostile value must not be able to recolor the
-/// terminal, move the cursor, set the window title (OSC), or forge a second "line" of output.
-/// Applied at the single CLI error sink, so every current and future error variant is covered without
-/// per-call-site flattening (mirrors `checkout::safe_path_for_error`; security review F1).
-fn safe_for_terminal(msg: &str) -> String {
-    sanitize(msg, ERROR_MSG_CAP).replace(['\n', '\t'], " ")
+/// The CLI's terminal-echo adapter: route untrusted text destined for stdout/stderr through the
+/// report crate's single-line primitive [`jitgen_report::sanitize_line`], which strips ANSI/CSI/OSC,
+/// C0/C1 (incl. CR), DEL, and bidi/zero-width controls, then flattens the intentionally-kept `\n`/`\t`.
+/// So a hostile value (a repo path/ref, a libgit2 message, a provider error) can't recolor the
+/// terminal, move the cursor, set the window title, or forge a fake line. Used at every CLI sink that
+/// prints untrusted single-line content (mirrors `checkout::safe_path_for_error`; security review F1).
+fn safe_for_terminal(msg: &str, max: usize) -> String {
+    sanitize_line(msg, max)
 }
 
 fn fail(msg: &str) -> ExitCode {
-    eprintln!("{}", safe_for_terminal(msg));
+    eprintln!("{}", safe_for_terminal(msg, ERROR_MSG_CAP));
     // Every runtime error gets a one-line, actionable next step (DX first principle: an error states
     // the problem AND the fix). The hint is keyed off the RAW msg (its match keywords are control-free)
     // and is itself a static, jitgen-authored string, so printing it verbatim is safe. Best-effort to
@@ -530,13 +540,17 @@ mod tests {
     #[test]
     fn error_output_is_sanitized_for_the_terminal() {
         // An error whose Display embeds a hostile repo path must be neutralized before it reaches
-        // stderr via `fail()` (security review F1): no ESC/CSI recolor, no OSC window-title/BEL, and
-        // no newline-forged second line such as a fake "success" the operator might trust.
+        // stderr via `fail()` (security review F1): no ESC/CSI recolor, no OSC window-title/BEL, no
+        // CR line-overwrite (codex P1), and no newline-forged second line such as a fake "success".
         let hostile =
-            "jitgen run: git intake: unsafe path: a\u{1b}[31mb\u{1b}]0;pwned\u{7}\nfake: SUCCESS";
-        let safe = safe_for_terminal(hostile);
+            "jitgen run: git intake: unsafe path: a\u{1b}[31mb\u{1b}]0;pwned\u{7}\r\nfake: SUCCESS";
+        let safe = safe_for_terminal(hostile, ERROR_MSG_CAP);
         assert!(!safe.contains('\u{1b}'), "ESC survived: {safe:?}");
         assert!(!safe.contains('\u{7}'), "BEL survived: {safe:?}");
+        assert!(
+            !safe.contains('\r'),
+            "CR survived (line overwrite): {safe:?}"
+        );
         assert!(
             !safe.contains('\n'),
             "newline survived (forged line): {safe:?}"
@@ -551,7 +565,7 @@ mod tests {
     fn safe_for_terminal_leaves_clean_messages_unchanged() {
         // A normal single-line error must pass through verbatim (no spurious edits).
         let clean = "jitgen run: invalid base: no such revision";
-        assert_eq!(safe_for_terminal(clean), clean);
+        assert_eq!(safe_for_terminal(clean, ERROR_MSG_CAP), clean);
     }
 
     #[test]

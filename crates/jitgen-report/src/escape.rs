@@ -53,6 +53,7 @@ fn is_strippable(c: char) -> bool {
     matches!(c,
         '\u{0}'..='\u{8}'        // C0 (minus \t \n handled separately)
         | '\u{B}' | '\u{C}'      // VT, FF
+        | '\u{D}'                // CR — stripped so a bare \r can't reposition the cursor; CRLF collapses to LF
         | '\u{E}'..='\u{1F}'     // SO..US (ESC handled separately)
         | '\u{7F}'               // DEL
         | '\u{80}'..='\u{9F}'    // C1 controls
@@ -131,6 +132,16 @@ pub fn cap(s: &str, max: usize) -> String {
 /// Strip controls then cap — the inert plain-text base every format escaper builds on.
 pub fn sanitize(s: &str, max: usize) -> String {
     cap(&strip_controls(s), max)
+}
+
+/// Strip controls + cap, then flatten the intentionally-kept `\n`/`\t` to spaces — the inert,
+/// guaranteed **single-line** form for a terminal field or a one-line report cell (a path, a
+/// rationale, a warning). `sanitize` already removes CR/ANSI/C0-C1/DEL/bidi; this additionally stops a
+/// hostile value from forging an extra line or column (e.g. a path containing `\nsummary: 0 rejected`
+/// faking a report row). Use `sanitize` (not this) for legitimately multi-line bodies — patch/source
+/// blocks, fenced code, XML `<failure>` text (security review F1).
+pub fn sanitize_line(s: &str, max: usize) -> String {
+    sanitize(s, max).replace(['\n', '\t'], " ")
 }
 
 /// Escape a single-line untrusted value for **Markdown/HTML inline** context (a table cell, a list
@@ -273,6 +284,31 @@ mod tests {
         let s = "a\u{9B}31mb\u{0}\u{7}c\nd\te\u{7F}f";
         let clean = strip_controls(s);
         assert_eq!(clean, "abc\nd\tef");
+    }
+
+    #[test]
+    fn strips_carriage_return_so_crlf_collapses_to_lf() {
+        // CR (U+000D) is a terminal-spoofing primitive — a bare `\r` returns the cursor to column 0
+        // and overwrites the current line. It is NOT in the `\n`/`\t` keep-set, so it must be stripped:
+        // a CRLF collapses to a clean LF and a lone CR vanishes (security review F1 follow-up).
+        assert_eq!(strip_controls("line1\r\nline2"), "line1\nline2");
+        assert_eq!(
+            strip_controls("real error\roverwrite"),
+            "real erroroverwrite"
+        );
+        assert!(!strip_controls("x\r\ny").contains('\r'));
+    }
+
+    #[test]
+    fn sanitize_line_flattens_to_a_single_inert_line() {
+        // A hostile single-line field must not forge an extra line/column or carry any control.
+        let evil = "tests/x\n  + /fake/pwn.rs [rust]\r\tcol\u{1b}[31m";
+        let out = sanitize_line(evil, CAP_NAME);
+        assert!(!out.contains('\n'), "LF survived: {out:?}");
+        assert!(!out.contains('\r'), "CR survived: {out:?}");
+        assert!(!out.contains('\t'), "tab survived: {out:?}");
+        assert!(!out.contains('\u{1b}'), "ESC survived: {out:?}");
+        assert!(out.starts_with("tests/x"), "content dropped: {out:?}");
     }
 
     #[test]

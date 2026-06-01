@@ -13,7 +13,7 @@ use jitgen_adapters::{AdapterContext, AdapterRegistry};
 use jitgen_context::redact;
 use jitgen_core::{Mode, ResolvedConfig, RevisionId, SymbolKind, TrustedConfig};
 use jitgen_gitintake::{diff_revisions, open_repo, resolve_commit};
-use jitgen_report::sanitize;
+use jitgen_report::sanitize_line;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -142,9 +142,9 @@ impl AnalyzeReport {
         ));
         s.push_str(&format!(
             "repo: {}\nbase: {}  head: {}\n\n",
-            sanitize(&self.repo, CAP),
-            sanitize(&self.base, CAP),
-            sanitize(&self.head, CAP)
+            sanitize_line(&self.repo, CAP),
+            sanitize_line(&self.base, CAP),
+            sanitize_line(&self.head, CAP)
         ));
 
         s.push_str(&format!("Changed files ({}):\n", self.changed_files.len()));
@@ -152,7 +152,7 @@ impl AnalyzeReport {
             s.push_str(&format!(
                 "  {} {} ({} hunks)\n",
                 f.kind,
-                sanitize(&f.path, CAP),
+                sanitize_line(&f.path, CAP),
                 f.hunks
             ));
         }
@@ -162,8 +162,12 @@ impl AnalyzeReport {
             self.detected_adapters.len()
         ));
         for a in &self.detected_adapters {
-            let ev: Vec<String> = a.evidence.iter().map(|e| sanitize(e, CAP)).collect();
-            s.push_str(&format!("  {} — {}\n", sanitize(&a.id, CAP), ev.join(", ")));
+            let ev: Vec<String> = a.evidence.iter().map(|e| sanitize_line(e, CAP)).collect();
+            s.push_str(&format!(
+                "  {} — {}\n",
+                sanitize_line(&a.id, CAP),
+                ev.join(", ")
+            ));
         }
 
         s.push_str(&format!("\nSelected targets ({}):\n", self.targets.len()));
@@ -171,11 +175,11 @@ impl AnalyzeReport {
             s.push_str(&format!(
                 "  [{:.2}] {} {} {:?} {}\n        {}\n",
                 t.score,
-                sanitize(&t.id, CAP),
-                sanitize(&t.adapter, CAP),
+                sanitize_line(&t.id, CAP),
+                sanitize_line(&t.adapter, CAP),
                 t.kind,
-                sanitize(t.symbol.as_deref().unwrap_or("(hunk)"), CAP),
-                sanitize(&t.rationale, CAP),
+                sanitize_line(t.symbol.as_deref().unwrap_or("(hunk)"), CAP),
+                sanitize_line(&t.rationale, CAP),
             ));
         }
         s.push_str("\n(analyze does not run tests, call a real LLM, or modify anything.)\n");
