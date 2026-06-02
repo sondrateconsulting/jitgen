@@ -442,9 +442,26 @@ In CI specifically: keep the [same-repo secret gating](#security-model-for-ci) (
 bound spend with the `concurrency` block shown above (cancel superseded PR runs), and start with
 `--warn-only` so a billed-but-flaky run can't block a PR while you build a track record.
 
-## Self-dogfood (forthcoming)
+## Self-dogfood
 
-jitgen's own CI will run this catch-mode advisory on its **own** pull requests using the shipped
-artifact and the security model above — its first real deployment. Until that track record exists,
-this integration is described as a **CI advisory**; "PR gate" positioning waits on the dogfood
-evidence. This guide is the contract that work builds on.
+jitgen's own CI runs this catch-mode advisory on its **own** pull requests, using the shipped
+container image and the security model above — its first real deployment. The workflow is
+[`.github/workflows/jitgen-advisory.yml`](../.github/workflows/jitgen-advisory.yml): it runs jitgen
+*inside* the digest-pinned image ("the container is the sandbox") and follows the two-job trust split
+from [GitHub Actions](#github-actions) above — tightened with one extra opt-in: the real-provider job
+*also* requires a `JITGEN_REAL_LLM` repository variable, so same-repo PRs run the mock until a
+maintainer sets it (the example above runs the real job on every same-repo PR). Fork PRs — and same-repo
+PRs until that variable is set — run the **offline mock** (deterministic, keyless, `0 catches`). The
+**real provider** runs only on same-repo PRs and only once a maintainer flips it on: the `JITGEN_REAL_LLM`
+variable set to `true`, with an `ANTHROPIC_API_KEY` secret in a protected `jitgen-llm` Environment as
+defense-in-depth. A hostile PR can neither reach the key nor enable a real provider.
+
+The run is **advisory and non-blocking**: the mock job omits `--fail-on-catch` and the real job arms it
+with `--warn-only`, so jitgen never fails its own PR on its own *findings* — the exit-3 findings gate
+maps to exit 0 (a genuine jitgen *runtime* error still fails the check, as a broken tool should; only
+the findings gate is suppressed). It surfaces findings and uploads the SARIF as a build artifact
+(code-scanning upload is added when the repo goes public, which needs GitHub Advanced Security). This
+is deliberately **not** a proven "PR gate": we are still accumulating the track record that would
+justify dropping `--warn-only` and letting exit `3` block.
+Until then jitgen-on-jitgen stays a **CI advisory** — the same posture this guide recommends for your
+own pipeline. This guide remains the contract that work builds on.

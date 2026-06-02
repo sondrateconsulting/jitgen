@@ -1,0 +1,234 @@
+# jitgen self-dogfood: run jitgen's own catch-mode advisory on jitgen's OWN pull requests, using the
+# shipped GHCR image — the artifact's first real deployment (WS5). This is jitgen being its own first
+# customer.
+#
+# POSITIONING: this is a CI *advisory*, not a "PR gate". It surfaces findings and uploads SARIF but
+# never fails a jitgen PR on its own *findings* — the mock path omits the gate; the real path arms it
+# with `--warn-only`, so the exit-3 findings gate maps to exit 0. (A genuine jitgen *runtime* error,
+# exit 1 — a broken build, or an unset key on the real path — still fails the check, as a broken tool
+# should; only the findings gate is suppressed.) Flipping the findings gate to blocking is a one-line
+# change (drop `--warn-only`) once jitgen-on-jitgen has a track record of trustworthy strong catches —
+# see docs/ci.md.
+#
+# SECURITY MODEL (docs/ci.md "Security model for CI", docs/security.md):
+#   - Trigger is `pull_request`, NEVER `pull_request_target` — fork PRs run with NO repo secrets by
+#     construction, so a fork can never reach the LLM key.
+#   - Two jobs split by trust. The secret-bearing REAL job runs ONLY for same-repo PRs
+#     (`head.repo.full_name == github.repository`) AND only when the maintainer has flipped the
+#     `JITGEN_REAL_LLM` repo variable on; everything else runs the keyless offline MOCK. The real key
+#     and untrusted fork-head code therefore never meet in one job. The key additionally sits behind a
+#     protected Environment (`jitgen-llm`) as defense-in-depth.
+#   - "The container IS the sandbox": every step runs INSIDE the digest-pinned jitgen image and passes
+#     `--unsafe-local-execution` (the constrained-local tier) — the throwaway container is the isolation
+#     boundary. No Docker socket, no Docker-in-Docker. (This is the inverse of jitgen's own
+#     `--docker-image` tier; see docs/ci.md + docs/security.md.)
+#   - Catch mode is report-only: jitgen writes nothing into the repo, so it is safe on PR code.
+#   - The trusted provider config is written OUTSIDE the repo checkout, so a hostile PR's `.jitgen.yaml`
+#     cannot enable a real provider or redirect egress. Every executed step body is defined here in the
+#     workflow (base-controlled); no PR-head script is run as CI logic.
+#   - IMAGE VISIBILITY: the GHCR image is private today, so only same-repo PRs (whose `GITHUB_TOKEN` can
+#     read the repo's own packages) can pull it — which is every PR while the repo is private. An
+#     external fork PR cannot pull a private package, so fork coverage depends on the image being made
+#     public (it is on the go-public checklist); until then a fork PR would fail at image pull. While the
+#     repo is private there are no external forks, so this is latent, not live.
+#
+# Conventions (see docs/ci.md / .github/zizmor.yml): every `uses:` action is pinned to a full commit
+# SHA, permissions are least-privilege per job, and head-controlled `${{ github.event.* }}` values are
+# passed via `env:` (never interpolated into a `run:` shell body) to avoid template injection.
+name: jitgen advisory
+
+on:
+  pull_request: # NOT pull_request_target — fork PRs must not get repo secrets (see Security model above)
+
+# Least privilege at the top; each job widens only what it needs.
+permissions:
+  contents: read
+
+# One run per PR; cancel superseded runs so a force-push doesn't stack real-provider token spend.
+concurrency:
+  group: jitgen-advisory-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # FORK PRs (and any same-repo PR while the real provider is OFF) land here: offline mock only — no
+  # secret, no Environment, deterministic, always green. The built-in mock + the default catch strategy
+  # (intent-aware) yields no candidates, so this never even compiles the repo; `0 catches` is the
+  # expected result, not a failure. This is what runs on the PR that introduces this workflow.
+  advisory-mock:
+    name: catch advisory (mock)
+    if: ${{ github.event.pull_request.head.repo.full_name != github.repository || vars.JITGEN_REAL_LLM != 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read # pull the private GHCR image (anonymous once the repo/image go public)
+    container:
+      # "The container IS the sandbox" — pinned to the v0.2.0 release digest, never a floating tag.
+      # Refresh with: docker buildx imagetools inspect ghcr.io/sondrateconsulting/jitgen:vX.Y.Z --format '{{.Manifest.Digest}}'
+      image: ghcr.io/sondrateconsulting/jitgen@sha256:5f6ddedc4984c72f10c6b68897ba384ec31630d78ae9063ecb499c218fdf4521
+      credentials: # required only while the package is PRIVATE; harmless once it is public
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      # The image is non-root; run as root so actions/checkout can write the workspace. Acceptable
+      # precisely because the throwaway container — not the user — is the isolation boundary.
+      options: --user root
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0 # jitgen diffs base..head; a shallow checkout may lack the merge base
+          persist-credentials: false
+      - name: jitgen catch advisory (mock)
+        env:
+          # Head-controlled SHAs via env (never inlined into the shell) — template-injection safe.
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          SARIF: ${{ runner.temp }}/jitgen.sarif
+        # No --real-llm => the offline mock master switch stays in force; deterministic, no network, no
+        # key. The default (intent-aware) strategy + the mock yields zero candidates, so no test command
+        # runs — but --unsafe-local-execution is still REQUIRED: sandbox selection runs regardless, and
+        # inside this toolless container Auto finds no isolating backend and would otherwise fail closed.
+        # No --output flag exists, so the SARIF report is redirected from stdout.
+        run: |
+          # jitgen opens the repo with libgit2, which enforces git's dubious-ownership check. This
+          # container runs as root on a runner-owned checkout, so mark the workspace safe (jitgen's
+          # sandbox, not file ownership, is the security boundary; the container is ephemeral). jitgen
+          # does not isolate libgit2's config search path, so it reads the global gitconfig set here.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          jitgen run --repo "$GITHUB_WORKSPACE" --base "$BASE" --head "$HEAD" \
+            --mode catch --format sarif --unsafe-local-execution \
+            > "$SARIF"
+      - name: Upload SARIF artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jitgen-sarif-mock
+          path: ${{ runner.temp }}/jitgen.sarif
+          if-no-files-found: warn # the `>` redirect always creates the file; an early jitgen error just leaves it 0 bytes
+          retention-days: 7
+      - name: Summarize findings
+        if: ${{ !cancelled() }}
+        env:
+          SARIF: ${{ runner.temp }}/jitgen.sarif
+          LABEL: mock
+          ARTIFACT: jitgen-sarif-mock
+        # Counts SARIF results (an int) and writes a short advisory note to the job summary. Reads only
+        # the count, never raw SARIF text, and always exits 0 — best-effort, never fails the job.
+        run: |
+          if [ ! -s "$SARIF" ]; then
+            echo "jitgen produced no SARIF (it errored before render, or had nothing to report)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          count="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(len(r.get("results",[])) for r in d.get("runs",[])))' "$SARIF" 2>/dev/null || echo '?')"
+          {
+            echo "### jitgen catch advisory ($LABEL)"
+            echo
+            echo "Surfaced **$count** catch result(s). This run is **advisory** — it never fails the PR on its own findings."
+            echo "Full SARIF: the \`$ARTIFACT\` build artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # SAME-REPO PRs with the real provider explicitly enabled land here. This job holds the key and never
+  # runs for a fork (it requires head.repo == github.repository), so the real key and untrusted
+  # fork-head code can never meet. It stays advisory (`--fail-on-catch --warn-only` => always exit 0).
+  #
+  # Enabling it is a CONFIG FLIP, not a rebuild (see the maintainer note in the PR / docs/ci.md):
+  #   1. Set the `JITGEN_REAL_LLM` repository variable to `true` — this ALONE gates the job (a job-level
+  #      `if` cannot read `secrets.*`). Until it is `true`, this job is skipped and `advisory-mock` runs
+  #      instead (live + green).
+  #   2. Create the `jitgen-llm` Environment and add the `ANTHROPIC_API_KEY` secret to it — the job
+  #      consumes this (and the Environment is defense-in-depth). Set the variable WITHOUT the secret and
+  #      the job RUNS but jitgen exits 1 with a clear "ANTHROPIC_API_KEY is not set" message; it does not
+  #      silently fall back to the mock. So land the secret with (or before) the variable.
+  advisory-real:
+    name: catch advisory (real provider)
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && vars.JITGEN_REAL_LLM == 'true' }}
+    runs-on: ubuntu-latest
+    environment: jitgen-llm # protected Environment holding ANTHROPIC_API_KEY (defense-in-depth)
+    permissions:
+      contents: read
+      packages: read # pull the private GHCR image (anonymous once the repo/image go public)
+    container:
+      image: ghcr.io/sondrateconsulting/jitgen@sha256:5f6ddedc4984c72f10c6b68897ba384ec31630d78ae9063ecb499c218fdf4521
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user root
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Single explicit, trusted dependency-fetch phase (ADR-0009 / security.md threat #6+#8): warm an
+      # offline cargo cache OUTSIDE the repo, so the sandboxed `cargo test` jitgen runs to validate a
+      # catch resolves jitgen's own deps with no network. The constrained-local tier does not itself cut
+      # the network (the container is the boundary); CARGO_NET_OFFLINE + this warmed cache make the
+      # validation build hermetic and deterministic regardless.
+      # This runs only for same-repo PRs (this job never runs for a fork), so it deliberately trusts the
+      # PR-head Cargo.toml/Cargo.lock — jitgen's same-repo trust tier. The LLM key is intentionally NOT in
+      # this step's env (it is scoped to the jitgen run step below), so untrusted manifest content and the
+      # key never coexist in one step.
+      - name: Warm offline cargo cache (trusted fetch phase)
+        env:
+          CARGO_HOME: ${{ runner.temp }}/jitgen-cargo
+        run: cargo fetch --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
+      - name: Write trusted provider config (outside the repo checkout)
+        env:
+          # env_allowlist_extra is config-file-only (no CLI flag / no env var); it forwards CARGO_HOME +
+          # CARGO_NET_OFFLINE from jitgen's process env into the no-network sandbox so the warmed cache
+          # is used. Both names pass the env deny-patterns; credential/socket names never could.
+          CONFIG: ${{ runner.temp }}/jitgen-trusted.yaml
+        run: |
+          cat > "$CONFIG" <<'YAML'
+          provider:
+            kind: anthropic
+            api_key_env: ANTHROPIC_API_KEY   # the NAME of the env var, never the key itself
+            real_llm: true
+          env_allowlist_extra:
+            - CARGO_HOME
+            - CARGO_NET_OFFLINE
+          YAML
+      - name: jitgen catch advisory (real provider)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CONFIG: ${{ runner.temp }}/jitgen-trusted.yaml
+          SARIF: ${{ runner.temp }}/jitgen.sarif
+          CARGO_HOME: ${{ runner.temp }}/jitgen-cargo
+          CARGO_NET_OFFLINE: "true"
+        # --warn-only keeps the findings gate advisory: a catch maps to exit 0, never 3 (a jitgen runtime
+        # error still exits 1 and fails the step — only the findings gate is suppressed). Drop --warn-only
+        # to let exit 3 block the PR once the strong-catch calls have earned trust. The SARIF is rendered
+        # before the gate decides the exit code, so it is complete even on a gate trip.
+        run: |
+          # Mark the runner-owned checkout safe for jitgen's libgit2 (root container; see the mock job).
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          jitgen run --repo "$GITHUB_WORKSPACE" --base "$BASE" --head "$HEAD" \
+            --mode catch --format sarif --unsafe-local-execution \
+            --config "$CONFIG" --real-llm \
+            --fail-on-catch --warn-only \
+            > "$SARIF"
+      - name: Upload SARIF artifact
+        if: ${{ !cancelled() }} # ALWAYS upload — even if the gate tripped (exit 3)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jitgen-sarif-real
+          path: ${{ runner.temp }}/jitgen.sarif
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Summarize findings
+        if: ${{ !cancelled() }}
+        env:
+          SARIF: ${{ runner.temp }}/jitgen.sarif
+          LABEL: real provider
+          ARTIFACT: jitgen-sarif-real
+        run: |
+          if [ ! -s "$SARIF" ]; then
+            echo "jitgen produced no SARIF (it errored before render, or had nothing to report)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          count="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(len(r.get("results",[])) for r in d.get("runs",[])))' "$SARIF" 2>/dev/null || echo '?')"
+          {
+            echo "### jitgen catch advisory ($LABEL)"
+            echo
+            echo "Surfaced **$count** catch result(s). This run is **advisory** — it never fails the PR on its own findings."
+            echo "Full SARIF: the \`$ARTIFACT\` build artifact."
+          } >> "$GITHUB_STEP_SUMMARY"

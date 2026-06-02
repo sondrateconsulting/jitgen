@@ -16,6 +16,18 @@ run state and report formats.
   `#![forbid(unsafe_code)]`, the trusted/untrusted config split, catch-mode-report-only,
   producer-redacts/renderer-escapes), and GitHub issue forms (`.github/ISSUE_TEMPLATE/`) that route
   security reports to private disclosure. (E10 / WS4)
+- **Self-dogfood CI advisory (WS5).** jitgen now runs its own catch-mode advisory on its own pull
+  requests via [`.github/workflows/jitgen-advisory.yml`](.github/workflows/jitgen-advisory.yml), using
+  the shipped, digest-pinned GHCR image ("the container IS the sandbox"). The run is **advisory and
+  non-blocking** — it surfaces findings and uploads SARIF but never fails a jitgen PR on its own
+  *findings* (a genuine jitgen runtime error can still fail the check). Fork PRs (and same-repo PRs
+  until a maintainer opts in) run the deterministic offline **mock**; the **real provider** runs only on
+  same-repo PRs and only when a maintainer sets the `JITGEN_REAL_LLM` repository variable to `true` (the
+  `ANTHROPIC_API_KEY` secret lives in a protected `jitgen-llm` Environment as defense-in-depth). The
+  key-bearing job never runs for a fork, so the LLM key and untrusted fork code never meet. Triggers on
+  `pull_request` (never `pull_request_target`). The
+  [self-dogfood section of docs/ci.md](docs/ci.md#self-dogfood) is now live (no longer "forthcoming").
+  (C1–C3 / WS5)
 
 ### Changed
 - **Docs lead with `analyze`.** The README and user guide now open on `jitgen analyze` — the zero-setup,

@@ -75,7 +75,7 @@ jitgen run     --repo <path> --base <ref> --head <ref>
                  [--mode harden|catch] [--strategy auto|harden|dodgy-diff|intent-aware]
                  [--write | --patch-out <file>]            # harden mode only
                  [--max-tests N] [--format human|json|markdown|patch|junit|sarif]
-                 [--fail-on-catch [--fail-threshold 0..1] [--baseline <file>] [--warn-only]]  # CI gate
+                 [--fail-on-catch [--fail-threshold 0..1] [--baseline <file>] [--warn-only]]  # CI findings gate (advisory; opt-in)
 jitgen analyze --repo <path> --base <ref> --head <ref> [--format human|json]   # non-executing plan
 jitgen resume  --run-id <id>
 jitgen report  --run-id <id> [--format human|json|markdown|junit|sarif|patch]
