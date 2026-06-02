@@ -8,7 +8,7 @@
 use crate::error::Result;
 use crate::targetsel::RankedTarget;
 use jitgen_context::{redact, render_prompt};
-use jitgen_core::{CatchClass, CatchDecision, ContextBundle, Mode, Strategy};
+use jitgen_core::{CatchClass, ContextBundle, Mode, Strategy};
 use jitgen_feedback::{
     assess, flake_filter_catch, flake_filter_single, generate_candidates, repair_loop,
     AssessConfig, Executor, FlakeConfig, GenTarget, HarvestedCatch, RepairConfig, RepairOutcome,
@@ -185,7 +185,7 @@ fn process_candidate(
                 base: executor.run_candidate(&candidate, &Variant::Base)?,
                 head: executor.run_candidate(&candidate, &Variant::Head)?,
             };
-            accept_or_reject_catch(provider, rt, &candidate, &exec, None, context, cfg, out);
+            report_assessed_catch(provider, rt, &candidate, &exec, None, context, cfg, out);
         }
         (_, class) => {
             out.rejected.push(reject(
@@ -247,7 +247,7 @@ fn process_harvested(
         base: executor.run_candidate(&harvested.candidate, &Variant::Base)?,
         head: executor.run_candidate(&harvested.candidate, &Variant::Head)?,
     };
-    accept_or_reject_catch(
+    report_assessed_catch(
         provider,
         rt,
         &harvested.candidate,
@@ -260,9 +260,14 @@ fn process_harvested(
     Ok(())
 }
 
-/// Assess a weak catch and either report it (StrongCatch over threshold) or reject it.
+/// Assess a confirmed weak catch and **surface it** as a [`CatchReport`] carrying the assessor's
+/// decision. Every assessed weak catch is reported — a `StrictlyWeak` or `Uncertain` verdict is
+/// surfaced at a *lower severity* (`jitgen_report::severity_of`) rather than dropped, so the report is
+/// transparent about what the run found. Only a `StrongCatch` can trip the findings gate (`gate.rs`),
+/// so surfacing the weaker verdicts never changes the exit code. (Pre-assessment failures — flaky,
+/// off-goal, repair-exhausted — are filtered into `rejected` upstream of this function.)
 #[allow(clippy::too_many_arguments)]
-fn accept_or_reject_catch(
+fn report_assessed_catch(
     provider: &dyn LlmProvider,
     rt: &RankedTarget,
     candidate: &jitgen_core::TestCandidate,
@@ -277,27 +282,22 @@ fn accept_or_reject_catch(
     let language = rt.target.adapter.as_str();
     let path = candidate.rel_path.clone();
 
-    if assessment.decision == CatchDecision::StrongCatch {
-        out.catches.push(CatchReport::from_assessment(
-            rt.target.id.to_string(),
-            language,
-            report_path(&path),
-            redact(&candidate.source).text,
-            &assessment,
-            mutant,
-            redact(&reproduction(language, &candidate.rel_path)).text,
-        ));
-    } else {
-        out.rejected.push(reject(
-            rt,
-            &path,
-            &format!(
-                "assessed {:?} (tp={:.2}); not a reported strong catch",
-                assessment.decision, assessment.tp_probability
-            ),
-            Some(CatchClass::WeakCatch),
-        ));
-    }
+    out.catches.push(CatchReport::from_assessment(
+        rt.target.id.to_string(),
+        language,
+        report_path(&path),
+        redact(&candidate.source).text,
+        &assessment,
+        mutant,
+        // The changed production location this catch concerns (for line-precise SARIF): the target's
+        // changed file + the first line of its changed span. For a symbol target that span start is the
+        // symbol's declaration line (the changed *unit*); for a hunk target it is the changed hunk line.
+        // Authoritative (diff / tree-sitter derived), unlike the LLM-supplied mutant path. Always `Some`
+        // for a newly produced report — a stored pre-E6 report deserializes these fields as `None`.
+        Some(report_path(&rt.target.path)),
+        Some(rt.target.span.start),
+        redact(&reproduction(language, &candidate.rel_path)).text,
+    ));
 }
 
 fn build_template(
@@ -405,8 +405,8 @@ fn reproduction(language: &str, rel_path: &str) -> String {
 mod tests {
     use super::*;
     use jitgen_core::{
-        AdapterId, ExecOutcome, ExecutionResult, LineRange, RiskScore, SymbolKind, Target,
-        TargetId, TestCandidate,
+        AdapterId, CatchDecision, ExecOutcome, ExecutionResult, LineRange, RiskScore, SymbolKind,
+        Target, TargetId, TestCandidate,
     };
     use jitgen_llm::MockProvider;
 
@@ -534,6 +534,61 @@ mod tests {
         assert_eq!(out.catches.len(), 1, "{out:?}");
         assert_eq!(out.catches[0].decision, CatchDecision::StrongCatch);
         assert!(out.accepted.is_empty());
+        // E6: the changed-production location is plumbed from the target's path + changed span.
+        assert_eq!(out.catches[0].changed_path.as_deref(), Some("src/a.rs"));
+        assert_eq!(out.catches[0].changed_line, Some(1));
+    }
+
+    #[test]
+    fn catch_surfaces_a_non_strong_verdict_into_catches_not_rejected() {
+        // E8: a weak catch whose assessment is NOT a StrongCatch (here an ambiguous, marker-less head
+        // failure ⇒ Uncertain) is now SURFACED in `out.catches` carrying its decision, rather than
+        // dropped into `rejected`. Only a StrongCatch trips the gate, so this never changes the exit
+        // code — it just makes the report transparent about what was generated.
+        struct AmbiguousCatchExec;
+        impl Executor for AmbiguousCatchExec {
+            fn run_candidate(
+                &self,
+                _c: &TestCandidate,
+                v: &Variant,
+            ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+                Ok(match v {
+                    Variant::Base => result(ExecOutcome::Passed, ""),
+                    // No assertion or env markers ⇒ ambiguous (0.5) ⇒ cannot pass the StrongCatch gate.
+                    _ => result(ExecOutcome::Failed, "boom"),
+                })
+            }
+            fn run_existing(
+                &self,
+                _v: &Variant,
+            ) -> std::result::Result<ExecutionResult, jitgen_feedback::ExecError> {
+                Ok(result(ExecOutcome::Passed, ""))
+            }
+        }
+        let cfg = RunConfig {
+            mode: Mode::Catch,
+            strategy: Strategy::DodgyDiff,
+            ..RunConfig::default()
+        };
+        let out = process_target(
+            &MockProvider::new(),
+            &AmbiguousCatchExec,
+            &ranked(SymbolKind::Function),
+            &ctx(),
+            &[],
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(out.catches.len(), 1, "the weak catch is surfaced: {out:?}");
+        assert_ne!(
+            out.catches[0].decision,
+            CatchDecision::StrongCatch,
+            "fixture is engineered to assess below StrongCatch"
+        );
+        assert!(
+            out.rejected.is_empty(),
+            "an assessed weak catch is surfaced, not rejected: {out:?}"
+        );
     }
 
     #[test]

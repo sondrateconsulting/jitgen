@@ -53,7 +53,8 @@ pub(crate) fn render(report: &RunReport) -> String {
             }
             for c in &report.catches {
                 s.push_str(&format!(
-                    "  ! {:?} tp={:.2} {} → {}\n",
+                    "  ! [{}] {:?} tp={:.2} {} → {}\n",
+                    crate::model::severity_of(c.decision, c.tp_probability).as_str(),
                     c.decision,
                     c.tp_probability,
                     sanitize_line(&c.path, CAP_NAME),

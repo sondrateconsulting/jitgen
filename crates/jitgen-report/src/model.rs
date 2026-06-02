@@ -15,6 +15,59 @@ use serde::{Deserialize, Serialize};
 /// Schema version of the on-disk `report.json` artifact (bump on incompatible changes).
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
+/// A catch's **severity**, derived once and shared by every exporter so a catch is labelled
+/// identically across human / Markdown / JUnit / SARIF output (and maps 1:1 to SARIF's
+/// `error`/`warning`/`note`). See [`severity_of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// A high-confidence likely-real bug (a [`StrongCatch`](CatchDecision::StrongCatch)). The only
+    /// severity the findings gate (`--fail-on-catch`) can trip on; SARIF `error`.
+    High,
+    /// A surfaced-but-unconfirmed finding (an [`Uncertain`](CatchDecision::Uncertain) verdict): worth
+    /// a look, not a confirmed bug. SARIF `warning`.
+    Medium,
+    /// A surfaced test defect (a [`StrictlyWeak`](CatchDecision::StrictlyWeak) verdict): informational
+    /// only. SARIF `note`.
+    Low,
+}
+
+impl Severity {
+    /// The SARIF `level` string for this severity (`error`/`warning`/`note`).
+    pub fn sarif_level(self) -> &'static str {
+        match self {
+            Severity::High => "error",
+            Severity::Medium => "warning",
+            Severity::Low => "note",
+        }
+    }
+
+    /// A short, stable lowercase tag (`high`/`medium`/`low`) for human/Markdown output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::High => "high",
+            Severity::Medium => "medium",
+            Severity::Low => "low",
+        }
+    }
+}
+
+/// The single severity mapping every exporter routes a catch through, so they cannot drift.
+///
+/// The level is **decision-driven**: the assessor ensemble already folds the true-positive
+/// probability into its [`CatchDecision`], so a `StrongCatch` is always [`High`](Severity::High)
+/// regardless of the exact probability (this preserves the existing SARIF `error` mapping for every
+/// strong catch). `tp_probability` is part of the signature so a caller can sort or annotate findings
+/// by confidence *within* a severity; it is the orchestrator's gate — not this label — that applies a
+/// probability threshold (`gate.rs`).
+pub fn severity_of(decision: CatchDecision, tp_probability: f64) -> Severity {
+    let _ = tp_probability; // reserved for confidence-based ordering; level is decision-driven
+    match decision {
+        CatchDecision::StrongCatch => Severity::High,
+        CatchDecision::Uncertain => Severity::Medium,
+        CatchDecision::StrictlyWeak => Severity::Low,
+    }
+}
+
 /// A full run report: the durable artifact + the exporter input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunReport {
@@ -64,7 +117,8 @@ pub struct RunSummary {
     pub candidates_generated: usize,
     /// Accepted tests (harden).
     pub accepted: usize,
-    /// Reported catches (catch).
+    /// Reported catches (catch) — every assessed weak catch surfaced, of any decision (not only
+    /// strong; the report lists each at its severity, while only a strong catch can trip the gate).
     pub catches: usize,
     /// Rejected candidates.
     pub rejected: usize,
@@ -125,12 +179,27 @@ pub struct CatchReport {
     /// The mutant this catch was harvested from (intent-aware), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutant: Option<MutantInfo>,
+    /// The changed **production** file this catch concerns (the target's changed path) — so an
+    /// exporter can point at the diffed source rather than the generated-test path. Authoritative
+    /// (diff / tree-sitter derived), unlike the LLM-supplied [`MutantInfo::path`].
+    ///
+    /// `#[serde(default)]`: absent in `report.json` artifacts written before this field existed, which
+    /// must still deserialize (resume/report back-compat; the report data-contract IRON RULE).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_path: Option<String>,
+    /// The 1-based line in [`changed_path`](Self::changed_path) the catch points at: the first line of
+    /// the target's changed span — the symbol's declaration line for a symbol target, or the changed
+    /// hunk line for a hunk target (always a valid line in `changed_path`, `>= 1`). `#[serde(default)]`
+    /// for the same back-compat reason as [`changed_path`](Self::changed_path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_line: Option<u32>,
     /// Redacted reproduction instructions.
     pub reproduction: String,
 }
 
 impl CatchReport {
     /// Build a catch report from an assessment plus the catch's identifying data.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_assessment(
         target: impl Into<String>,
         language: impl Into<String>,
@@ -138,6 +207,8 @@ impl CatchReport {
         source: impl Into<String>,
         assessment: &WeakCatchAssessment,
         mutant: Option<MutantInfo>,
+        changed_path: Option<String>,
+        changed_line: Option<u32>,
         reproduction: impl Into<String>,
     ) -> Self {
         Self {
@@ -151,6 +222,8 @@ impl CatchReport {
             bucket: assessment.bucket,
             rationale: assessment.rationale.clone(),
             mutant,
+            changed_path,
+            changed_line,
             reproduction: reproduction.into(),
         }
     }
@@ -218,6 +291,8 @@ mod tests {
                     risk_description: "off-by-one".into(),
                     path: "src/a.rs".into(),
                 }),
+                Some("src/a.rs".into()),
+                Some(12),
                 "cargo test --test jitgen_a",
             )],
             rejected: vec![RejectedCandidate {
@@ -246,12 +321,16 @@ mod tests {
             "def test_x(): ...",
             &assessment(),
             None,
+            Some("app/x.py".into()),
+            Some(7),
             "pytest test_x.py",
         );
         assert_eq!(c.class, CatchClass::WeakCatch);
         assert_eq!(c.decision, CatchDecision::StrongCatch);
         assert_eq!(c.tp_probability, 0.9);
         assert_eq!(c.bucket, TpBucket::VeryHigh);
+        assert_eq!(c.changed_path.as_deref(), Some("app/x.py"));
+        assert_eq!(c.changed_line, Some(7));
     }
 
     #[test]
@@ -261,5 +340,40 @@ mod tests {
         v.as_object_mut().unwrap().remove("schema_version");
         let back: RunReport = serde_json::from_value(v).unwrap();
         assert_eq!(back.schema_version, REPORT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn catch_report_back_compat_without_new_location_fields() {
+        // IRON RULE: a report.json written before `changed_path`/`changed_line` existed must still
+        // deserialize (resume/report), defaulting the new fields to None.
+        let mut v = serde_json::to_value(sample()).unwrap();
+        let catch = v["catches"][0].as_object_mut().unwrap();
+        assert!(
+            catch.contains_key("changed_path"),
+            "sample should carry the fields"
+        );
+        catch.remove("changed_path");
+        catch.remove("changed_line");
+        let back: RunReport = serde_json::from_value(v).unwrap();
+        assert_eq!(back.catches[0].changed_path, None);
+        assert_eq!(back.catches[0].changed_line, None);
+        // The rest of the catch is intact.
+        assert_eq!(back.catches[0].decision, CatchDecision::StrongCatch);
+        assert_eq!(back.catches[0].target, "t0");
+    }
+
+    #[test]
+    fn severity_of_maps_decision_to_level_and_is_probability_stable() {
+        // Decision drives the level; the exact tp_probability does not change it (so every
+        // StrongCatch stays SARIF `error`, even a borderline one).
+        for tp in [0.0, 0.5, 0.91, 1.0] {
+            assert_eq!(severity_of(CatchDecision::StrongCatch, tp), Severity::High);
+            assert_eq!(severity_of(CatchDecision::Uncertain, tp), Severity::Medium);
+            assert_eq!(severity_of(CatchDecision::StrictlyWeak, tp), Severity::Low);
+        }
+        // The SARIF level mapping is the one the exporter relies on.
+        assert_eq!(Severity::High.sarif_level(), "error");
+        assert_eq!(Severity::Medium.sarif_level(), "warning");
+        assert_eq!(Severity::Low.sarif_level(), "note");
     }
 }

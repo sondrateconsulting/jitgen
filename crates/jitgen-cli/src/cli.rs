@@ -833,6 +833,8 @@ mod tests {
                     risk_description: "rd".into(),
                     path: "src/a.rs".into(),
                 }),
+                changed_path: Some("src/a.rs".into()),
+                changed_line: Some(1),
                 reproduction: "cargo test".into(),
             }],
             rejected: vec![],

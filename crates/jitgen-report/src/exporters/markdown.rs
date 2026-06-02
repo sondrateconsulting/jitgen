@@ -101,9 +101,11 @@ fn catches_section(s: &mut String, r: &RunReport) {
 }
 
 fn catch_entry(s: &mut String, c: &CatchReport) {
+    let sev = crate::model::severity_of(c.decision, c.tp_probability);
     s.push_str(&format!(
-        "### {} — `{}`\n\n",
-        decision_label(c.decision),
+        "### {} {} — `{}`\n\n",
+        severity_marker(sev),
+        decision_name(c.decision),
         md_inline(&c.path, CAP_NAME)
     ));
     s.push_str(&format!(
@@ -130,11 +132,23 @@ fn catch_entry(s: &mut String, c: &CatchReport) {
     code_fence(s, &c.language, &c.source);
 }
 
-fn decision_label(d: CatchDecision) -> &'static str {
+/// The severity icon, kept in sync with [`crate::model::severity_of`] so Markdown's marker always
+/// matches the SARIF level (🔴 = `error`, 🟡 = `warning`, ⚪ = `note`).
+fn severity_marker(sev: crate::model::Severity) -> &'static str {
+    use crate::model::Severity;
+    match sev {
+        Severity::High => "🔴",
+        Severity::Medium => "🟡",
+        Severity::Low => "⚪",
+    }
+}
+
+/// The decision's display name (its severity icon comes from [`severity_marker`]).
+fn decision_name(d: CatchDecision) -> &'static str {
     match d {
-        CatchDecision::StrongCatch => "🔴 Strong catch",
-        CatchDecision::StrictlyWeak => "⚪ Strictly weak",
-        CatchDecision::Uncertain => "🟡 Uncertain",
+        CatchDecision::StrongCatch => "Strong catch",
+        CatchDecision::StrictlyWeak => "Strictly weak",
+        CatchDecision::Uncertain => "Uncertain",
     }
 }
 
@@ -250,6 +264,8 @@ mod tests {
                 risk_description: "off-by-one".into(),
                 path: "src/a.rs".into(),
             }),
+            changed_path: None,
+            changed_line: None,
             reproduction: "cargo test --test jitgen_c".into(),
         });
         let md = render(&r);

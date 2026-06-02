@@ -319,6 +319,8 @@ mod tests {
                 risk_description: "rd".into(),
                 path: pp.into(),
             }),
+            changed_path: None,
+            changed_line: None,
             reproduction: "cargo test".into(),
         }
     }

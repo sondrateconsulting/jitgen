@@ -19,6 +19,13 @@ run state and report formats.
   [troubleshooting](docs/troubleshooting.md). (DX audit finding 1)
 
 ### Changed
+- **Catch reports now surface every assessed verdict, not only strong catches.** A `StrictlyWeak`
+  (test defect) or `Uncertain` weak catch is reported at a lower severity instead of being dropped into
+  `rejected`, so the report is transparent about what the run generated. Only a `StrongCatch` can still
+  trip the findings gate, so the exit code is unchanged. JUnit accordingly renders only a high-severity
+  catch as a failing `<testcase>`; a lower-severity verdict is a passing testcase carrying the verdict
+  in `<system-out>`, so the suite's `failures` count means "suspected bugs found", not "every catch".
+  (E8 + E7 / WS3)
 - Renumbered the duplicated **ADR-0011**: the real-provider HTTP-client decision is now
   [ADR-0012](docs/decisions/0012-real-provider-http-client.md); overlay-confined materialization
   keeps [ADR-0011](docs/decisions/0011-overlay-materialization.md). (DX audit finding 4)
@@ -42,6 +49,14 @@ run state and report formats.
   fingerprints (one per line, `#` comments allowed) keyed on each catch's stable identity (target +
   mutated path), not the run-to-run generated-test source. See
   [user-guide.md → Findings gate](docs/user-guide.md#findings-gate---fail-on-catch). (E4 / WS2)
+- **Line-precise SARIF + a shared exporter severity.** Catch results now point at the **changed
+  production line** — new `#[serde(default)]` `changed_path`/`changed_line` fields on `CatchReport`,
+  plumbed from the target's changed span — instead of the generated-test path, and the SARIF
+  `informationUri` is the real repository URL (was a placeholder). A single `severity_of(decision, tp)`
+  helper (`jitgen_report`) maps every catch to one severity shared by the human / Markdown / JUnit /
+  SARIF exporters, so they cannot drift (Strong → error/high, Uncertain → warning/medium, StrictlyWeak
+  → note/low). The new fields default when absent, so reports written before them still deserialize
+  (resume/report back-compat). (E8 + E6 / WS3)
 - This changelog. (DX audit finding 3)
 
 ## [0.1.0] — 2026-06-01

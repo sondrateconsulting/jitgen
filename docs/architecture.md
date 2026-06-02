@@ -259,9 +259,10 @@ run_jit_generation(repo, base, head, mode, strategy):
       if mode == harden and class == HardenPass: accept(candidate)
       elif mode == catch and class == WeakCatch:
         assessment = assessors.assess(candidate, class, context)   # rule-based + LLM ensemble
-        if assessment.decision == StrongCatch and assessment.tp_probability >= threshold:
-          accept_as_catch(candidate, assessment)                   # reported, NOT landed
-        else: reject(candidate, assessment)                        # StrictlyWeak / Uncertain
+        report_catch(candidate, assessment)   # report-only; EVERY verdict is surfaced at a severity
+                                               # (severity_of: Strong→error, Uncertain→warning,
+                                               # StrictlyWeak→note). The findings GATE — not the report —
+                                               # is what requires StrongCatch ≥ threshold (gate.rs, E4).
       else: reject(candidate, class)
   produce_patch_and_reports()
 

@@ -17,8 +17,8 @@ mod model;
 
 pub use escape::{cap, md_inline, sanitize, sanitize_line, strip_controls, xml_attr, xml_text};
 pub use model::{
-    AcceptedTest, CatchReport, MutantInfo, RejectedCandidate, RunReport, RunSummary,
-    REPORT_SCHEMA_VERSION,
+    severity_of, AcceptedTest, CatchReport, MutantInfo, RejectedCandidate, RunReport, RunSummary,
+    Severity, REPORT_SCHEMA_VERSION,
 };
 
 /// A render target.
