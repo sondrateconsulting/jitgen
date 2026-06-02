@@ -46,6 +46,9 @@ regex = "1.11"
 # CLI arg parsing (layer 1). default-features=false drops color/suggestions/wrap_help to keep the
 # transitive crate set lean (friendlier to Bazel crate_universe re-pinning). Pure-Rust, no build scripts.
 clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+# Shell-completion script generation for the `completions` subcommand (layer 1). default-features=false
+# keeps the transitive set lean (no unstable-dynamic); pure-Rust, no build scripts, tracks clap 4.5.
+clap_complete = { version = "4.5", default-features = false }
 # Blocking HTTP client for real LLM providers (ADR-0008 + ADR-0011; wired in F11). Default features
 # select rustls + ring + bundled webpki-roots: TLS is always on, the CA set is vendored (hermetic, no
 # system trust store), and we avoid aws-lc/native-tls. Like git2/rusqlite/tree-sitter above, its `ring`

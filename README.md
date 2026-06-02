@@ -30,19 +30,32 @@ arXiv:2601.22832 — see [docs/research/paper-notes.md](docs/research/paper-note
 
 ## Install
 
-Tagged releases publish per-platform binaries (with SHA-256 checksums) and a digest-pinned container
-image (`linux/amd64`; arm64 is a follow-up) — each smoke-tested (`--version` + `analyze` on a fixture)
-before publish. The repository is currently **private**, so hosted downloads are auth-gated
-(`docker login` / a token) until it is made public; full recipes (checksum verification, the
-"container IS the sandbox" CI model) live in
-[docs/ci.md → Getting jitgen onto the runner](docs/ci.md#getting-jitgen-onto-the-runner).
+**Build from source (no release tag or registry login needed).** While the repository is **private**
+this is the reliable path — clone it (you need repo access) and build the release binary:
 
 ```bash
-# Substitute a published release tag for <release-tag> and the digest it reports for <digest>:
+git clone https://github.com/sondrateconsulting/jitgen
+cd jitgen
+cargo build --release        # first build is several minutes: cold C-heavy deps (libgit2, tree-sitter)
+./target/release/jitgen --version    # jitgen 0.2.0 (data-contract v1)
+# Put it on your PATH (or use the full target/release/jitgen path) so you can run it from other repos:
+export PATH="$PWD/target/release:$PATH"
+```
+
+**Hosted artifacts (auth-gated until the repo is public).** Tagged releases publish per-platform
+binaries (with SHA-256 checksums) and a digest-pinned container image (`linux/amd64`; arm64 is a
+follow-up) — each smoke-tested (`--version` + `analyze` on a fixture) before publish. Until the repo is
+public these need a `docker login` / token; copy the real tag and the digest it reports from the
+[Releases page](https://github.com/sondrateconsulting/jitgen/releases) in place of the placeholders:
+
+```bash
+# <release-tag> / <digest>: from the Releases page (e.g. v0.2.0 and the sha256 it prints).
 cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag <release-tag> jitgen-cli
 docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
-cargo build --release   # from a clone -> target/release/jitgen (no release needed)
 ```
+
+Full recipes (checksum verification, the "container IS the sandbox" CI model) live in
+[docs/ci.md → Getting jitgen onto the runner](docs/ci.md#getting-jitgen-onto-the-runner).
 
 ## Quickstart
 
@@ -51,8 +64,10 @@ and no sandbox**. It reads only the git objects for your diff and prints the cha
 languages/build tools it detected, and the risk-ranked targets it *would* generate tests for:
 
 ```bash
-jitgen analyze --repo . --base main --head HEAD            # human-readable plan
-jitgen analyze --repo . --base main --head HEAD --format json
+# Run these from the root of the repo you want to test (not the jitgen source tree); jitgen opens
+# --repo exactly, with no upward search. --repo defaults to the current directory and --head to HEAD:
+jitgen analyze --base main                                 # human-readable plan
+jitgen analyze --base main --format json
 ```
 
 `analyze` is a **plan, not the tests** — it proves jitgen parses your diff and ranks the changed code,
@@ -61,7 +76,7 @@ and nothing more. Generating and validating real tests is a `run`, which needs a
 
 ```bash
 jitgen doctor      # toolchains, the sandbox tier it would pick, provider status — exit 0 iff git is present
-jitgen run --repo . --base main --head HEAD               # harden mode; prints a patch (non-destructive)
+jitgen run --base main                                     # harden mode; prints a patch (non-destructive)
 ```
 
 `doctor` is the **readiness probe**: it answers "can this host/runner execute jitgen safely?" by
@@ -71,15 +86,16 @@ flow.
 ## CLI
 
 ```text
-jitgen run     --repo <path> --base <ref> --head <ref>
+jitgen run     [--repo <path>] --base <ref> [--head <ref>]   # --repo defaults to . , --head to HEAD
                  [--mode harden|catch] [--strategy auto|harden|dodgy-diff|intent-aware]
                  [--write | --patch-out <file>]            # harden mode only
                  [--max-tests N] [--format human|json|markdown|patch|junit|sarif]
                  [--fail-on-catch [--fail-threshold 0..1] [--baseline <file>] [--warn-only]]  # CI findings gate (advisory; opt-in)
-jitgen analyze --repo <path> --base <ref> --head <ref> [--format human|json]   # non-executing plan
+jitgen analyze [--repo <path>] --base <ref> [--head <ref>] [--format human|json]   # non-executing plan
 jitgen resume  --run-id <id>
 jitgen report  --run-id <id> [--format human|json|markdown|junit|sarif|patch]
 jitgen doctor
+jitgen completions <bash|zsh|fish|powershell|elvish>       # print a shell completion script
 
 # Trusted options (CLI / user config outside the repo only): --state-dir, --config,
 # --sandbox <backend>, --unsafe-local-execution. See docs/architecture.md + docs/security.md.

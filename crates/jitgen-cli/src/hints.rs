@@ -4,7 +4,12 @@
 //! dispatch. Every hint here is advisory and printed to stderr *below* the authoritative error, so a
 //! mis-keyed hint is cosmetic, never wrong behavior — see the `user_hint` soundness note.
 
-/// Map a user-facing error message to a one-line fix hint, with a `docs/troubleshooting.md` pointer.
+/// Map a user-facing error message to a one-line fix hint, with a troubleshooting-docs pointer.
+///
+/// Hints point at the canonical docs **URL**, not a repo-relative `docs/…` path: a `cargo install`
+/// or `docker run` user has no repo checkout on disk, so a relative path would be a dead reference
+/// exactly when they are stuck. The URL resolves for repo-access users now and for everyone once the
+/// repo is public.
 ///
 /// Matches on stable, multi-word substrings of jitgen's OWN error envelopes (verified against the
 /// typed intake/orchestrator/sandbox errors in this workspace). It is a deliberately small, contained
@@ -25,12 +30,12 @@ pub(crate) fn user_hint(msg: &str) -> &'static str {
     if msg.contains("LLM provider configuration error") {
         return "→ real-provider config: export the API key env var named by your trusted config \
                 (default ANTHROPIC_API_KEY / OPENAI_API_KEY), and set `model` (and `base_url` for \
-                openai-compatible/local) in that config. Run `jitgen doctor`. See docs/troubleshooting.md.";
+                openai-compatible/local) in that config. Run `jitgen doctor`. See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
     if msg.contains("LLM provider error") {
         return "→ the LLM provider call failed (network, auth, rate limit, or a bad/blocked response). \
                 Check the message above, verify the key and connectivity, then retry. Real calls need \
-                --real-llm. See docs/troubleshooting.md.";
+                --real-llm. See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
 
     // --- (A) errors that embed an arbitrary user value: matched FIRST so the embedded value can't
@@ -45,7 +50,7 @@ pub(crate) fn user_hint(msg: &str) -> &'static str {
         return "→ --baseline wants a readable UTF-8 file of catch fingerprints, one per line (`#` \
                 comments and blank lines allowed); copy the fingerprint jitgen prints for a gated \
                 catch. Check the path exists, is text, and is within the size cap. See \
-                docs/troubleshooting.md.";
+                https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
     // The overlay/snapshot DoS caps (file-count, per-file, aggregate, walk) embed the offending repo
     // PATH, which could itself contain another branch's keyword. Match FIRST in section (A), requiring
@@ -61,7 +66,7 @@ pub(crate) fn user_hint(msg: &str) -> &'static str {
         return "→ a repo file (or the whole tree) is too large to materialize into the sandbox for \
                 test runs. Large generated/vendored/data files are not needed to generate tests — \
                 remove, move, or ignore the file named in the error (or split a genuinely huge source \
-                file). See docs/troubleshooting.md.";
+                file). See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
     // Match ONLY the unique "run not found in the index" envelope, NOT a bare "invalid run-id":
     // `OrchestratorError::Invalid` is a catch-all that ALSO prefixes the stale-OID and
@@ -69,63 +74,63 @@ pub(crate) fn user_hint(msg: &str) -> &'static str {
     // hints (T-codex-r3 P3). The run id is embedded after `no run "…"`, before `in the state index`.
     if msg.contains("invalid run-id: no run ") && msg.contains("in the state index") {
         return "→ check the run id; `resume`/`report` locate runs via the global run index (no \
-                --repo needed). See docs/troubleshooting.md.";
+                --repo needed). See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
     if msg.contains("is not in a completed state") {
         return "→ finish the run first with `jitgen resume --run-id <id>`, then report. See \
-                docs/troubleshooting.md.";
+                https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
     if msg.contains("must be OUTSIDE") || msg.contains("must live outside") {
         // `--state-dir`/`--config` path is embedded after "(resolved under …)".
         return "→ point --state-dir/--config at a path OUTSIDE the target repo (or omit it for the \
-                XDG default). See docs/troubleshooting.md.";
+                XDG default). See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
     if msg.contains("git intake: invalid revision") {
         // Anchored on the `git intake:` envelope so a *boundary* path containing "invalid revision"
         // can't match here; the revspec itself is in the trailing quotes.
         return "→ check --base/--head: each must resolve to a commit (a branch, tag, or revspec like \
-                `HEAD` or `HEAD~1`) reachable in the repo. See docs/troubleshooting.md.";
+                `HEAD` or `HEAD~1`) reachable in the repo. See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
     if msg.contains("failed to resolve path")
         || msg.contains("could not find repository")
         || msg.contains("not a git repository")
     {
         return "→ check --repo points to an existing git working tree. Run `jitgen doctor` to \
-                sanity-check your environment. See docs/troubleshooting.md.";
+                sanity-check your environment. See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
 
     // --- (B) keyword-only envelopes (no embedded user value). ---
     if msg.contains("boundary escape") {
         return "→ jitgen reads only the repo you point --repo at. A normal `git worktree` must be \
                 nested in its main repo; a hand-edited `.git`/alternates/symlinked storage is \
-                refused. See docs/troubleshooting.md (\"repository boundary escape\").";
+                refused. See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md (\"repository boundary escape\").";
     }
     if msg.contains("no isolating sandbox available") {
         return if resume_like {
             "→ no isolating sandbox. `resume` reloads the original run's trusted config, so re-run \
              `jitgen run …` with --unsafe-local-execution (trusted hosts) or a container runtime. \
-             Run `jitgen doctor`. See docs/troubleshooting.md."
+             Run `jitgen doctor`. See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md."
         } else {
             "→ start a container runtime or run where an OS sandbox exists; or, on a trusted host, \
              pass --unsafe-local-execution. Run `jitgen doctor` to see what's detected. See \
-             docs/troubleshooting.md."
+             https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md."
         };
     }
     if msg.contains("digest-pinned") {
         return if resume_like {
             "→ the container tier needs a digest-pinned image, which `resume` can't take; re-run \
              `jitgen run …` with --docker-image name@sha256:… (or set JITGEN_DOCKER_IMAGE). See \
-             docs/troubleshooting.md."
+             https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md."
         } else {
             "→ pass --docker-image name@sha256:… (or set JITGEN_DOCKER_IMAGE). See \
-             docs/troubleshooting.md."
+             https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md."
         };
     }
     if msg.contains("no longer present") {
         return "→ the pinned base/head commits were rewritten or GC'd; start a fresh `jitgen run` \
-                against current revisions. See docs/troubleshooting.md.";
+                against current revisions. See https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md.";
     }
-    "→ see docs/troubleshooting.md for common causes and fixes."
+    "→ see https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md for common causes and fixes."
 }
 
 /// The jitgen subcommand a `fail()` message came from, parsed from the `jitgen <cmd>: …` prefix that
@@ -157,7 +162,7 @@ pub(crate) fn mock_empty_run_hint(
         "note: this run used jitgen's built-in mock LLM (the deterministic, offline default) — it \
          exercises the full pipeline but doesn't synthesize real tests, so `0 accepted` is expected \
          here, not a failure. To generate real tests, set a provider in a trusted config file and \
-         pass --real-llm (see docs/user-guide.md → Real providers).",
+         pass --real-llm (see https://github.com/sondrateconsulting/jitgen/blob/main/docs/user-guide.md → Real providers).",
     )
 }
 
@@ -176,7 +181,7 @@ pub(crate) fn gate_modifiers_without_master_note(
     }
     Some(
         "note: --warn-only/--baseline/--fail-threshold only take effect with --fail-on-catch; the \
-         findings gate is off, so this run does not gate on catches (see docs/user-guide.md → \
+         findings gate is off, so this run does not gate on catches (see https://github.com/sondrateconsulting/jitgen/blob/main/docs/user-guide.md → \
          Findings gate).",
     )
 }

@@ -44,18 +44,20 @@ enum Command {
     Report(ReportArgs),
     /// Report toolchain, sandbox tier, and provider availability.
     Doctor(DoctorArgs),
+    /// Print a shell completion script to stdout (bash, zsh, fish, powershell, elvish).
+    Completions(CompletionsArgs),
 }
 
 #[derive(Debug, Args)]
 struct RunArgs {
-    /// Target repository path.
-    #[arg(long)]
+    /// Target repository path (defaults to the current directory).
+    #[arg(long, default_value = ".")]
     repo: PathBuf,
     /// Base revision (revspec).
     #[arg(long)]
     base: String,
-    /// Head revision (revspec).
-    #[arg(long)]
+    /// Head revision (revspec; defaults to HEAD).
+    #[arg(long, default_value = "HEAD")]
     head: String,
     /// Generation mode (unset ⇒ `JITGEN_MODE`/config/default `harden`).
     #[arg(long, value_enum)]
@@ -117,11 +119,14 @@ struct RunArgs {
 
 #[derive(Debug, Args)]
 struct AnalyzeArgs {
-    #[arg(long)]
+    /// Target repository path (defaults to the current directory).
+    #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Base revision (revspec).
     #[arg(long)]
     base: String,
-    #[arg(long)]
+    /// Head revision (revspec; defaults to HEAD).
+    #[arg(long, default_value = "HEAD")]
     head: String,
     #[arg(long, value_enum)]
     mode: Option<ModeArg>,
@@ -171,6 +176,13 @@ struct DoctorArgs {
     /// Report readiness for real LLM calls (off by default; TRUSTED).
     #[arg(long)]
     real_llm: bool,
+}
+
+#[derive(Debug, Args)]
+struct CompletionsArgs {
+    /// Shell to generate a completion script for.
+    #[arg(value_enum)]
+    shell: clap_complete::Shell,
 }
 
 // ---- value enums --------------------------------------------------------------------------------
@@ -320,6 +332,7 @@ pub fn run() -> ExitCode {
         Command::Resume(a) => cmd_resume(a),
         Command::Report(a) => cmd_report(a),
         Command::Doctor(a) => cmd_doctor(a),
+        Command::Completions(a) => cmd_completions(a),
     }
 }
 
@@ -529,7 +542,7 @@ fn print_gate_summary(verdict: &GateVerdict, threshold: f64) {
             err,
             "jitgen: exit 3 (findings gate). Suppress a known catch by adding its fingerprint to a \
              --baseline file (one per line), or re-run with --warn-only to keep it advisory. See \
-             docs/troubleshooting.md."
+             https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md."
         );
     }
 }
@@ -616,6 +629,16 @@ fn cmd_doctor(a: DoctorArgs) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+/// Print a shell completion script for `shell` to stdout. Pure presentation — no repo, no network, no
+/// sandbox — e.g. `jitgen completions zsh > ~/.zsh/completions/_jitgen`. The script is clap's own,
+/// generated from the same `Cli` command tree, so it always matches the live flag surface.
+fn cmd_completions(a: CompletionsArgs) -> ExitCode {
+    let mut cmd = Cli::command();
+    let bin = cmd.get_name().to_string();
+    clap_complete::generate(a.shell, &mut cmd, bin, &mut std::io::stdout());
+    ExitCode::SUCCESS
 }
 
 /// Cap on a sanitized error message printed to the terminal. Generous for any real jitgen error
@@ -765,6 +788,41 @@ mod tests {
     }
 
     #[test]
+    fn run_defaults_repo_to_cwd_and_head_to_head() {
+        // DX: the common case is `jitgen run --base <X>` in the current repo against HEAD. --repo
+        // defaults to "." and --head to "HEAD"; --base stays required (no safe universal default —
+        // a wrong base silently diffs the wrong range for a diff-driven tool).
+        let cli =
+            Cli::try_parse_from(["jitgen", "run", "--base", "main"]).expect("parses w/ defaults");
+        match cli.command {
+            Command::Run(a) => {
+                assert_eq!(a.repo, PathBuf::from("."));
+                assert_eq!(a.head, "HEAD");
+                assert_eq!(a.base, "main");
+            }
+            _ => panic!("expected run"),
+        }
+        // --base is still mandatory.
+        assert!(Cli::try_parse_from(["jitgen", "run"]).is_err());
+    }
+
+    #[test]
+    fn analyze_defaults_repo_to_cwd_and_head_to_head() {
+        let cli = Cli::try_parse_from(["jitgen", "analyze", "--base", "main"])
+            .expect("parses w/ defaults");
+        match cli.command {
+            Command::Analyze(a) => {
+                assert_eq!(a.repo, PathBuf::from("."));
+                assert_eq!(a.head, "HEAD");
+                assert_eq!(a.base, "main");
+            }
+            _ => panic!("expected analyze"),
+        }
+        // --base is still mandatory.
+        assert!(Cli::try_parse_from(["jitgen", "analyze"]).is_err());
+    }
+
+    #[test]
     fn clap_parses_subcommands_and_rejects_unknown() {
         assert!(Cli::try_parse_from(["jitgen", "doctor"]).is_ok());
         assert!(Cli::try_parse_from(["jitgen", "resume", "--run-id", "x"]).is_ok());
@@ -772,8 +830,33 @@ mod tests {
             Cli::try_parse_from(["jitgen", "report", "--run-id", "x", "--format", "sarif"]).is_ok()
         );
         assert!(Cli::try_parse_from(["jitgen", "frobnicate"]).is_err());
-        // run requires --repo/--base/--head.
+        // run still requires --base (--repo/--head now default).
         assert!(Cli::try_parse_from(["jitgen", "run"]).is_err());
+    }
+
+    #[test]
+    fn clap_parses_completions_subcommand() {
+        let cli = Cli::try_parse_from(["jitgen", "completions", "zsh"]).expect("parses");
+        match cli.command {
+            Command::Completions(a) => assert_eq!(a.shell, clap_complete::Shell::Zsh),
+            _ => panic!("expected completions"),
+        }
+        // A bogus shell is a usage error; a missing shell is too.
+        assert!(Cli::try_parse_from(["jitgen", "completions", "klingon"]).is_err());
+        assert!(Cli::try_parse_from(["jitgen", "completions"]).is_err());
+    }
+
+    #[test]
+    fn completions_script_is_generated_and_mentions_the_binary() {
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, "jitgen", &mut buf);
+        let script = String::from_utf8(buf).expect("utf8");
+        assert!(!script.is_empty(), "completion script must not be empty");
+        assert!(
+            script.contains("jitgen"),
+            "script names the binary: {script:.80}"
+        );
     }
 
     #[test]

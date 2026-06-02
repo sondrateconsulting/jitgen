@@ -10,7 +10,7 @@ See also: [architecture.md](architecture.md) · [security.md](security.md) ·
 ## Install / build
 
 ```bash
-cargo build --release          # produces target/release/jitgen
+cargo build --release          # first build is several minutes (cold C-heavy deps: libgit2, tree-sitter)
 ./target/release/jitgen --version
 # jitgen 0.2.0 (data-contract v1)
 ```
@@ -33,8 +33,9 @@ no API key, and no sandbox**: it reads only the git objects for `base..head` and
 languages and build tools it detected, and the **risk-ranked targets** it *would* generate tests for.
 
 ```bash
-jitgen analyze --repo . --base main --head HEAD            # human-readable plan
-jitgen analyze --repo . --base main --head HEAD --format json
+# --repo defaults to the current directory and --head to HEAD, so inside your repo:
+jitgen analyze --base main                                 # human-readable plan
+jitgen analyze --base main --format json
 ```
 
 It **proves diff parsing and target ranking — and only that**: it is a *plan/preview*, **not generated
@@ -63,12 +64,12 @@ tier on a trusted host.
 ## Commands
 
 ```text
-jitgen run     --repo <path> --base <ref> --head <ref>
+jitgen run     [--repo <path>] --base <ref> [--head <ref>]   # --repo defaults to . , --head to HEAD
                  [--mode harden|catch] [--strategy auto|harden|dodgy-diff|intent-aware]
                  [--write | --patch-out <file>]            # harden mode only
                  [--max-tests N] [--format human|json|markdown|patch|junit|sarif]
                  [--fail-on-catch [--fail-threshold 0..1] [--baseline <file>] [--warn-only]]  # CI findings gate
-jitgen analyze --repo <path> --base <ref> --head <ref> [--format human|json]   # non-executing plan
+jitgen analyze [--repo <path>] --base <ref> [--head <ref>] [--format human|json]   # non-executing plan
 jitgen resume  --run-id <id> [--state-dir <path>] [--format ...]
 jitgen report  --run-id <id> [--state-dir <path>] [--format human|json|markdown|junit|sarif|patch]
 jitgen doctor  [--format human|json]
@@ -81,17 +82,20 @@ targets, generates candidate tests, runs them in the sandbox, classifies, repair
 the outcome.
 
 ```bash
+# --repo defaults to . and --head to HEAD; --base is required. Pass them explicitly to override.
+# jitgen opens the repo at exactly --repo with no upward search, so run from the repo root.
+
 # Default: harden mode, print a unified patch to stdout (non-destructive).
-jitgen run --repo . --base main --head HEAD
+jitgen run --base main
 
 # Write accepted tests into the repo (harden only):
-jitgen run --repo . --base main --head HEAD --write
+jitgen run --base main --write
 
 # Write the patch to a file instead of stdout:
-jitgen run --repo . --base main --head HEAD --patch-out changes.patch
+jitgen run --base main --patch-out changes.patch
 
 # Catch mode: surface tests that fail on head but pass on base (report-only):
-jitgen run --repo . --base main --head HEAD --mode catch
+jitgen run --base main --mode catch
 ```
 
 ### `analyze` — dry-run plan (never executes)
@@ -101,8 +105,8 @@ without running any tests, calling any real LLM, or writing to the repo. Use it 
 would target.
 
 ```bash
-jitgen analyze --repo . --base main --head HEAD            # human
-jitgen analyze --repo . --base main --head HEAD --format json
+jitgen analyze --base main                                 # human
+jitgen analyze --base main --format json
 ```
 
 ### `resume` — continue an interrupted run
@@ -341,6 +345,19 @@ toolchain (e.g. no JDK or `pytest`), first-class execution runs via the **contai
 backend with digest-pinned images ([ADR-0009](decisions/0009-hermetic-toolchains-ci.md)); `doctor`
 reports which path (native/container) is available, and the e2e harness records which path each test
 used. See [adapter-guide.md](adapter-guide.md).
+
+## Shell completions
+
+Generate a completion script for your shell and install it where that shell looks for completions:
+
+```bash
+jitgen completions zsh  > ~/.zsh/completions/_jitgen     # then: autoload -U compinit && compinit
+jitgen completions bash > /usr/local/etc/bash_completion.d/jitgen   # or source it from ~/.bashrc
+jitgen completions fish > ~/.config/fish/completions/jitgen.fish
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`. The script is generated from jitgen's
+own command tree, so it always matches the installed version's flags (no separate file to keep in sync).
 
 ## Supply-chain audits
 
