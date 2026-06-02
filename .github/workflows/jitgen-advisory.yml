@@ -58,6 +58,7 @@ jobs:
     name: catch advisory (mock)
     if: ${{ github.event.pull_request.head.repo.full_name != github.repository || vars.JITGEN_REAL_LLM != 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5 # bound a hung run; the offline mock should finish in well under a minute
     permissions:
       contents: read
       packages: read # pull the private GHCR image (anonymous once the repo/image go public)
@@ -141,6 +142,7 @@ jobs:
     name: catch advisory (real provider)
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository && vars.JITGEN_REAL_LLM == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10 # bound a hung compile/LLM call so the key context can't linger for the 6h default
     environment: jitgen-llm # protected Environment holding ANTHROPIC_API_KEY (defense-in-depth)
     permissions:
       contents: read
