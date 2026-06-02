@@ -23,6 +23,14 @@ pub struct Redaction {
 /// Patterns that may legitimately END in `-`/`_` deliberately omit a trailing `\b` (which only fires
 /// between a word and a non-word char) and instead rely on the greedy character class to stop at the
 /// first out-of-class byte — otherwise a token ending in `_`/`-` would be partially missed (F5/S1 #1).
+///
+/// The LEFT `\b` is also deliberate and **kept**. Accepted residual: a known-format token glued to a
+/// preceding word char with no delimiter (`yyyyAKIAIOSFODNN7EXAMPLE`, `xtask-`-style) is NOT redacted,
+/// because relaxing the left boundary would make short prefixes like `sk-` match the tail of ordinary
+/// kebab identifiers/paths (`disk-…`, `risk-…`, `task-…`) — corrupting the very code the model must
+/// read (the heuristic's primary design goal; see `looks_like_secret` and docs/security.md §3). Real
+/// secrets are essentially always delimited (whitespace, `=`/`:`, quote, `/`), which still matches
+/// (/cso LOW finding, 2026-06-01).
 fn token_patterns() -> &'static [(&'static str, Regex)] {
     static PATS: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
     PATS.get_or_init(|| {
@@ -104,8 +112,10 @@ fn assignment_quoted_pattern() -> &'static Regex {
     static PAT: OnceLock<Regex> = OnceLock::new();
     PAT.get_or_init(|| {
         Regex::new(concat!(
-            r#"(?i)((?:api[_-]?key|secret[_-]?key|access[_-]?key|client[_-]?secret|"#,
-            r#"auth[_-]?token|secret|token|password|passwd|pwd)["']?\s*[:=]\s*["'])"#,
+            r#"(?i)((?:api[_-]?key|secret[_-]?key|access[_-]?key|private[_-]?key|"#,
+            r#"encryption[_-]?key|signing[_-]?key|client[_-]?secret|"#,
+            r#"auth[_-]?token|secret|token|password|passwd|pwd|credentials)"#,
+            r#"["']?\s*[:=]\s*["'])"#,
             r#"([^"'\n]{6,})(["'])"#
         ))
         .unwrap()
@@ -317,6 +327,42 @@ mod tests {
         assert!(r.redacted);
         assert!(!r.text.contains("averyrealsecretvalue123"), "{}", r.text);
         assert!(r.text.contains("api_key"));
+    }
+
+    #[test]
+    fn redacts_additional_secret_key_words_when_quoted() {
+        // Widened quoted-assignment allowlist (/cso LOW): private/encryption/signing key + credentials.
+        // A quoted, digit-bearing value is redacted; the key, quotes, and surrounding text survive.
+        let r = red(r#"{"private_key":"averyrealsecretvalue123"}"#);
+        assert!(r.redacted);
+        assert!(!r.text.contains("averyrealsecretvalue123"), "{}", r.text);
+        assert!(r.text.contains("private_key"));
+
+        let r = red(r#"signing_key = "s1gningk3yvalue4567""#);
+        assert!(r.redacted);
+        assert!(!r.text.contains("s1gningk3yvalue4567"), "{}", r.text);
+
+        let r = red(r#"{"credentials":"cr3dentialvalue789"}"#);
+        assert!(r.redacted);
+        assert!(!r.text.contains("cr3dentialvalue789"), "{}", r.text);
+
+        let r = red(r#"encryption-key: "encrypti0nk3yvalue12""#);
+        assert!(r.redacted);
+        assert!(!r.text.contains("encrypti0nk3yvalue12"), "{}", r.text);
+
+        // NOT over-redacted: an UNQUOTED code assignment with an ordinary identifier value stays
+        // intact — the new key words live only in the quoted matcher, never the unquoted/config-line
+        // paths, so ordinary code the model must read is untouched (the deliberate `looks_like_secret`
+        // / `\b` design tradeoff).
+        for src in [
+            "let private_key = derive_private_key(config);",
+            "signing_key: SigningKeyMaterial",
+            "self.credentials = CredentialStore::default()",
+        ] {
+            let r = red(src);
+            assert!(!r.redacted, "false positive on `{src}` -> `{}`", r.text);
+            assert_eq!(r.text, src);
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! for each first-class language, whether a *native* toolchain exists; missing native toolchains are
 //! covered by the containerized sandbox backend in CI.
 
+use jitgen_report::sanitize_line;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -13,6 +14,10 @@ use std::time::{Duration, Instant};
 /// Per-probe wall-clock timeout. Diagnostic commands are jitgen's own fixed argv, but we still bound
 /// them defensively (F2/S1 review #1).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Single-line cap for a tool's name/version cell in the human report. A real `--version` first line
+/// is short; this bounds a hostile tool's flood while leaving genuine versions intact.
+const TOOL_FIELD_CAP: usize = 120;
 
 /// Availability of a single external tool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,8 +86,17 @@ impl DoctorReport {
         out.push_str(&format!("OS: {}\n\nTools:\n", self.os));
         for t in &self.tools {
             let mark = if t.available { "ok  " } else { "MISS" };
-            let ver = t.version.as_deref().unwrap_or("-");
-            out.push_str(&format!("  [{mark}] {:<10} {ver}\n", t.name));
+            // `version` is the first line of an external tool's `--version` output — doctor probes
+            // whatever `git`/`rustc`/`node`/`docker` is first on the operator's PATH, which may be
+            // hostile. `probe` only trims surrounding whitespace, leaving mid-line ESC/CSI/OSC and CR
+            // intact, and this human report prints straight to the terminal (cli.rs) with no further
+            // sanitizer — unlike the JSON path (serde-encoded) and every other CLI terminal sink (which
+            // use `safe_for_terminal`). Route the version (and defensively the name) through the report
+            // crate's single-line sanitizer so a malicious tool binary can't recolor the terminal, move
+            // the cursor, set the window title, or forge a fake row. Mirrors `analyze`'s render_human.
+            let name = sanitize_line(&t.name, TOOL_FIELD_CAP);
+            let ver = sanitize_line(t.version.as_deref().unwrap_or("-"), TOOL_FIELD_CAP);
+            out.push_str(&format!("  [{mark}] {name:<10} {ver}\n"));
         }
         out.push_str("\nLanguages (native toolchain; CI uses containers otherwise — ADR-0009):\n");
         for l in &self.languages {
@@ -403,6 +417,29 @@ mod tests {
         }]);
         assert!(!without.prerequisites_ok());
         assert!(without.render_human().contains("git not found"));
+    }
+
+    #[test]
+    fn render_human_sanitizes_hostile_tool_version() {
+        // A malicious `git`/`rustc`/`node`/`docker` earlier on the operator's PATH can emit ANSI/CR in
+        // its `--version` line; doctor's human report prints straight to the terminal, so the version
+        // (and defensively the name) must be control-stripped first (mirrors the CLI's other sinks).
+        let r = report_with(vec![ToolStatus {
+            name: "git".into(),
+            available: true,
+            version: Some("\x1b[2Jx\rPWNED".into()),
+        }]);
+        let out = r.render_human();
+        assert!(
+            !out.contains('\x1b'),
+            "ESC leaked into terminal output: {out:?}"
+        );
+        assert!(
+            !out.contains('\r'),
+            "CR leaked into terminal output: {out:?}"
+        );
+        // The inert remainder still renders, so the report stays useful.
+        assert!(out.contains("PWNED"), "{out:?}");
     }
 
     #[test]

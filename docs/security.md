@@ -272,12 +272,19 @@ These MUST exist and pass before the relevant phase is complete (built security-
   those exact shapes is not caught. Relatedly, the *unanchored* matcher that scans mid-line text
   (logs/feedback) is restricted to uppercase-style keys (`API_KEY=…`), so a **mid-line, lowercase
   compound-key** secret (`… api_key=secret123 …` not at line start) is a documented false-negative;
-  line-start config assignments of those keys are still caught. This is the irreducible
-  false-positive/false-negative tradeoff of a regex heuristic, chosen to avoid corrupting the ordinary
-  code the model must read. Quoted values and all known token formats are unaffected, and the primary
-  guarantees stand independently — **API keys are read only from the trusted-named env var (never repo
-  config/logs), model output is never executed, and execution is sandboxed** (threats #1/#3,
-  ADR-0008/0010). Reviewed across F5/S1·T2·T3·T4·T5·T6·T7.
+  line-start config assignments of those keys are still caught. Likewise, the known-format token
+  patterns are **left-anchored with `\b`**: a token glued to a preceding word char with no delimiter
+  (`yyyyAKIAIOSFODNN7EXAMPLE`) is a documented false-negative. Relaxing the left boundary was
+  considered and rejected — short prefixes like `sk-` would then match the tail of ordinary kebab
+  identifiers/paths (`disk-…`, `risk-…`, `task-…`), corrupting the code the model must read; real
+  secrets are essentially always delimited, which still matches (/cso LOW finding, 2026-06-01). This is
+  the irreducible false-positive/false-negative tradeoff of a regex heuristic, chosen to avoid
+  corrupting the ordinary code the model must read. Quoted values and all known token formats are
+  unaffected, and the primary guarantees stand independently — **API keys are read only from the
+  trusted-named env var (never repo config/logs), model output is never executed, and execution is
+  sandboxed** (threats #1/#3, ADR-0008/0010). Reviewed across F5/S1·T2·T3·T4·T5·T6·T7. The quoted
+  secret-key allowlist additionally covers `private_key`/`encryption_key`/`signing_key`/`credentials`
+  (/cso LOW finding, 2026-06-01).
 
 ## F10 hardening — carry-over triage (final phase)
 
