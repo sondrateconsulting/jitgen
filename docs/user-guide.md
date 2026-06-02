@@ -26,18 +26,39 @@ All default behavior is **offline and deterministic** — generation uses a buil
 (no API keys, no network). Real providers are opt-in and trusted-config only (see
 [Configuration](#configuration-trusted-vs-repo)).
 
-## First, run `doctor`
+## First contact: `analyze` (no setup required)
 
-`jitgen doctor` reports your toolchains (native **and** container), the sandbox tier it would select,
-and provider availability. Run it once on a new host:
+The safe first thing to run is **`analyze`** — a non-executing preview. It needs **no test toolchains,
+no API key, and no sandbox**: it reads only the git objects for `base..head` and reports the diff, the
+languages and build tools it detected, and the **risk-ranked targets** it *would* generate tests for.
 
 ```bash
-jitgen doctor
+jitgen analyze --repo . --base main --head HEAD            # human-readable plan
+jitgen analyze --repo . --base main --head HEAD --format json
 ```
 
-It exits non-zero if a prerequisite for real execution is missing, and tells you what to do (e.g.
-"no OS sandbox or container available → execution is fail-closed; pass `--unsafe-local-execution` to
-use the no-isolation local tier on a trusted host").
+It **proves diff parsing and target ranking — and only that**: it is a *plan/preview*, **not generated
+tests**. `analyze` never runs a test, never calls a real LLM, never builds a sandbox, and never writes
+to your repo or the state store. Producing real, validated tests is a `run` (below), which does need an
+isolating sandbox (and a provider for non-mock output).
+
+## Then check readiness: `doctor`
+
+When you're ready to actually generate and validate tests, `jitgen doctor` tells you whether this
+host/runner can do it. It probes the **host** — your toolchains (native **and** container), the sandbox
+tier it would select, and provider availability — **without touching your repo or the network**. Run it
+once on a new host:
+
+```bash
+jitgen doctor                  # human-readable
+jitgen doctor --format json    # machine-readable (e.g. assert sandbox_tier != "none")
+```
+
+`git` is the **only hard prerequisite**, so `doctor` exits non-zero **only** when `git` is missing. A
+missing sandbox or provider is *reported, not failed* — a runner with no provider still passes `doctor`
+and runs in offline mock mode. When no sandbox tier is available it says so: execution is then
+fail-closed unless a trusted operator passes `--unsafe-local-execution` to use the no-isolation local
+tier on a trusted host.
 
 ## Commands
 
@@ -257,6 +278,32 @@ base URL, key-env name, model, and real-LLM enablement are **trusted-only**: a r
 cannot set them, so a hostile repo can never redirect egress (see [security.md](security.md),
 [ADR-0008](decisions/0008-llm-provider-abstraction.md), [ADR-0012](decisions/0012-real-provider-http-client.md)).
 
+### Operating a real provider: cost, data, and egress
+
+A real provider calls a paid API and sends code off the host, so operate it deliberately — especially
+in CI, where it runs unattended ([ci.md](ci.md)):
+
+- **Cost is bounded by `--max-tests`** (default **20**): a run generates for at most that many
+  risk-ranked targets — the dominant lever on call volume. The repair loop adds a **bounded** number of
+  follow-up calls per target (not unbounded), and every call has bounded timeouts (**15 s** connect,
+  **120 s** total). jitgen does **not** retry on an HTTP error: a `429`/`5xx` surfaces as a runtime
+  error (exit 1) instead of being silently re-sent, so a rate-limited provider cannot quietly amplify
+  your bill. There is no built-in backoff — manage rate limits with provider-side limits and CI
+  concurrency (the GitHub recipe cancels superseded PR runs).
+- **Egress is fixed and minimal.** The only network connection jitgen ever opens is to the provider
+  endpoint you configured — there is **no telemetry or phone-home** (the sandbox even strips
+  `SENTRY_DSN`, `*_TOKEN`, and `*_API_KEY`-style vars from test commands). That endpoint is **HTTPS with
+  TLS verification always on** (plain `http://` is refused except for a loopback local server), and the
+  provider, base URL, and key-env name are **trusted-config only**, so a hostile repo can never redirect
+  egress to an attacker endpoint.
+- **Data sent is bounded and redacted.** jitgen sends the **minimum context** needed, run through secret
+  redaction first; files matching secret/credential patterns are excluded entirely. What jitgen
+  *persists* (run state, generated tests, reports) goes to the private `0700` state dir **outside your
+  repo**, redacted and length-capped. What the **provider** retains is governed by your contract with
+  that provider — jitgen can't control it, so review the provider's data-retention/training policy
+  before sending production code, and prefer a `local` provider (Ollama/LM Studio over loopback) when
+  code must not leave the host.
+
 ## Sandbox tiers
 
 Untrusted test commands run **fail-closed**: an OS sandbox (bubblewrap/firejail on Linux,
@@ -268,6 +315,24 @@ no tier is available, execution is **refused** — unless a trusted operator pas
 The sandbox enforces no-network, an env allowlist with synthetic `HOME`, overlay-confined writes,
 timeouts, output caps, and per-backend resource limits. See
 [ADR-0003](decisions/0003-sandbox-strategy.md).
+
+## Platform support
+
+The available **sandbox tiers** depend on the host OS (the sandbox is required for `run`/e2e — see
+[Sandbox tiers](#sandbox-tiers)). `analyze` and `doctor` run anywhere jitgen builds; neither executes
+untrusted code, so neither needs a sandbox.
+
+| Platform | Native OS sandbox | Container tier | Sandbox availability |
+|----------|-------------------|----------------|----------------------|
+| **Linux** | `bubblewrap` / `firejail` | Docker / Podman | Fully isolated once an OS sandbox is installed — no extra flags. |
+| **macOS** | `sandbox-exec` | Docker / Podman | `sandbox-exec` is **Apple-deprecated but still functional**, and remains macOS's default OS tier (see [security.md → Residual risks](security.md#residual-risks)). |
+| **Windows** *(and any other OS)* | **none** | Docker / Podman | **Container-only** — there is no native OS sandbox, so `run` needs a digest-pinned container or the "container IS the sandbox" model. |
+
+**Binaries vs. image.** Prebuilt binaries ship for **Linux x86-64** and **macOS x86-64 / arm64**; the
+published container image is **`linux/amd64`** today. On Windows, run jitgen through the container image
+(e.g. Docker Desktop) or build from source — and because Windows has **no native OS sandbox**, that
+container is also what gives `run` its isolation. `jitgen doctor` reports the tier it would select on
+your host.
 
 ## First-class languages
 

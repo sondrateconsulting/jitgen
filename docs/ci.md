@@ -430,6 +430,18 @@ especially on pull requests from forks — must preserve that boundary. The rule
   `AWS_*`, `SSH_AUTH_SOCK`, and package-manager credentials are **not** passed through, even on a
   same-repo PR.
 
+## Provider cost & data governance
+
+Running a **real** provider in CI spends money and sends code off-box on every PR, so treat it as a
+governed dependency. The mechanics — the `--max-tests` cost lever (default 20), bounded per-call
+timeouts, **no automatic retry on `429`/`5xx`** (a rate-limited provider can't amplify spend), fixed
+HTTPS-only egress with **no telemetry**, and minimized + redacted context (with a loopback `local`
+provider option when code must not leave the host) — are detailed in
+[user-guide → Operating a real provider](user-guide.md#operating-a-real-provider-cost-data-and-egress).
+In CI specifically: keep the [same-repo secret gating](#security-model-for-ci) (fork PRs run the mock),
+bound spend with the `concurrency` block shown above (cancel superseded PR runs), and start with
+`--warn-only` so a billed-but-flaky run can't block a PR while you build a track record.
+
 ## Self-dogfood (forthcoming)
 
 jitgen's own CI will run this catch-mode advisory on its **own** pull requests using the shipped

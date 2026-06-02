@@ -6,6 +6,30 @@ All notable changes to `jitgen` are documented here. The format follows
 schema version (`jitgen --version` prints `data-contract vN`) is the compatibility signal for stored
 run state and report formats.
 
+## [Unreleased]
+
+### Added
+- **Community & disclosure files (WS4).** A root [`SECURITY.md`](SECURITY.md) vulnerability-disclosure
+  policy (GitHub private vulnerability reporting; scope tied to the threat model in
+  [docs/security.md](docs/security.md)), a [`CONTRIBUTING.md`](CONTRIBUTING.md) (the Cargo + Bazel dual
+  build, `./scripts/check.sh`, and the invariants every change must preserve — offline-by-default,
+  `#![forbid(unsafe_code)]`, the trusted/untrusted config split, catch-mode-report-only,
+  producer-redacts/renderer-escapes), and GitHub issue forms (`.github/ISSUE_TEMPLATE/`) that route
+  security reports to private disclosure. (E10 / WS4)
+
+### Changed
+- **Docs lead with `analyze`.** The README and user guide now open on `jitgen analyze` — the zero-setup,
+  non-executing preview (no toolchains, keys, or sandbox) — framed honestly as a *plan* that proves diff
+  parsing + target ranking, **not** generated tests; `jitgen doctor` is positioned as the
+  runner-readiness probe (exit 0 iff `git` is present; a missing sandbox/provider is reported, not
+  failed). (E9 / WS4)
+- **Platform & operational coverage (WS4).** Documented platform support (Windows and any non-Linux/
+  non-macOS host are **container-only** — no native OS sandbox; macOS `sandbox-exec` is Apple-deprecated
+  but functional), the published image's CVE/SBOM rebuild ownership (digest-pinning freezes CVEs until a
+  base-digest refresh; SBOM/provenance noted as planned, not shipped), and real-LLM provider governance
+  for CI (the `--max-tests` cost lever, bounded timeouts with no `429`/`5xx` retry, fixed HTTPS-only
+  egress with no telemetry, and redacted/minimized context). (E11 / WS4)
+
 ## [0.2.0] — 2026-06-02
 
 First **distributable** release: everything since the initial build (WS1–WS3), now installable as

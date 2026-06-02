@@ -167,6 +167,29 @@ network in sandbox (conformance-tested); jitgen-owned env allowlist + synthetic 
 redaction + caps everywhere; blob-based intake with git filters disabled; immutable OIDs; private
 `0700` state dir; preflight resource budgets; per-format report escaping.
 
+## Operational ownership: published-image CVE/SBOM rebuilds
+
+Digest-pinning (threat #8, [ADR-0009](decisions/0009-hermetic-toolchains-ci.md)) is a deliberate
+trade-off. Pinning the base and toolchain layers to `@sha256:…` makes builds reproducible and stops a
+floating tag from swapping content under you — but it also **freezes** whatever CVEs those layers
+carried at pin time. A pinned image does not get safer on its own; someone has to **refresh the
+digests**:
+
+- **The published `ghcr.io/sondrateconsulting/jitgen` image** is the maintainers' to rebuild — re-pin
+  the base/toolchain digests, re-cut the image, and publish the new digest through the release
+  pipeline — on a **regular cadence** and in response to relevant advisories. Consume the digest a
+  release reports and watch releases for refreshed images; do not assume a digest stays current
+  indefinitely. (An **SBOM** and build **provenance/attestation** per release are planned hardening,
+  **not yet shipped** — don't assume one is attached.)
+- **Self-built images and any `--docker-image` you supply** are yours to keep current on the same
+  cadence. The digest you pass is a **trusted input**: rebuild from an updated base and re-pin on your
+  schedule. jitgen enforces that the reference is digest-*pinned*, **not** that the digest is *recent* —
+  freshness is an operational responsibility the tool cannot verify for you.
+
+This applies to the **container path** only. Prebuilt binaries and `cargo install --git` builds carry
+their dependency versions from the pinned `Cargo.lock`, audited separately by `./scripts/audit.sh`
+(`cargo audit` + `cargo deny`; threat #8).
+
 ## Security conformance tests (required gates)
 
 These MUST exist and pass before the relevant phase is complete (built security-review-first at F7):

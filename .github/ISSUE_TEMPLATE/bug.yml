@@ -1,0 +1,92 @@
+name: Bug report
+description: Report a defect in jitgen (not a security vulnerability)
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. **Do not report security vulnerabilities here** — follow
+        [SECURITY.md](https://github.com/sondrateconsulting/jitgen/blob/main/SECURITY.md)
+        (GitHub private vulnerability reporting) instead.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: This is not a security vulnerability (those go through private reporting per SECURITY.md).
+          required: true
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: jitgen version
+      description: Output of `jitgen --version`.
+      placeholder: jitgen 0.2.0 (data-contract v1)
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other / container
+    validations:
+      required: true
+  - type: dropdown
+    id: sandbox
+    attributes:
+      label: Sandbox tier (from `jitgen doctor`)
+      description: The `Sandbox tier:` line printed by `jitgen doctor`.
+      options:
+        - os-sandbox
+        - container
+        - none
+        - not sure
+    validations:
+      required: false
+  - type: dropdown
+    id: provider
+    attributes:
+      label: LLM provider
+      options:
+        - mock (default, offline)
+        - anthropic
+        - openai-compatible
+        - local
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you run, what did you expect, and what happened instead? Include the exact command.
+      placeholder: |
+        Command: jitgen run --repo . --base main --head HEAD --mode catch
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        Minimal steps, ideally a small repo/diff. jitgen's default is offline and deterministic, so a
+        mock-mode reproduction is easiest to investigate.
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: >-
+        Any error message and stderr. Redact secrets — jitgen redacts its own output, but pasted
+        environment details may not be.
+      render: text
+    validations:
+      required: false

@@ -1,0 +1,54 @@
+name: Feature request
+description: Suggest an enhancement or new capability for jitgen
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please check existing issues first, and keep jitgen's
+        constraints in mind — offline-by-default, a fail-closed sandbox, and the trusted/untrusted
+        config split (see
+        [CONTRIBUTING.md](https://github.com/sondrateconsulting/jitgen/blob/main/CONTRIBUTING.md)).
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues and didn't find a duplicate request.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do, and where does jitgen fall short today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like jitgen to do? Include a CLI shape, output, or behavior if you have one in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches or workarounds you've tried or ruled out.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - CLI / UX
+        - Language adapter
+        - Sandbox / execution
+        - Reporting / exporters (SARIF/JUnit/...)
+        - CI integration
+        - LLM provider
+        - Other
+    validations:
+      required: false

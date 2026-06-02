@@ -44,6 +44,30 @@ docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
 cargo build --release   # from a clone -> target/release/jitgen (no release needed)
 ```
 
+## Quickstart
+
+Your first contact is **`analyze`** — a non-executing preview that needs **no toolchains, no API key,
+and no sandbox**. It reads only the git objects for your diff and prints the changed files, the
+languages/build tools it detected, and the risk-ranked targets it *would* generate tests for:
+
+```bash
+jitgen analyze --repo . --base main --head HEAD            # human-readable plan
+jitgen analyze --repo . --base main --head HEAD --format json
+```
+
+`analyze` is a **plan, not the tests** — it proves jitgen parses your diff and ranks the changed code,
+and nothing more. Generating and validating real tests is a `run`, which needs an isolating sandbox
+(and a provider for non-mock output). Before your first `run`, check the machine can do it safely:
+
+```bash
+jitgen doctor      # toolchains, the sandbox tier it would pick, provider status — exit 0 iff git is present
+jitgen run --repo . --base main --head HEAD               # harden mode; prints a patch (non-destructive)
+```
+
+`doctor` is the **readiness probe**: it answers "can this host/runner execute jitgen safely?" by
+probing the host (not your repo, not the network). The [user guide](docs/user-guide.md) walks the full
+flow.
+
 ## CLI
 
 ```text

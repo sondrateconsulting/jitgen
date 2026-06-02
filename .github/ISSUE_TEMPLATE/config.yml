@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/sondrateconsulting/jitgen/security/advisories/new
+    about: Do not file security issues publicly. Use GitHub private vulnerability reporting (see SECURITY.md).
+  - name: Documentation
+    url: https://github.com/sondrateconsulting/jitgen/tree/main/docs
+    about: User guide, CI integration, security model, troubleshooting, and the ADRs.

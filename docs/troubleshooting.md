@@ -15,6 +15,21 @@ jitgen is **fail-closed**: it will not run untrusted test commands without an is
   constrained-local tier. This is loud, recorded, and never auto-selected. Only do this on a host you
   trust to run the repo's test command directly. See [ADR-0003](decisions/0003-sandbox-strategy.md).
 
+## Windows / other platforms: "no OS sandbox" (container-only)
+
+Only **Linux** (`bubblewrap`/`firejail`) and **macOS** (`sandbox-exec`) have a native OS sandbox tier.
+On **Windows — and any other OS** — jitgen's only sandbox tiers are **Docker and Podman**, so `run`
+needs a container.
+
+- **Fix:** run on a host with a digest-pinned container runtime — pass `--docker-image name@sha256:…`,
+  or use the "container IS the sandbox" model (run jitgen inside the published image and pass
+  `--unsafe-local-execution`; see [ci.md](ci.md)). `analyze` and `doctor` need no sandbox and work on
+  every platform.
+- **macOS note:** `sandbox-exec` is **Apple-deprecated but still functional** and remains macOS's
+  default OS tier; if you'd rather not depend on it, install Docker/Podman or run in a container. See
+  [security.md → Residual risks](security.md#residual-risks) and
+  [user-guide → Platform support](user-guide.md#platform-support).
+
 ## "container image is not digest-pinned"
 
 The container backend requires a **fully digest-pinned** image (`name@sha256:<64 hex>`) — a floating
