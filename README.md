@@ -83,7 +83,7 @@ cargo test  --workspace          # offline; uses the deterministic mock LLM (no 
 # Bazel (canonical build) produces the identical binary + version string:
 bazel build //...
 bazel test  //...
-bazel run //:jitgen -- --version   # jitgen 0.1.0 (data-contract v1) — same under Cargo
+bazel run //:jitgen -- --version   # jitgen 0.2.0 (data-contract v1) — same under Cargo
 ```
 
 All tests run **offline** with a deterministic mock LLM provider. Real providers — Anthropic,

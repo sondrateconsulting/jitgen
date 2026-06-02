@@ -6,7 +6,10 @@ All notable changes to `jitgen` are documented here. The format follows
 schema version (`jitgen --version` prints `data-contract vN`) is the compatibility signal for stored
 run state and report formats.
 
-## [Unreleased]
+## [0.2.0] — 2026-06-02
+
+First **distributable** release: everything since the initial build (WS1–WS3), now installable as
+prebuilt binaries + a container image. (Release date is the tag date — adjust if cut later.)
 
 ### Fixed
 - `jitgen run` no longer aborts when the repository contains a file larger than the 2 MB **parse**

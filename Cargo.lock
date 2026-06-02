@@ -423,7 +423,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jitgen-adapters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jitgen-core",
  "tree-sitter",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "jitgen-core",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-context"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jitgen-core",
  "regex",
@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-feedback"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jitgen-context",
  "jitgen-core",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-gitintake"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "git2",
  "jitgen-core",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-llm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jitgen-context",
  "jitgen-core",
@@ -497,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-materialize"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jitgen-core",
  "sha2",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "git2",
  "jitgen-adapters",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-report"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jitgen-core",
  "serde",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jitgen-context",
  "jitgen-core",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "jitgen-state"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "jitgen-core",
  "rusqlite",

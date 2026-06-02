@@ -9,7 +9,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 # Single source of the Bazel-side crate version. Keep in sync with [workspace.package].version in
 # Cargo.toml (a version-parity check is added in F10 hardening).
-JITGEN_VERSION = "0.1.0"
+JITGEN_VERSION = "0.2.0"
 
 def jitgen_rust_library(name, deps = [], **kwargs):
     """A jitgen library crate (edition 2021, versioned) + its unit test target."""
