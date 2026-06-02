@@ -50,6 +50,15 @@ impl UreqTransport {
             .timeout_global(Some(GLOBAL_TIMEOUT))
             // We inspect non-2xx bodies ourselves to surface the provider's own error message.
             .http_status_as_error(false)
+            // Never follow a redirect. Provider endpoints are single-shot POSTs that should not
+            // 3xx; ureq's default (10 redirects) only strips the standard `Authorization` header on
+            // a cross-host redirect, so a provider that returned a 3xx could otherwise replay a
+            // *custom* auth header — Anthropic's `x-api-key` — to the redirect target. Pinning to 0
+            // means a 3xx is returned as-is (never a `TooManyRedirects` error) and surfaces as a
+            // non-2xx API error, so no request (and no key) ever leaves for an unvetted host. This
+            // is defense-in-depth: TLS verification is always on and the provider is trusted config
+            // a repo cannot set, so only a compromised/misconfigured provider could trigger it.
+            .max_redirects(0)
             .build()
             .into();
         Self { agent }
@@ -149,5 +158,14 @@ mod tests {
     fn non_http_scheme_is_rejected() {
         assert!(validate_endpoint("ftp://example.com").is_err());
         assert!(validate_endpoint("api.anthropic.com").is_err());
+    }
+
+    #[test]
+    fn transport_never_follows_redirects() {
+        // Regression guard: the agent must be pinned to 0 redirects so a provider 3xx is never
+        // followed and a custom auth header (Anthropic's `x-api-key`) can't be replayed to a
+        // redirect target. A ureq bump that changed the default (10) must not silently re-enable it.
+        let t = UreqTransport::new();
+        assert_eq!(t.agent.config().max_redirects(), 0);
     }
 }

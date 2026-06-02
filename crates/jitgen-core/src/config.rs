@@ -68,8 +68,6 @@ pub struct RepoConfig {
     /// Keyed `argv` in `.jitgen.yaml` (the documented schema); `test_argv` is accepted as an alias.
     #[serde(rename = "argv", alias = "test_argv")]
     pub test_argv: Vec<String>,
-    /// Where to place generated test files (relative dir/template).
-    pub test_file_placement: Option<String>,
     /// tree-sitter grammar **name** (validated against a compiled-in allowlist; never loaded dynamically).
     pub grammar: Option<String>,
     /// Prompt hints — treated as **fenced untrusted data**, never instructions.

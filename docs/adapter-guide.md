@@ -42,7 +42,6 @@ extensions: [go]            # file extensions this adapter owns
 include: ["src/**"]         # optional include globs (empty = all owned files)
 exclude: ["**/vendor/**"]   # optional exclude globs
 argv: ["go", "test", "-run", "Test", "{target}"]   # explicit argv template (NOT a shell string)
-test_file_placement: "jitgen-tests"                # optional: where generated tests are placed
 grammar: rust               # optional: an ALLOWLISTED tree-sitter grammar name (see below)
 prompt_hints:               # optional: extra context for the model — treated as FENCED DATA, never instructions
   - "Public API lives in pkg/api."

@@ -42,6 +42,23 @@ run state and report formats.
   for CI (the `--max-tests` cost lever, bounded timeouts with no `429`/`5xx` retry, fixed HTTPS-only
   egress with no telemetry, and redacted/minimized context). (E11 / WS4)
 
+### Removed
+- **Unused `test_file_placement` repo-config key.** The `.jitgen.yaml` `test_file_placement` field was
+  parsed into `RepoConfig` and documented in the adapter guide but never consumed — generated-test
+  placement is determined by per-language conventions in the placement layer. Removed the dead field
+  and the doc line so the untrusted-config surface matches what is actually honored. Parsing is
+  unaffected: an unknown key in `.jitgen.yaml` is still ignored (it was already a no-op).
+
+### Security
+- **HTTP transport never follows redirects (defense-in-depth).** The real-provider `ureq` agent is now
+  pinned to `max_redirects(0)`. Provider endpoints are single-shot POSTs; the default (10 redirects)
+  only strips the standard `Authorization` header across hosts, so a provider that returned a `3xx`
+  could otherwise replay a *custom* auth header (Anthropic's `x-api-key`) to the redirect target. A
+  `3xx` is now returned as-is and surfaces as a non-2xx API error, so no request — and no key — leaves
+  for an unvetted host. Only a compromised/misconfigured trusted provider could ever trigger this
+  (TLS verification is always on; a repo cannot set the provider), so it is hardening, not a fix for a
+  reachable issue.
+
 ## [0.2.0] — 2026-06-02
 
 First **distributable** release: everything since the initial build (WS1–WS3), now installable as
