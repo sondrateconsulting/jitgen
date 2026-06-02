@@ -370,4 +370,26 @@ real_llm: true
         assert_eq!(ok.grammar.as_deref(), Some("rust"));
         assert!(w.is_empty());
     }
+
+    #[test]
+    fn removed_test_file_placement_key_is_silently_ignored() {
+        // Back-compat: an older `.jitgen.yaml` that still sets the now-removed `test_file_placement`
+        // key must parse cleanly, honor the real fields, and produce NO warning. It was never a
+        // security key, so it is just an unknown field that serde drops (`#[serde(default)]`, no
+        // `deny_unknown_fields`) — not a forbidden/security key that would warn.
+        let yaml = "\
+id: go
+extensions: [go]
+argv: [\"go\", \"test\", \"{target}\"]
+test_file_placement: custom-tests-dir
+";
+        let (cfg, warnings) = RepoConfig::parse_yaml(yaml).unwrap();
+        assert_eq!(cfg.id.as_deref(), Some("go"));
+        assert_eq!(cfg.extensions, vec!["go"]);
+        assert_eq!(cfg.test_argv, vec!["go", "test", "{target}"]);
+        assert!(
+            warnings.is_empty(),
+            "a removed non-security key must be silently ignored, got {warnings:?}"
+        );
+    }
 }

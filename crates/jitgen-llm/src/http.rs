@@ -168,4 +168,78 @@ mod tests {
         let t = UreqTransport::new();
         assert_eq!(t.agent.config().max_redirects(), 0);
     }
+
+    #[test]
+    fn redirect_is_returned_not_followed_so_no_second_request_is_made() {
+        // Behavioral proof of the config guard above: stand up a loopback server that answers the
+        // first request with a `302` whose `Location` points back at ITSELF. With `max_redirects(0)`
+        // ureq must return that 302 as-is (never a `TooManyRedirects` error) and must NOT issue a
+        // second request — so the server is contacted exactly once and the `x-api-key` header is
+        // never replayed to the redirect target. If the default (10) ever leaked back in, the server
+        // would be hit twice and this fails. std-only; no real network leaves loopback.
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_w = Arc::clone(&hits);
+
+        let server = std::thread::spawn(move || {
+            // Bounded: stop after a second connection (redirect followed) or a 1s quiet window.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut handled = 0u32;
+            while Instant::now() < deadline && handled < 2 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let n = hits_w.fetch_add(1, Ordering::SeqCst) + 1;
+                        // Drain the request (bounded) so the client finishes writing before we reply.
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                        let _ = stream.read(&mut [0u8; 2048]);
+                        let resp = if n == 1 {
+                            // Redirect to ourselves: a followed redirect would reconnect here.
+                            format!(
+                                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/followed\r\n\
+                                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        } else {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_string()
+                        };
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                        handled += 1;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let t = UreqTransport::new();
+        let out = t
+            .post_json(
+                &format!("http://127.0.0.1:{port}/v1/messages"),
+                &[("x-api-key", "sk-ant-SECRET-must-not-be-replayed")],
+                "{}",
+            )
+            .expect("a 3xx must be returned as Ok(status=3xx), not an error");
+        assert_eq!(
+            out.status, 302,
+            "the redirect must be surfaced, not followed"
+        );
+
+        let _ = server.join();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the server was contacted more than once — a redirect was followed and the key replayed"
+        );
+    }
 }
