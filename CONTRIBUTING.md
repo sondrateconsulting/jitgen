@@ -11,8 +11,8 @@ are load-bearing, not stylistic.
 ## Prerequisites
 
 - **Rust** — the toolchain is pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (currently
-  `1.95.0`); rustup installs it automatically. The crates declare an MSRV of **1.80** (`rust-version`
-  in [`Cargo.toml`](Cargo.toml)).
+  `1.95.0`); rustup installs it automatically. The crates declare an MSRV of **1.85** (`rust-version`
+  in [`Cargo.toml`](Cargo.toml)) — raised from 1.80 when the clap 4.6 line (rustc 1.85) was adopted.
 - **git** — required at runtime.
 - **Bazel** *(optional, but canonical)* — `bazel` or `bazelisk` on `PATH`. Cargo is the
   always-working dev build; Bazel (Bzlmod) is the canonical build

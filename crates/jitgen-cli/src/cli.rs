@@ -315,13 +315,21 @@ fn version_string() -> String {
     )
 }
 
+/// Build the top-level `clap::Command` with the data-contract-qualified version applied. Shared by
+/// `run()` (arg parsing) and `cmd_completions()` (script generation) so a generated completion script
+/// carries the live flag surface — including `--version`, which a bare `Cli::command()` omits. The
+/// version `String` is allocated once (a process-lifetime `OnceLock`) so no string is leaked, and
+/// `clap`'s `version` (which needs `&'static str`) gets a stable static reference.
+fn build_command() -> clap::Command {
+    use std::sync::OnceLock;
+    static VERSION: OnceLock<String> = OnceLock::new();
+    Cli::command().version(VERSION.get_or_init(version_string).as_str())
+}
+
 /// Parse args and dispatch. Returns a process exit code. `--version`/`--help` are handled by clap
 /// (which exits), with the version overridden to the data-contract-qualified string.
 pub fn run() -> ExitCode {
-    // clap's `version` wants a `&'static str`; leak the one-time version string (CLI lives for the
-    // whole process, so this is a bounded, single allocation — not a growing leak).
-    let version: &'static str = Box::leak(version_string().into_boxed_str());
-    let matches = Cli::command().version(version).get_matches();
+    let matches = build_command().get_matches();
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(c) => c,
         Err(e) => e.exit(),
@@ -632,13 +640,35 @@ fn cmd_doctor(a: DoctorArgs) -> ExitCode {
 }
 
 /// Print a shell completion script for `shell` to stdout. Pure presentation — no repo, no network, no
-/// sandbox — e.g. `jitgen completions zsh > ~/.zsh/completions/_jitgen`. The script is clap's own,
-/// generated from the same `Cli` command tree, so it always matches the live flag surface.
+/// sandbox — e.g. `jitgen completions zsh > ~/.zsh/completions/_jitgen`. Built via `build_command()`
+/// (same tree as the real CLI, version included), so the script always matches the live flag surface.
+///
+/// Uses `Generator::try_generate` rather than the free `clap_complete::generate`, which `.expect()`s on
+/// write errors: `jitgen completions zsh | head` closes the pipe early, and a broken-pipe write must be
+/// a clean exit, not a panic (exit 101).
 fn cmd_completions(a: CompletionsArgs) -> ExitCode {
-    let mut cmd = Cli::command();
+    match write_completions(a.shell, &mut std::io::stdout()) {
+        Ok(()) => ExitCode::SUCCESS,
+        // A closed pipe (`jitgen completions zsh | head`) is a clean exit, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => fail(&format!("jitgen completions: {e}")),
+    }
+}
+
+/// Render a `shell` completion script into `out`. Mirrors clap's free `generate`: set the bin name and
+/// `build()` the command so the script carries clap's auto `--version`/`--help` flags — a bare
+/// (unbuilt) command omits them. Uses `try_generate` (not `generate`, which `.expect()`s on write
+/// errors) so a broken pipe surfaces as an `io::Error` for the caller to handle. Pure + testable.
+fn write_completions(
+    shell: clap_complete::Shell,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<()> {
+    use clap_complete::Generator;
+    let mut cmd = build_command();
     let bin = cmd.get_name().to_string();
-    clap_complete::generate(a.shell, &mut cmd, bin, &mut std::io::stdout());
-    ExitCode::SUCCESS
+    cmd.set_bin_name(bin);
+    cmd.build();
+    shell.try_generate(&cmd, out)
 }
 
 /// Cap on a sanitized error message printed to the terminal. Generous for any real jitgen error
@@ -683,8 +713,8 @@ mod tests {
 
     #[test]
     fn clap_command_is_valid() {
-        // clap's own consistency assertions (no duplicate args, etc.).
-        Cli::command().version("0.0.0-test").debug_assert();
+        // clap's own consistency assertions (no duplicate args, etc.) on the REAL command builder.
+        build_command().debug_assert();
     }
 
     #[test]
@@ -847,16 +877,23 @@ mod tests {
     }
 
     #[test]
-    fn completions_script_is_generated_and_mentions_the_binary() {
-        let mut cmd = Cli::command();
-        let mut buf = Vec::new();
-        clap_complete::generate(clap_complete::Shell::Bash, &mut cmd, "jitgen", &mut buf);
-        let script = String::from_utf8(buf).expect("utf8");
-        assert!(!script.is_empty(), "completion script must not be empty");
-        assert!(
-            script.contains("jitgen"),
-            "script names the binary: {script:.80}"
-        );
+    fn completions_script_is_generated_and_carries_the_live_flag_surface() {
+        // Exercise the EXACT path cmd_completions uses (write_completions: build + try_generate), for
+        // bash AND zsh — a bare/unbuilt Cli::command() omits clap's auto --version, the codex regression.
+        for shell in [clap_complete::Shell::Bash, clap_complete::Shell::Zsh] {
+            let mut buf = Vec::new();
+            write_completions(shell, &mut buf).expect("generate");
+            let script = String::from_utf8(buf).expect("utf8");
+            assert!(!script.is_empty(), "{shell}: script must not be empty");
+            assert!(
+                script.contains("jitgen"),
+                "{shell}: script names the binary"
+            );
+            assert!(
+                script.contains("--version"),
+                "{shell}: completions include --version (regression: unbuilt command omitted it)"
+            );
+        }
     }
 
     #[test]

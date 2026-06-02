@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 license = "Apache-2.0"
 description = "jitgen — Just-in-Time test generation for changed code in a git repository"
 repository = "https://github.com/sondrateconsulting/jitgen"
@@ -53,7 +53,8 @@ clap_complete = { version = "4.5", default-features = false }
 # select rustls + ring + bundled webpki-roots: TLS is always on, the CA set is vendored (hermetic, no
 # system trust store), and we avoid aws-lc/native-tls. Like git2/rusqlite/tree-sitter above, its `ring`
 # backend runs a build script (cc + pregenerated asm), which Bazel crate_universe handles. Pinned to the
-# 3.2.x line: ureq >=3.3 raises its MSRV to rustc 1.85, above our workspace MSRV of 1.80.
+# 3.2.x line: pinned for build stability. (ureq >=3.3 needs rustc 1.85, now within the workspace MSRV
+# of 1.85 — adopting a newer ureq is a separate, deliberate change.)
 ureq = "~3.2.1"
 
 # Intra-workspace (path-based).

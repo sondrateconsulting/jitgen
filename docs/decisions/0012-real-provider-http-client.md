@@ -17,7 +17,8 @@ choosing an HTTP client. Constraints particular to this repo:
   TLS build systems are a liability.
 - **Hermetic** — the project vendors its trust anchors rather than depending on the host (no system
   OpenSSL; static zlib). TLS root certs should follow suit.
-- **MSRV 1.80** — the declared workspace `rust-version`.
+- **MSRV 1.80** — the declared workspace `rust-version` _at the time of this ADR_ (later raised to
+  1.85 when the clap 4.6 line, which requires rustc 1.85, was adopted).
 
 ## Decision
 
@@ -30,7 +31,9 @@ Use **`ureq` 3.2.x** with its **default features**, which select **rustls + `rin
   Bazel-hostile.
 - **`webpki-roots`** bundles the Mozilla CA set → **hermetic**, identical across platforms, no system
   trust store (consistent with vendoring libgit2/zlib). TLS verification is always on.
-- **Pinned to the 3.2.x line** (`~3.2.1`): ureq ≥ 3.3 raises its MSRV to rustc 1.85, above our 1.80.
+- **Pinned to the 3.2.x line** (`~3.2.1`): ureq ≥ 3.3 raised its MSRV to rustc 1.85, above the 1.80
+  MSRV in force when this ADR was written. (The workspace MSRV is now 1.85; the pin remains for build
+  stability and can be revisited separately.)
 - **`serde_json`** (already a workspace dep) builds request bodies and parses responses.
 - A small `HttpTransport` **trait seam** isolates the one socket-opening type (`UreqTransport`) so each
   provider's body-building / response-parsing / error-mapping is unit-tested **offline** with a fake.
