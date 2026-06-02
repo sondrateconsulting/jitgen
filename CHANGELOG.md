@@ -31,6 +31,22 @@ run state and report formats.
   keeps [ADR-0011](docs/decisions/0011-overlay-materialization.md). (DX audit finding 4)
 
 ### Added
+- **Release pipeline + container image (WS1 distribution).** A tagged release
+  ([`.github/workflows/release.yml`](.github/workflows/release.yml)) builds per-platform binaries
+  (Linux x86-64, macOS x86-64 / arm64) with SHA-256 checksums and a digest-pinned GHCR container image
+  (jitgen + git + the first-class toolchains: Rust, Node, JDK+Maven, Python+pytest), and **smoke-tests
+  every artifact** — `jitgen --version` + `analyze` on a fixture repo, plus `--version`/`analyze`
+  inside the image — *before* publishing, so a broken build never ships. This enables
+  `cargo install --git https://github.com/sondrateconsulting/jitgen --tag <v> jitgen-cli` and the
+  "container IS the sandbox" CI model (run jitgen inside the image with `--unsafe-local-execution`;
+  distinct from jitgen's own `--docker-image` tier). [docs/ci.md](docs/ci.md), [docs/security.md](docs/security.md),
+  and the README document the acquisition paths and the execution model; the repo is private, so hosted
+  downloads stay auth-gated until it is made public. A linux/arm64 binary + image are a follow-up (they
+  need an arm runner). (E2 + E3 / WS1)
+- **Workflow security gate.** A [`security`](.github/workflows/security.yml) workflow runs
+  [zizmor](https://zizmor.sh) on every pull request and push to `main`; [`.github/zizmor.yml`](.github/zizmor.yml)
+  enforces that every `uses:` action is pinned to a full commit SHA, so a PR that introduces an unpinned
+  (or otherwise unsafe) action fails the job. (WS1)
 - **CI integration guide** ([docs/ci.md](docs/ci.md)): how to run the catch-mode advisory in GitHub
   Actions and GitLab, upload SARIF to code scanning, and roll the findings gate out from advisory to
   blocking. Documents the canonical **exit-code table** (`0` ok / `1` runtime / `2` usage / `3`

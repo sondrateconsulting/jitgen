@@ -1,0 +1,152 @@
+# Release pipeline: build per-platform binaries + a container image, smoke-test each artifact, and
+# publish ONLY after the smoke test passes.
+#
+#   - on a `v*` tag push: build -> smoke -> publish (GitHub Release assets + a GHCR image).
+#   - on workflow_dispatch (any branch): build -> smoke only (every publish step is gated on a `v*`
+#     tag), so the pipeline can be dry-run without cutting a release.
+#
+# Conventions (see docs/ci.md): every third-party action is pinned to a full commit SHA, permissions
+# are least-privilege per job, and no layer/dependency cache is used — a release build is cold by
+# design so a poisoned cache can never taint a published artifact (zizmor `cache-poisoning`).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+# Least privilege at the top; each job widens only what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false # never cancel a release mid-publish
+
+jobs:
+  # Native build per runner — no cross-compilation. The C-heavy deps (vendored libgit2, static zlib,
+  # bundled rusqlite, tree-sitter grammars, ring) are fiddly to cross-compile, so each target builds on
+  # its own host. (linux/arm64 needs an arm runner and is a documented follow-up; see docs/ci.md.)
+  build-binaries:
+    name: binary (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Build release binary (native target)
+        # rust-toolchain.toml pins 1.95.0; the runner's rustup installs it on first use. No --target:
+        # the host IS the matrix target, so this is a native build.
+        run: cargo build --locked --release --bin jitgen -p jitgen-cli
+      - name: Smoke test the binary BEFORE packaging
+        run: bash .github/scripts/smoke.sh target/release/jitgen
+      - name: Package tarball + SHA256 checksum
+        id: package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME//\//-}"          # sanitize slashes from dispatch branch refs
+          name="jitgen-${ver}-${TARGET}"
+          mkdir -p dist
+          tar -czf "dist/${name}.tar.gz" -C target/release jitgen
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "artifact=${name}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Build the "container IS the sandbox" image, smoke-test it, then (on a tag) push to GHCR.
+  build-image:
+    name: image (linux/amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to GHCR — only exercised on a v* tag
+    env:
+      IMAGE: ghcr.io/sondrateconsulting/jitgen
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Build image ONCE (loaded into the local daemon; not pushed)
+        run: docker build -t jitgen:smoke .
+      - name: Smoke test the image BEFORE publish
+        run: |
+          set -euo pipefail
+          docker run --rm jitgen:smoke --version
+          docker run --rm jitgen:smoke doctor
+          # The image's reason to exist is the bundled toolchains — assert each is present + runnable,
+          # so a toolchain that silently breaks (e.g. a future base-digest bump) fails the smoke, not CI.
+          docker run --rm --entrypoint sh jitgen:smoke -c '
+            set -e
+            git --version; cargo --version; rustc --version
+            node --version; npm --version
+            java -version; mvn --version
+            python3 --version; pytest --version'
+          # Build the analyze fixture inside the container (non-root), proving jitgen runs end to end.
+          docker run --rm -i --entrypoint bash jitgen:smoke -s jitgen < .github/scripts/smoke.sh
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the SMOKED image to GHCR (the exact bits that passed smoke)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Tag + push the SAME local image that was just smoke-tested — NOT a second build — so the
+          # published (and digest-pinned) image is provably the one that passed smoke.
+          docker tag jitgen:smoke "${IMAGE}:${REF}"
+          docker tag jitgen:smoke "${IMAGE}:latest"
+          docker push "${IMAGE}:${REF}"
+          docker push "${IMAGE}:latest"
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${REF}" --format '{{.Manifest.Digest}}')"
+          echo "Published ${IMAGE}@${digest}  (pin THIS digest in CI)"
+
+  # Publish the GitHub Release. `needs:` both build jobs, so this runs only when every binary smoke
+  # passed AND the image was built+smoked+pushed — i.e. publish is always gated on the smoke tests.
+  release:
+    name: publish release
+    needs: [build-binaries, build-image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload assets
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub Release with binaries + checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag \
+            dist/*.tar.gz dist/*.tar.gz.sha256

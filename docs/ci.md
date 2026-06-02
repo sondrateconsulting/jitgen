@@ -69,8 +69,10 @@ provide one of:
 1. **Run jitgen _inside_ a container (recommended).** When the job's steps already run inside an
    ephemeral, jitgen-owned container, that container **is** the isolation boundary, so pass
    `--unsafe-local-execution` to use the constrained-local tier. This is the "container is the sandbox"
-   model — **no** Docker-in-Docker and **no** mounted Docker socket. *(A digest-pinned jitgen image
-   published from the release pipeline is forthcoming — see [Getting jitgen onto the runner](#getting-jitgen-onto-the-runner). Until then, build the image from the repo's `Dockerfile` or use option 2.)*
+   model — **no** Docker-in-Docker and **no** mounted Docker socket. *(jitgen publishes a digest-pinned
+   image with the toolchains baked in — `ghcr.io/sondrateconsulting/jitgen` — see [Getting jitgen onto
+   the runner](#getting-jitgen-onto-the-runner) for how to consume it and how it differs from jitgen's
+   own `--docker-image` sandbox tier.)*
 2. **Install an OS sandbox on the runner.** Install `bubblewrap` (Linux) so jitgen selects the
    `os-sandbox` tier with no extra flags — fully isolated, no `--unsafe-local-execution` needed:
 
@@ -102,20 +104,69 @@ API-key env var is set (never the value).
 
 ### Getting jitgen onto the runner
 
-Until the release pipeline publishes prebuilt artifacts, build jitgen from source on the runner (it is
-a single static-ish binary once built):
+A tagged release (`v*`) publishes, from [`.github/workflows/release.yml`](../.github/workflows/release.yml),
+**per-platform binaries with SHA-256 checksums** and a **digest-pinned container image** — each
+smoke-tested (`--version` + `analyze` on a fixture) *before* it is published. Choose the acquisition path
+that fits your runner. The `v0.1.0` and `@sha256:<digest>` tokens below are **placeholders** — substitute
+a published release tag and the digest that release reports (no release is cut yet; this pipeline is what
+produces them):
+
+**Prebuilt binary** (Linux x86-64, macOS x86-64, macOS arm64), checksum-verified before use:
 
 ```bash
-# Build from source (works today). Pin to a tag/commit in a real workflow.
-cargo build --release            # -> target/release/jitgen
-./target/release/jitgen --version
+ver=v0.1.0; target=x86_64-unknown-linux-gnu          # your release tag + platform
+base="https://github.com/sondrateconsulting/jitgen/releases/download/${ver}"
+curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz"
+curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz.sha256"
+shasum -a 256 -c "jitgen-${ver}-${target}.tar.gz.sha256"   # must pass before you trust the binary
+tar -xzf "jitgen-${ver}-${target}.tar.gz" && ./jitgen --version
 ```
 
-> **Forthcoming (distribution work, WS1):** per-platform prebuilt binaries with SHA-256 checksums
-> (enabling `cargo install --git https://github.com/sondrateconsulting/jitgen`) and a digest-pinned
-> container image. When those ship, the build step above becomes a download (or a `container:` image
-> reference) and the examples below change by one line. The repository is currently **private**, so
-> acquisition is auth-gated (`docker login` / a token) until it is made public.
+**`cargo install`** (compiles the pinned source; needs a Rust toolchain). The workspace has no root
+package, so name the CLI crate explicitly:
+
+```bash
+cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.1.0 jitgen-cli
+```
+
+**Container image** — `ghcr.io/sondrateconsulting/jitgen`, with git and the first-class toolchains
+(Rust, Node, JDK+Maven, Python+pytest) baked in. **`linux/amd64` only today** (a `linux/arm64` image is a
+follow-up — it needs an arm runner; on arm64 runners build from the `Dockerfile` or use the OS-sandbox
+tier). Pin the **digest** the release reports, never a floating tag:
+
+```bash
+docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
+```
+
+**Build from source** (always works, no release required): `cargo build --release` →
+`target/release/jitgen`. Pin to a tag/commit in a real workflow.
+
+> The repository is currently **private**, so every hosted path is **auth-gated**: `docker login
+> ghcr.io` for the image, and a token (e.g. `GITHUB_TOKEN`) for release-asset downloads and
+> `cargo install --git`. Making the repo public turns these into anonymous downloads — nothing else
+> changes (the binaries and image are built public-grade today).
+
+#### "The container IS the sandbox"
+
+Option 1 above, made concrete. Run jitgen *inside* the published image and treat that ephemeral
+container as the isolation boundary — pass `--unsafe-local-execution`, with **no** Docker socket and
+**no** Docker-in-Docker. Catch mode writes nothing to the repo, so mount the checkout read-only and
+send the SARIF to stdout:
+
+```bash
+docker run --rm -v "$PWD":/repo:ro ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
+  run --repo /repo --base "$BASE" --head "$HEAD" \
+  --mode catch --format sarif --unsafe-local-execution > jitgen.sarif
+```
+
+GitHub Actions' `container:` key works the same way (every step runs inside the image; call `jitgen`
+from `PATH`). The image is **non-root**; if `actions/checkout` cannot write the workspace under a
+`container:` job, run that job as root (`container: { options: --user root }`) — acceptable here
+precisely because the throwaway container, not the user, is the boundary.
+
+**This is not jitgen's `--docker-image` sandbox tier.** That tier is the inverse — jitgen runs on a
+host and spawns its *own* containers per run, which on a runner needs a Docker socket / Docker-in-Docker.
+The "container is the sandbox" model deliberately needs neither.
 
 ## GitHub Actions
 
@@ -146,7 +197,7 @@ jobs:
     steps:
       - uses: actions/checkout@<sha>
         with: { fetch-depth: 0 }      # full history so base..head is resolvable
-      - run: cargo build --release     # replace with a download / `container:` image once WS1 ships
+      - run: cargo build --release     # or download a prebuilt binary / use the published image (above)
       - name: Preflight
         run: |
           sudo apt-get update && sudo apt-get install -y bubblewrap

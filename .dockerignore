@@ -1,0 +1,14 @@
+# Keep the Docker build context lean: the builder needs the Cargo workspace sources (crates/,
+# Cargo.toml, Cargo.lock, rust-toolchain.toml) and nothing else.
+target/
+.git/
+.github/
+.claude/
+.jitgen/
+bazel-*
+# 650 KB Bazel crate_universe lockfile — irrelevant to the cargo build.
+MODULE.bazel.lock
+# Release packaging output.
+dist/
+*.tar.gz
+*.sha256

@@ -1,0 +1,10 @@
+# zizmor configuration — https://docs.zizmor.sh/configuration/
+#
+# Enforce that EVERY `uses:` action is pinned to a full commit SHA (not a tag or branch). zizmor has
+# defaulted to hash-pin since v1.20.0; this makes the policy explicit and load-bearing so the
+# `security` workflow fails any PR that introduces a tag/branch-pinned action.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin

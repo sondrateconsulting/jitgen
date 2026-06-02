@@ -28,6 +28,22 @@ arXiv:2601.22832 — see [docs/research/paper-notes.md](docs/research/paper-note
 - **Bazel (Bzlmod)** canonical build + Cargo workspace for dev ergonomics.
 - **Non-destructive by default** — emits a patch/overlay; never mutates your repo without `--write`.
 
+## Install
+
+Tagged releases publish per-platform binaries (with SHA-256 checksums) and a digest-pinned container
+image (`linux/amd64`; arm64 is a follow-up) — each smoke-tested (`--version` + `analyze` on a fixture)
+before publish. The repository is currently **private**, so hosted downloads are auth-gated
+(`docker login` / a token) until it is made public; full recipes (checksum verification, the
+"container IS the sandbox" CI model) live in
+[docs/ci.md → Getting jitgen onto the runner](docs/ci.md#getting-jitgen-onto-the-runner).
+
+```bash
+# Substitute a published release tag for <release-tag> and the digest it reports for <digest>:
+cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag <release-tag> jitgen-cli
+docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
+cargo build --release   # from a clone -> target/release/jitgen (no release needed)
+```
+
 ## CLI
 
 ```text

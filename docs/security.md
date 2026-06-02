@@ -49,6 +49,14 @@ Test commands and build scripts are attacker-controlled.
   **refused** (clear error). The **constrained-local** tier is **never auto-selected**; it runs only
   with the trusted `--unsafe-local-execution` flag, which warns loudly and is recorded.
   ([ADR-0003](decisions/0003-sandbox-strategy.md), [ADR-0010](decisions/0010-config-trust-and-fail-closed.md))
+- **"The container IS the sandbox" (CI deployment).** A jitgen-owned **ephemeral container** can serve
+  as the isolation boundary: run jitgen *inside* it and pass the trusted `--unsafe-local-execution`
+  flag (the constrained-local tier), with **no** Docker socket and **no** Docker-in-Docker. This is
+  sound only because the container is **throwaway and jitgen-owned** and `--unsafe-local-execution` is
+  **trusted-config only** — a hostile `.jitgen.yaml` cannot set it. It is the inverse of the
+  **`--docker-image` tier** (jitgen spawning its *own* containers, which needs a Docker socket); do
+  **not** mount a Docker socket to satisfy the CI model. The published image is **digest-pinned** like
+  every toolchain image (threat #8); see [docs/ci.md](ci.md).
 - No network by default (enforced + **conformance-tested per backend**); cwd pinned to overlay;
   resource limits **per backend** (containers via cgroup flags `--memory`/`--pids-limit`/`--cpus`;
   firejail via `--rlimit-*`; OS-sandbox/constrained-local via a `ulimit` preamble applying CPU-time +
