@@ -284,16 +284,21 @@ carries the severity, so filter code-scanning rules on the `level`, not on disti
 untrusted string (paths, messages, rationale) is escaped and capped per format — the SARIF is always
 data, never markup or terminal controls.
 
-> **Known limitations (improving — exporter work, WS3).** Be honest with your reviewers about these
-> until the exporter slice lands:
+> **SARIF locations point at the changed production code.** A result's location is the **changed
+> production line** — code-scanning annotations land on the diffed source, not the generated-test file
+> — and `tool.driver.informationUri` is the repository URL. The line is the first line of the changed
+> *unit* (the enclosing symbol's declaration, or the changed hunk for a hunk-level target), so an
+> annotation may sit at the top of the changed function rather than the exact mutated line. When a
+> changed line can't be resolved (e.g. an older `report.json`), jitgen falls back to the production
+> file at file level, then to the test path.
 >
-> - **Result locations point at the _generated test_ file** (e.g. `tests/jitgen_*.rs`), **not the
->   changed production line**. Code-scanning annotations therefore land on the test path, not on the
->   diffed source line. Line-precise production locations are tracked as a follow-up.
-> - **`tool.driver.informationUri` is a placeholder** (`https://example.invalid/jitgen`) pending the
->   same exporter pass; it will become the real repository URL.
-> - **JUnit** (`--format junit`) currently renders every catch as a *failing* `<testcase>`, which
->   conflates "suspected bug found" with "test suite broke". Prefer SARIF for CI surfacing today.
+> **JUnit (`--format junit`) distinguishes a suspected bug from a broken suite.** Only a high-confidence
+> catch (a `StrongCatch`) renders as a failing `<testcase>`; a `StrictlyWeak`/`Uncertain` verdict is a
+> *passing* testcase carrying the verdict in `<system-out>`, so the suite's `failures` count means
+> "suspected bugs found", not "every catch". A JUnit failure is keyed on the **decision** alone, so it
+> is a slightly broader signal than the [findings gate](#exit-codes), which also requires
+> `tp_probability ≥ --fail-threshold` — don't wire CI to fail on JUnit `failures > 0` expecting it to
+> match `--fail-on-catch`.
 
 With the offline mock the SARIF is byte-deterministic; with a real provider its content varies
 run-to-run (next section).
