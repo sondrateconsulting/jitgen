@@ -28,6 +28,9 @@ run state and report formats.
   `pull_request` (never `pull_request_target`). The
   [self-dogfood section of docs/ci.md](docs/ci.md#self-dogfood) is now live (no longer "forthcoming").
   (C1–C3 / WS5)
+- **`jitgen completions <shell>`.** Generate a shell-completion script for `bash`, `zsh`, `fish`,
+  `powershell`, or `elvish` (e.g. `jitgen completions zsh > ~/.zsh/completions/_jitgen`). The script is
+  generated from jitgen's own command tree, so it always matches the installed version's flags. (DX review)
 
 ### Changed
 - **Docs lead with `analyze`.** The README and user guide now open on `jitgen analyze` — the zero-setup,
@@ -41,6 +44,17 @@ run state and report formats.
   base-digest refresh; SBOM/provenance noted as planned, not shipped), and real-LLM provider governance
   for CI (the `--max-tests` cost lever, bounded timeouts with no `429`/`5xx` retry, fixed HTTPS-only
   egress with no telemetry, and redacted/minimized context). (E11 / WS4)
+- **`--repo` and `--head` now default.** `jitgen run`/`analyze` default `--repo` to the current
+  directory and `--head` to `HEAD`, so the common case is `jitgen analyze --base <ref>`; `--base` is
+  still required. jitgen opens `--repo` exactly (no upward search), so run from the repository root. (DX review)
+- **Minimum supported Rust version raised to 1.85** (from 1.80). The `clap` 4.6 line requires rustc
+  1.85 and the dependency tree already required it, so the declared MSRV (and `CONTRIBUTING.md` /
+  ADR-0012) now match reality. (eng review)
+- **Install docs lead with build-from-source.** The README and user guide now lead with the working
+  `git clone` + `cargo build --release` path, set a first-build-is-slow expectation, and label the
+  hosted binary/image as auth-gated while the repository is private. Error-hint pointers now use
+  resolvable GitHub URLs instead of repo-relative `docs/…` paths (which do not exist for
+  `cargo install` / `docker run` users). (DX review)
 
 ### Removed
 - **Unused `test_file_placement` repo-config key.** The `.jitgen.yaml` `test_file_placement` field was
