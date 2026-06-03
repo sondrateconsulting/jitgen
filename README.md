@@ -11,7 +11,7 @@ arXiv:2601.22832 — see [docs/research/paper-notes.md](docs/research/paper-note
 - **`catch`** — tests that **fail** on your change while **passing** on its parent (a *weak catch*),
   then assessed for whether they reveal a real bug (*strong catch*).
 
-> **Status:** the phased build is **complete** (F0–F10). See
+> **Status:** the phased build is **complete** (F0–F11). See
 > [docs/final-report.md](docs/final-report.md) for the full wrap-up,
 > [docs/implementation-status.md](docs/implementation-status.md) for the per-phase record, and
 > [docs/user-guide.md](docs/user-guide.md) to get started. Runs are **resumable**: jitgen records

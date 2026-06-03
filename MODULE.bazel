@@ -11,9 +11,17 @@ module(
 bazel_dep(name = "rules_rust", version = "0.70.0")
 
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
-# Omit an explicit version to use the rules_rust default toolchain (guaranteed integrity hashes).
-# The dev/cargo build pins 1.95.0 (rust-toolchain.toml); both compile the same edition-2021 code.
-rust.toolchain(edition = "2021")
+# Pin the Bazel Rust toolchain to the Cargo dev build's version (rust-toolchain.toml channel = 1.95.0).
+# rules_rust 0.70.0's default rustc already happens to be 1.95.0, so this is explicit-not-corrective:
+# it stops a future rules_rust bump from silently moving Bazel's rustc off the Cargo pin (which would
+# introduce a Cargo-vs-Bazel divergence and stale cross-build cache entries). scripts/check.sh (the
+# local gate) fails on drift between the two declared pins and, when Bazel is available, on a resolved
+# rustc that isn't 1.95.0.
+# rules_rust 0.70.0 ships integrity hashes for 1.95.0, so no explicit sha256s are needed.
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.95.0"],
+)
 use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")

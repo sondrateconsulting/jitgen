@@ -55,6 +55,21 @@ run state and report formats.
   hosted binary/image as auth-gated while the repository is private. Error-hint pointers now use
   resolvable GitHub URLs instead of repo-relative `docs/…` paths (which do not exist for
   `cargo install` / `docker run` users). (DX review)
+- **Bazel rustc version is now pinned explicitly (1.95.0), matching Cargo.** `MODULE.bazel` now sets
+  `rust.toolchain(versions = ["1.95.0"])` instead of relying on the `rules_rust` default. That default
+  in `rules_rust 0.70.0` already happens to be 1.95.0 (so the resolved compiler is unchanged today), but
+  pinning makes it explicit so a future `rules_rust` upgrade cannot silently move Bazel's rustc off the
+  Cargo pin (`rust-toolchain.toml`) — which would introduce a Cargo-vs-Bazel divergence and stale
+  cross-build cache entries. `rules_rust 0.70.0` ships integrity hashes for 1.95.0, so the pin needs no
+  hand-supplied `sha256s`. `scripts/check.sh` gained a `rustc pin parity` step that fails if the two
+  declared pins disagree or (when Bazel is available) if the version Bazel actually resolves isn't
+  1.95.0. (Bazel/CI hardening)
+- **More deterministic Bazel test environment.** `bazel test` now runs with a fixed timezone and locale
+  (`--test_env=TZ=UTC`, `--test_env=LC_ALL=C`) and denies external network in the test sandbox
+  (`--sandbox_default_allow_network=false`). This removes the undeclared host inputs most likely to make
+  a cached pass/fail unreliable (wall-clock zone, locale, ambient connectivity) — it does not make tests
+  fully hermetic, but it closes the common cases. Loopback stays available, so the lone unit test that
+  binds a `127.0.0.1` server still runs sandboxed. (Bazel/CI hardening)
 
 ### Removed
 - **Unused `test_file_placement` repo-config key.** The `.jitgen.yaml` `test_file_placement` field was

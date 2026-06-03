@@ -308,15 +308,19 @@ F10 ran the supply-chain audits and triaged every recorded carry-over. Each is e
   `openat`/`O_NOFOLLOW` traversal of the state path would only harden against a *local* attacker who
   can plant symlinks under the user's own trusted state root — outside the hostile-repo threat model.
 
-- **Bazel↔Cargo toolchain version pin + checksum-pinned bazelisk (F1 P4) — DOCUMENTED DECISION.**
-  `.bazelversion` pins Bazel `7.4.1`; `rust-toolchain.toml` pins Rust `1.95.0` for the Cargo/dev
-  build; Bazel uses the `rules_rust` **default** toolchain (which ships with guaranteed download
-  integrity hashes) at the same edition (2021). The Rust-version divergence is intentional: pinning
-  Bazel to an exact Rust version `rules_rust 0.70.0` does not bundle would require hand-supplied
-  integrity hashes and *reduce* hermeticity. Version **parity of the product** is what's contracted
-  and verified — `jitgen 0.1.0 (data-contract v1)` is byte-identical under Cargo and Bazel. Fully
-  checksum-pinning the bazelisk *launcher* is a CI-provisioning step (the Bazel version it fetches is
-  already pinned by `.bazelversion`).
+- **Bazel↔Cargo rustc pin (explicit) + checksum-pinned bazelisk — DOCUMENTED DECISION.**
+  `.bazelversion` pins Bazel `7.4.1`; `rust-toolchain.toml` pins Rust `1.95.0` for the Cargo/dev build;
+  the Bazel toolchain pins the **same** `1.95.0` via `rust.toolchain(versions = ["1.95.0"])` in
+  `MODULE.bazel`, at the same edition (2021). `rules_rust 0.70.0`'s default rustc already happens to be
+  1.95.0, so the resolved compiler is unchanged — the pin is explicit-not-corrective: it stops a future
+  `rules_rust` upgrade from silently moving Bazel's rustc off the Cargo pin, which would introduce a
+  Cargo-vs-Bazel divergence (a source of phantom Bazel cache misses and build-result drift). `rules_rust
+  0.70.0` ships integrity hashes for 1.95.0, so the pin needs **no** hand-supplied `sha256s` and keeps
+  full download-integrity hermeticity. `scripts/check.sh` (the offline maintainer gate — there is no
+  Bazel CI job yet) fails on any mismatch between the two declared pins and on a resolved rustc that
+  isn't 1.95.0 (the `rustc pin parity` step). Product **parity** is still contracted and verified —
+  `jitgen` reports an identical version under Cargo and Bazel. Fully checksum-pinning the bazelisk
+  *launcher* is a CI-provisioning step (the Bazel version it fetches is already pinned by `.bazelversion`).
 
 - **Digest-pinned container images + live `#[ignore]` conformance suite (ADR-0009) — VERIFIED.**
   Digest-pinning is **enforced in code**: the container backend requires `name@sha256:<64 hex>` and

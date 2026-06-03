@@ -6,3 +6,16 @@ test --test_output=errors
 
 # Don't let the local Cargo target/ dir leak into the action environment.
 build --incompatible_strict_action_env
+
+# --- test hygiene: reduce undeclared-input flakiness in cached test results ---
+# Bazel caches a passing test result keyed on its declared inputs, so a result that swings on an
+# UNDECLARED host input can be served stale from cache. These flags pin the host inputs most likely to
+# bite — wall-clock zone and locale — and deny EXTERNAL network in the test sandbox so a result can't
+# hinge on ambient connectivity. This does NOT make tests fully hermetic (current time, host files,
+# $HOME/tmp, CPU, etc. remain undeclared), but it closes the common cases. Loopback (127.0.0.1) stays
+# up, so the one unit test that binds a local server (jitgen-llm/src/http.rs) still runs sandboxed.
+# (A test needing real outbound network would tag its rust_test "requires-network"; the bazel/defs.bzl
+# macros do not forward tags to the generated rust_test today, so that would need a macro tweak. None need it.)
+test --test_env=TZ=UTC
+test --test_env=LC_ALL=C
+test --sandbox_default_allow_network=false
