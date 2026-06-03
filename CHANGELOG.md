@@ -63,6 +63,15 @@ run state and report formats.
   and the doc line so the untrusted-config surface matches what is actually honored. Parsing is
   unaffected: an unknown key in `.jitgen.yaml` is still ignored (it was already a no-op).
 
+### Fixed
+- **Broken-pipe writes no longer panic.** `main` resets SIGPIPE to its default disposition at startup
+  (via the `sigpipe` crate, so every crate stays `#![forbid(unsafe_code)]`). Piping any stdout command
+  to a reader that closes early — `jitgen analyze … | head`, `jitgen run … | grep -q` — now terminates
+  the process via SIGPIPE (exit 141) instead of panicking in `print!`/`println!` (exit 101). This
+  generalizes the per-command broken-pipe handling added for `jitgen completions` to every stdout
+  command uniformly on Unix; that per-command catch is retained as the guard on non-Unix, where the
+  SIGPIPE reset is a no-op. Covered by a `tests/broken_pipe.rs` integration test.
+
 ### Security
 - **HTTP transport never follows redirects (defense-in-depth).** The real-provider `ureq` agent is now
   pinned to `max_redirects(0)`. Provider endpoints are single-shot POSTs; the default (10 redirects)

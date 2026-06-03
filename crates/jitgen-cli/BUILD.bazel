@@ -9,5 +9,6 @@ jitgen_rust_binary(
         "@crates//:clap",
         "@crates//:clap_complete",
         "@crates//:serde_json",
+        "@crates//:sigpipe",
     ],
 )

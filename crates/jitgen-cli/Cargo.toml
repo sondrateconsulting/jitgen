@@ -18,3 +18,10 @@ jitgen-report.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 serde_json.workspace = true
+sigpipe.workspace = true
+
+[dev-dependencies]
+# Test-only. Lets tests/broken_pipe.rs create a pipe and close the read end BEFORE spawning the child,
+# so the child's first stdout write deterministically hits a no-reader pipe (EPIPE) — no spawn/drop
+# scheduling race, no pipe-buffer-size dependence. (std::io::pipe is 1.87+, above the 1.85 MSRV.)
+os_pipe = "1"

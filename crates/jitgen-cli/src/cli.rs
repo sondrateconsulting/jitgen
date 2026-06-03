@@ -643,13 +643,16 @@ fn cmd_doctor(a: DoctorArgs) -> ExitCode {
 /// sandbox — e.g. `jitgen completions zsh > ~/.zsh/completions/_jitgen`. Built via `build_command()`
 /// (same tree as the real CLI, version included), so the script always matches the live flag surface.
 ///
-/// Uses `Generator::try_generate` rather than the free `clap_complete::generate`, which `.expect()`s on
-/// write errors: `jitgen completions zsh | head` closes the pipe early, and a broken-pipe write must be
-/// a clean exit, not a panic (exit 101).
+/// Broken-pipe handling: on Unix the global `sigpipe::reset()` in `main()` already turns a closed-pipe
+/// write into a quiet SIGPIPE exit, so `jitgen completions zsh | head` ends before the `Err` arm below
+/// is reached. This per-command catch is the guard on non-Unix, where `sigpipe::reset()` is a no-op —
+/// `try_generate` (not the free `clap_complete::generate`, which `.expect()`s on write errors) surfaces
+/// the broken pipe as an `io::Error` so the match exits cleanly instead of panicking (exit 101).
 fn cmd_completions(a: CompletionsArgs) -> ExitCode {
     match write_completions(a.shell, &mut std::io::stdout()) {
         Ok(()) => ExitCode::SUCCESS,
-        // A closed pipe (`jitgen completions zsh | head`) is a clean exit, not a failure.
+        // A closed pipe (`jitgen completions zsh | head`) is a clean exit, not a failure. (Reached on
+        // non-Unix; on Unix the global SIGPIPE reset has already ended the process by this point.)
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => fail(&format!("jitgen completions: {e}")),
     }
