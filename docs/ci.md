@@ -13,6 +13,23 @@ See also: [user-guide.md](user-guide.md) · [security.md](security.md) ·
 > finding as "a reviewer should look here", not "this PR is wrong". See
 > [The gate is nondeterministic](#the-gate-is-nondeterministic-with-a-real-provider).
 
+## Smoke-test jitgen on the runner first (no secrets)
+
+Before wiring a provider key and a real catch run, confirm jitgen actually **runs and catches** on your
+runner with one command — **no API key, no secrets, fully offline**:
+
+```bash
+jitgen demo --format sarif > jitgen-demo.sarif   # exits 0; valid SARIF with one strong-catch result
+```
+
+`jitgen demo` builds an embedded seeded-bug repo and runs the **real** catch pipeline against it
+(replaying a recorded LLM response), so a green `jitgen demo` proves the binary and the
+catch→assess→SARIF path work on this runner. (It runs its own fixture on the **constrained-local**
+tier, so it does **not** exercise the isolating sandbox — bwrap/firejail/sandbox-exec/Docker — that a
+real `jitgen run` would auto-select here; use `jitgen doctor` to check that.) It validates the
+**pipeline**, not LLM generation *quality* — that needs the real-provider run below. Use it as a cheap
+CI health check (or run it locally before you invest in secrets).
+
 ## The model
 
 On a pull request, run a `--mode catch` generation across `base..head`:

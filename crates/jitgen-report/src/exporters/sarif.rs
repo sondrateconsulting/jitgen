@@ -163,6 +163,7 @@ mod tests {
             mutant: None,
             changed_path: None,
             changed_line: None,
+            evidence: None,
             reproduction: "cargo test".into(),
         });
         let v: Value = serde_json::from_str(&render(&r)).unwrap();
@@ -193,6 +194,7 @@ mod tests {
                 mutant: None,
                 changed_path: None,
                 changed_line: None,
+                evidence: None,
                 reproduction: "x".into(),
             });
             let v: Value = serde_json::from_str(&render(&r)).unwrap();
@@ -217,6 +219,7 @@ mod tests {
             mutant: None,
             changed_path: None,
             changed_line: None,
+            evidence: None,
             reproduction: "x".into(),
         });
         let raw = render(&r);
@@ -271,6 +274,7 @@ mod tests {
             mutant: None,
             changed_path: Some("src/auth/session.rs".into()),
             changed_line: Some(42),
+            evidence: None,
             reproduction: "cargo test".into(),
         });
         let v: Value = serde_json::from_str(&render(&r)).unwrap();
@@ -305,6 +309,7 @@ mod tests {
             mutant: None,
             changed_path: None,
             changed_line: None,
+            evidence: None,
             reproduction: "x".into(),
         });
         let v: Value = serde_json::from_str(&render(&r)).unwrap();
@@ -331,6 +336,7 @@ mod tests {
             mutant: None,
             changed_path: Some("src/lib.rs".into()),
             changed_line: None,
+            evidence: None,
             reproduction: "x".into(),
         });
         let v: Value = serde_json::from_str(&render(&r)).unwrap();

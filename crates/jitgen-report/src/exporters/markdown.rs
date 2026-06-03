@@ -266,6 +266,7 @@ mod tests {
             }),
             changed_path: None,
             changed_line: None,
+            evidence: None,
             reproduction: "cargo test --test jitgen_c".into(),
         });
         let md = render(&r);

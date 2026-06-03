@@ -155,6 +155,31 @@ pub struct MutantInfo {
     pub path: String,
 }
 
+/// The observed base+head execution evidence behind a catch — the deterministic facts the assessor
+/// gated on, so `jitgen demo` can SHOW *why* a catch fired rather than just asserting a verdict. All
+/// strings are producer-redacted and size-capped. **Populated only on the trusted `jitgen demo` path**
+/// (the orchestrator gates it behind `RunConfig::surface_evidence`): a production run is against a
+/// hostile repo, and persisting arbitrary test output into `report.json` is avoided. Optional +
+/// `serde(default)` on [`CatchReport`], so a `report.json` written before this existed still
+/// deserializes (resume/report back-compat; the report data-contract IRON RULE — no `SCHEMA_VERSION`
+/// bump).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatchEvidence {
+    /// Base-revision process exit code, if it exited normally (the base side is the *passing* run for a
+    /// weak catch, so this is normally 0 — observed, not enforced by this type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_exit_code: Option<i32>,
+    /// Head-revision process exit code, if it exited normally (the head side is the *failing* run, so
+    /// this is normally non-zero — observed, not enforced by this type).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_exit_code: Option<i32>,
+    /// Redacted, control-stripped, capped base-revision output (stdout then stderr).
+    pub base_output: String,
+    /// Redacted, control-stripped, capped head-revision output (stdout then stderr); carries the genuine
+    /// assertion marker the rule gate keyed on.
+    pub head_output: String,
+}
+
 /// A reported weak catch with its assessment (catch mode is report-only; never landed).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatchReport {
@@ -195,6 +220,11 @@ pub struct CatchReport {
     pub changed_line: Option<u32>,
     /// Redacted reproduction instructions.
     pub reproduction: String,
+    /// The observed base+head execution evidence (exit codes + redacted/capped output) the assessor
+    /// gated on. `#[serde(default)]` for the same back-compat reason as the location fields: a
+    /// pre-evidence `report.json` deserializes this as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<CatchEvidence>,
 }
 
 impl CatchReport {
@@ -210,6 +240,7 @@ impl CatchReport {
         changed_path: Option<String>,
         changed_line: Option<u32>,
         reproduction: impl Into<String>,
+        evidence: Option<CatchEvidence>,
     ) -> Self {
         Self {
             target: target.into(),
@@ -225,6 +256,7 @@ impl CatchReport {
             changed_path,
             changed_line,
             reproduction: reproduction.into(),
+            evidence,
         }
     }
 }
@@ -294,6 +326,12 @@ mod tests {
                 Some("src/a.rs".into()),
                 Some(12),
                 "cargo test --test jitgen_a",
+                Some(CatchEvidence {
+                    base_exit_code: Some(0),
+                    head_exit_code: Some(101),
+                    base_output: "ok".into(),
+                    head_output: "assertion `left == right` failed".into(),
+                }),
             )],
             rejected: vec![RejectedCandidate {
                 target: "t0".into(),
@@ -324,6 +362,7 @@ mod tests {
             Some("app/x.py".into()),
             Some(7),
             "pytest test_x.py",
+            None,
         );
         assert_eq!(c.class, CatchClass::WeakCatch);
         assert_eq!(c.decision, CatchDecision::StrongCatch);
@@ -331,6 +370,7 @@ mod tests {
         assert_eq!(c.bucket, TpBucket::VeryHigh);
         assert_eq!(c.changed_path.as_deref(), Some("app/x.py"));
         assert_eq!(c.changed_line, Some(7));
+        assert_eq!(c.evidence, None);
     }
 
     #[test]
@@ -360,6 +400,38 @@ mod tests {
         // The rest of the catch is intact.
         assert_eq!(back.catches[0].decision, CatchDecision::StrongCatch);
         assert_eq!(back.catches[0].target, "t0");
+    }
+
+    #[test]
+    fn catch_report_back_compat_without_evidence_field() {
+        // IRON RULE: a report.json written before `evidence` existed must still deserialize,
+        // defaulting it to None (resume/report back-compat; no SCHEMA_VERSION bump).
+        let mut v = serde_json::to_value(sample()).unwrap();
+        let catch = v["catches"][0].as_object_mut().unwrap();
+        assert!(
+            catch.contains_key("evidence"),
+            "sample should carry evidence"
+        );
+        catch.remove("evidence");
+        let back: RunReport = serde_json::from_value(v).unwrap();
+        assert_eq!(back.catches[0].evidence, None);
+        assert_eq!(back.catches[0].decision, CatchDecision::StrongCatch);
+    }
+
+    #[test]
+    fn catch_evidence_roundtrips_and_survives_a_strong_catch_report() {
+        // The evidence the demo/report renders round-trips losslessly and carries the failing-run
+        // marker the rule gate keyed on.
+        let r = sample();
+        let ev = r.catches[0]
+            .evidence
+            .as_ref()
+            .expect("sample carries evidence");
+        assert_eq!(ev.base_exit_code, Some(0));
+        assert_eq!(ev.head_exit_code, Some(101));
+        assert!(ev.head_output.contains("assertion"));
+        let j = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<RunReport>(&j).unwrap(), r);
     }
 
     #[test]

@@ -26,11 +26,36 @@ All default behavior is **offline and deterministic** — generation uses a buil
 (no API keys, no network). Real providers are opt-in and trusted-config only (see
 [Configuration](#configuration-trusted-vs-repo)).
 
+## See a real catch first: `jitgen demo`
+
+The fastest way to understand jitgen is to watch it catch a real bug — **offline, no API key**:
+
+```bash
+jitgen demo                    # human transparency view (the default)
+jitgen demo --keep             # also keep the seeded repo + print by-hand reproduction commands
+jitgen demo --format sarif     # the exact SARIF a CI gate would upload
+```
+
+`demo` builds a tiny **seeded-bug repo** (a correct `/bin/sh` `add` on the base revision; a `+`→`-`
+operator-swap regression on the head revision) and runs jitgen's **real** catch pipeline against it,
+replaying a **recorded** LLM response in place of a live call. It prints the regression diff, the
+generated test, the **real** sandbox runs on base (passes) and head (fails with an assertion), and the
+verdict — a **strong catch** — with no network and no key.
+
+> **Honesty boundary.** Because the LLM response is replayed (not live), the demo validates jitgen's
+> *pipeline* end to end — diff parsing, sandboxed execution, catch classification, the flake-filter,
+> the strong-catch assessment, and reporting — but **not** LLM generation *quality*. Seeing jitgen
+> catch bugs in **your** code needs a real provider: see [From the demo to your repo](#from-the-demo-to-your-repo).
+
+With `--keep`, the printed reproduction commands run the generated test against base and head with
+plain `git` and `/bin/sh` — **no jitgen in the loop** — so you can confirm the pass→fail yourself.
+
 ## First contact: `analyze` (no setup required)
 
-The safe first thing to run is **`analyze`** — a non-executing preview. It needs **no test toolchains,
-no API key, and no sandbox**: it reads only the git objects for `base..head` and reports the diff, the
-languages and build tools it detected, and the **risk-ranked targets** it *would* generate tests for.
+The safe first thing to run **on your own repo** is **`analyze`** — a non-executing preview. It needs
+**no test toolchains, no API key, and no sandbox**: it reads only the git objects for `base..head` and
+reports the diff, the languages and build tools it detected, and the **risk-ranked targets** it *would*
+generate tests for.
 
 ```bash
 # --repo defaults to the current directory and --head to HEAD, so inside your repo:
@@ -245,6 +270,23 @@ error (exit 1) with a one-line fix hint; see [troubleshooting.md](troubleshootin
 The **state root** resolves as: `--state-dir` → `JITGEN_STATE_DIR` → `$XDG_STATE_HOME/jitgen` →
 `~/.local/state/jitgen` (Linux) / `~/Library/Application Support/jitgen` (macOS). It is always created
 **outside** the target repo as a private `0700` directory.
+
+## From the demo to your repo
+
+The [demo](#see-a-real-catch-first-jitgen-demo) proves jitgen's pipeline works, but it replays a
+recorded response — to catch bugs in **your** code you need a real provider. Three steps:
+
+1. **Configure a real provider** in a trusted config file outside the repo (Anthropic, an
+   OpenAI-compatible endpoint, or a `local` server) and enable it with `--real-llm` — see
+   [Real LLM providers](#real-llm-providers) just below for the config and the key-from-env rule.
+2. **Confirm readiness:** `jitgen doctor --config <file> --real-llm` reports the provider it would use
+   and whether the key env var is set, **without** calling the API.
+3. **Run catch mode on a diff:** `jitgen run --repo . --base main --mode catch --format sarif --config <file> --real-llm`.
+   Start it **advisory** (surface findings, don't block) and wire it into CI per [docs/ci.md](ci.md);
+   turn the [findings gate](#findings-gate---fail-on-catch) on once you trust its strong-catch calls.
+
+Read [Operating a real provider](#operating-a-real-provider-cost-data-and-egress) first: a real
+provider calls a paid API and sends (redacted, capped) code off the host.
 
 ## Real LLM providers
 

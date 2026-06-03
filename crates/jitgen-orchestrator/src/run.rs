@@ -20,7 +20,7 @@ use jitgen_core::{
 use jitgen_gitintake::{
     diff_revisions, open_repo, read_blob_at, reject_unsafe_rel, resolve_commit,
 };
-use jitgen_llm::make_provider;
+use jitgen_llm::{make_provider, LlmProvider};
 use jitgen_report::{RunReport, RunSummary, REPORT_SCHEMA_VERSION};
 use jitgen_sandbox::{ExecPolicy, Sandbox};
 use jitgen_state::{RunHandle, RunMeta, RunStore, StepStatus, STATE_SCHEMA_VERSION};
@@ -62,7 +62,22 @@ const MANIFEST_NAMES: &[&str] = &[
 ];
 
 /// Run JIT generation end-to-end and return the assembled report (also persisted as `report.json`).
+///
+/// Production entry point: the LLM provider is selected from trusted config by
+/// [`make_provider`](jitgen_llm::make_provider) (the offline mock unless `--real-llm` + a real kind).
 pub fn run_jit_generation(opts: &RunOptions) -> Result<RunReport> {
+    run_jit_generation_inner(opts, None)
+}
+
+/// The body of [`run_jit_generation`], with an **optional injected provider** for the trusted
+/// `jitgen demo` path (`crate::demo`). When `injected` is `Some`, that provider drives generation
+/// instead of [`make_provider`]; when `None` the production master-switch selection is used, so the
+/// hostile-repo-facing `make_provider`/`provider_is_mock`/config-parser path is byte-identical. This is
+/// `pub(crate)`: there is **no** public "inject any provider" API and **no** config route to it.
+pub(crate) fn run_jit_generation_inner(
+    opts: &RunOptions,
+    injected: Option<Box<dyn LlmProvider>>,
+) -> Result<RunReport> {
     let repo = open_repo(&opts.repo)?;
     let repo_abs = opts.repo.canonicalize()?.to_string_lossy().into_owned();
     let base_oid = resolve_commit(&repo, &opts.base)?;
@@ -92,7 +107,15 @@ pub fn run_jit_generation(opts: &RunOptions) -> Result<RunReport> {
     // Persist the trusted config so `resume` can reconstruct the run without re-specifying flags.
     persist_trusted(&run, &opts.trusted)?;
 
-    let report = drive_run(&store, &run, &repo, base_oid, head_oid, &opts.trusted)?;
+    let report = drive_run(
+        &store,
+        &run,
+        &repo,
+        base_oid,
+        head_oid,
+        &opts.trusted,
+        injected,
+    )?;
     store.set_run_status(&run_id, "completed")?;
     Ok(report)
 }
@@ -126,12 +149,19 @@ pub fn resume_run(state_root: &Path, run_id: &str) -> Result<RunReport> {
     let run = store.open_run(run_id)?;
     let trusted = load_trusted(&run)?;
     store.set_run_status(run_id, "running")?;
-    let report = drive_run(&store, &run, &repo, base_oid, head_oid, &trusted)?;
+    // Resume always uses the production provider selection: the injected demo provider is never
+    // persisted, so a resumed run reconstructs the mock/real provider from the stored trusted config.
+    let report = drive_run(&store, &run, &repo, base_oid, head_oid, &trusted, None)?;
     store.set_run_status(run_id, "completed")?;
     Ok(report)
 }
 
 /// The shared run body used by both `run` and `resume`.
+///
+/// `injected` is the trusted-only provider override for `jitgen demo` (`crate::demo`); `None` (the
+/// `run`/`resume` default) selects the provider from trusted config via [`make_provider`], so the
+/// hostile-repo-facing selection path is unchanged.
+#[allow(clippy::too_many_arguments)]
 fn drive_run(
     store: &RunStore,
     run: &RunHandle,
@@ -139,6 +169,7 @@ fn drive_run(
     base_oid: Oid,
     head_oid: Oid,
     trusted: &TrustedConfig,
+    injected: Option<Box<dyn LlmProvider>>,
 ) -> Result<RunReport> {
     let changes = diff_revisions(repo, &base_oid.to_string(), &head_oid.to_string())?;
     let snapshot = build_snapshot(repo, head_oid, &changes)?;
@@ -156,9 +187,16 @@ fn drive_run(
     let targets = registry.analyze(&adapter_ctx, &changes);
     let ranked = select(targets, trusted.max_tests);
 
-    let provider = make_provider(&resolved);
+    // Trusted demo override (`crate::demo`) drives generation when present; otherwise the production
+    // master-switch selection (offline mock unless real-LLM + a real kind). A repo cannot reach either.
+    // The demo (the ONLY injector) is also the ONLY path allowed to surface raw base/head execution
+    // output as report evidence — a production run is against a hostile repo and must not persist its
+    // (only secret-redacted) test output into report.json (S1).
+    let surface_evidence = injected.is_some();
+    let provider = injected.unwrap_or_else(|| make_provider(&resolved));
     let sandbox = build_sandbox(trusted)?;
-    let run_config = run_config_from(trusted);
+    let mut run_config = run_config_from(trusted);
+    run_config.surface_evidence = surface_evidence;
     let overlays_root = run.dir().join("overlays");
     std::fs::create_dir_all(&overlays_root)?;
     let state_root = store.root().to_path_buf();

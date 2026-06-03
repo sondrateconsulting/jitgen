@@ -9,6 +9,18 @@ run state and report formats.
 ## [Unreleased]
 
 ### Added
+- **`jitgen demo` — offline proof that catch mode catches a real bug (T1).** A new subcommand that, with
+  **no API key and no network**, builds a tiny embedded seeded-bug repo (a correct `/bin/sh` `add` on the
+  base revision; a `+`→`-` operator-swap regression on head) and runs jitgen's **real** catch pipeline
+  against it — replaying a *recorded* LLM response — to produce a genuine **strong catch**. The human
+  output is deliberately transparent: it shows the regression diff, the generated test, the real base
+  (pass) and head (fail-with-assertion) sandbox runs, and the verdict, plus an explicit honesty boundary
+  that it validates the *pipeline* (parsing, sandboxed execution, classification, flake-filter,
+  assessment, reporting) **not LLM generation quality**. `--keep` writes the generated test into the kept
+  repo and prints by-hand reproduction commands (plain `git` + `/bin/sh`, no jitgen); `--format sarif`
+  emits the exact code-scanning artifact a CI gate would upload. Closes the acquisition gap where the
+  offline mock yields zero catches, so a cold evaluator could not see jitgen's value without first wiring
+  a real provider and secrets. The README and user guide now lead with it. (T1)
 - **Community & disclosure files (WS4).** A root [`SECURITY.md`](SECURITY.md) vulnerability-disclosure
   policy (GitHub private vulnerability reporting; scope tied to the threat model in
   [docs/security.md](docs/security.md)), a [`CONTRIBUTING.md`](CONTRIBUTING.md) (the Cargo + Bazel dual

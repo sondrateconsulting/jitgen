@@ -16,7 +16,7 @@ use jitgen_feedback::{
 };
 use jitgen_llm::{LlmProvider, LlmRequest};
 use jitgen_materialize::test_path;
-use jitgen_report::{AcceptedTest, CatchReport, MutantInfo, RejectedCandidate};
+use jitgen_report::{AcceptedTest, CatchEvidence, CatchReport, MutantInfo, RejectedCandidate};
 use serde::{Deserialize, Serialize};
 
 /// Tunables for a run (all trusted / cost bounds).
@@ -31,6 +31,16 @@ pub struct RunConfig {
     /// Consult the LLM judge during assessment (only meaningful with a real provider; the mock
     /// degrades to rules-only, so we gate it on `real_llm` to keep offline runs deterministic).
     pub real_llm: bool,
+    /// Surface the raw base/head execution output as [`CatchReport`] evidence. **Off in production**:
+    /// a real run is against a HOSTILE repo, and persisting arbitrary (only secret-redacted) test
+    /// output into `report.json` could disclose absolute overlay/state/home paths or other
+    /// attacker-chosen text. It is enabled **only** on the trusted `jitgen demo` path (`crate::demo`),
+    /// whose fixture is jitgen's own content, so the demo can show the genuine passing/failing runs.
+    ///
+    /// `pub(crate)`, NOT `pub`: this is a security-controlled toggle, not a user tunable. External
+    /// callers can still build a `RunConfig` via `..Default::default()` (which leaves it `false`) but
+    /// cannot set it — the only writer is `drive_run` (gated on the trusted injected provider).
+    pub(crate) surface_evidence: bool,
 }
 
 impl Default for RunConfig {
@@ -43,6 +53,7 @@ impl Default for RunConfig {
             flake_cfg: FlakeConfig::default(),
             assess_cfg: AssessConfig::default(),
             real_llm: false,
+            surface_evidence: false,
         }
     }
 }
@@ -297,7 +308,41 @@ fn report_assessed_catch(
         Some(report_path(&rt.target.path)),
         Some(rt.target.span.start),
         redact(&reproduction(language, &candidate.rel_path)).text,
+        // The deterministic base+head evidence the assessor gated on, surfaced (redacted + capped) so
+        // `jitgen demo` can SHOW the passing/failing runs. Gated to the demo path only: a production
+        // run against a hostile repo must NOT persist arbitrary test output into the report (S1).
+        cfg.surface_evidence.then(|| catch_evidence(exec)),
     ));
+}
+
+/// Max chars of redacted base/head output kept per side in a [`CatchEvidence`] (bounds the report
+/// artifact; the sandbox already caps the raw output, this is a defensive report-side bound).
+const MAX_EVIDENCE_OUTPUT: usize = 4096;
+
+/// Surface the observed base+head execution as redacted, control-stripped, size-capped evidence: exit
+/// codes plus a `stdout`-then-`stderr` snippet per side. Redaction is idempotent over the sandbox's
+/// already-redacted output (producer-redacts contract); the failing-side snippet carries the genuine
+/// assertion marker the rule gate keyed on.
+fn catch_evidence(exec: &jitgen_core::CatchExecution) -> CatchEvidence {
+    CatchEvidence {
+        base_exit_code: exec.base.exit_code,
+        head_exit_code: exec.head.exit_code,
+        base_output: evidence_output(&exec.base),
+        head_output: evidence_output(&exec.head),
+    }
+}
+
+fn evidence_output(r: &jitgen_core::ExecutionResult) -> String {
+    let combined = match (r.stdout.trim().is_empty(), r.stderr.trim().is_empty()) {
+        (false, false) => format!("{}\n{}", r.stdout, r.stderr),
+        (true, false) => r.stderr.clone(),
+        (false, true) => r.stdout.clone(),
+        (true, true) => r.stdout.clone(), // both blank → blank
+    };
+    // `sanitize` = strip controls (ANSI/CR/CSI/bidi) THEN cap, applied AFTER redaction — so the
+    // evidence persisted into `report.json` is control-free like every other report string
+    // (producer redacts AND control-strips), not just at the display layer.
+    jitgen_report::sanitize(&redact(&combined).text, MAX_EVIDENCE_OUTPUT)
 }
 
 fn build_template(
@@ -419,6 +464,122 @@ mod tests {
             stdout: String::new(),
             stderr: stderr.into(),
         }
+    }
+
+    #[test]
+    fn evidence_output_redacts_secrets_and_caps_size() {
+        // A surfaced base/head snippet must redact a secret-shaped token BEFORE it is persisted (the
+        // redact runs on the full string before the cap, so no partial secret can survive truncation)
+        // and stay bounded by MAX_EVIDENCE_OUTPUT (defense-in-depth on top of the sandbox's own cap).
+        let secret = "ghp_0123456789abcdefghijABCDEFGHIJ012345";
+        let mut r = result(ExecOutcome::Failed, "");
+        r.stdout = format!("leaking {secret} here");
+        let out = evidence_output(&r);
+        assert!(
+            !out.contains("ghp_0123456789"),
+            "secret must be redacted: {out}"
+        );
+
+        // Oversized output is capped.
+        let mut big = result(ExecOutcome::Failed, "");
+        big.stdout = "x".repeat(MAX_EVIDENCE_OUTPUT * 2);
+        let capped = evidence_output(&big);
+        assert!(
+            capped.len() <= MAX_EVIDENCE_OUTPUT + 16, // +cap marker
+            "evidence is bounded: {} chars",
+            capped.len()
+        );
+
+        // Control bytes are stripped at the producer (not just at the display layer), so the persisted
+        // evidence in report.json is control-free like every other report string.
+        let mut ctrl = result(ExecOutcome::Failed, "");
+        ctrl.stdout = "boom \u{1b}[31mred\u{7}\rFORGED".into();
+        let cleaned = evidence_output(&ctrl);
+        assert!(
+            !cleaned.contains('\u{1b}') && !cleaned.contains('\u{7}') && !cleaned.contains('\r')
+        );
+        assert!(
+            cleaned.contains("boom") && cleaned.contains("red"),
+            "{cleaned}"
+        );
+    }
+
+    #[test]
+    fn evidence_output_covers_stderr_only_and_combined_sides() {
+        // The three non-empty branches: stdout-only, stderr-only, and both combined (stdout\nstderr).
+        let mut so = result(ExecOutcome::Failed, "");
+        so.stdout = "out only".into();
+        assert_eq!(evidence_output(&so), "out only");
+
+        let se = result(ExecOutcome::Failed, "err only"); // result() sets stderr, empty stdout
+        assert_eq!(evidence_output(&se), "err only");
+
+        let mut both = result(ExecOutcome::Failed, "the stderr");
+        both.stdout = "the stdout".into();
+        assert_eq!(evidence_output(&both), "the stdout\nthe stderr");
+    }
+
+    #[test]
+    fn surface_evidence_on_populates_both_sides_of_the_report_evidence() {
+        // The positive of the off-by-default test: with surface_evidence=true (the demo path), the
+        // catch report carries BOTH base and head evidence — proving the toggle actually populates it.
+        let mut cfg = RunConfig {
+            mode: Mode::Catch,
+            strategy: Strategy::DodgyDiff,
+            ..RunConfig::default()
+        };
+        cfg.surface_evidence = true;
+        let out = process_target(
+            &MockProvider::new(),
+            &WeakCatchExec,
+            &ranked(SymbolKind::Function),
+            &ctx(),
+            &[],
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(out.catches[0].decision, CatchDecision::StrongCatch);
+        let ev = out.catches[0]
+            .evidence
+            .as_ref()
+            .expect("demo path surfaces evidence");
+        // WeakCatchExec returns exit 0 on both sides via the `result()` helper, so both are collected.
+        assert_eq!(ev.base_exit_code, Some(0));
+        assert_eq!(ev.head_exit_code, Some(0));
+        // The head side carries the failing-run assertion text the gate keyed on.
+        assert!(
+            ev.head_output.contains("assertion failed"),
+            "{:?}",
+            ev.head_output
+        );
+    }
+
+    #[test]
+    fn catch_evidence_off_by_default_so_production_reports_carry_no_raw_output() {
+        // S1: a default (production) RunConfig must NOT surface raw base/head output. Only the demo
+        // path (`surface_evidence = true`) populates it; this prevents hostile-repo output reaching
+        // report.json. The dodgy-diff strong-catch path with the default config yields no evidence.
+        let cfg = RunConfig {
+            mode: Mode::Catch,
+            strategy: Strategy::DodgyDiff,
+            ..RunConfig::default()
+        };
+        assert!(!cfg.surface_evidence, "evidence is off by default");
+        let out = process_target(
+            &MockProvider::new(),
+            &WeakCatchExec,
+            &ranked(SymbolKind::Function),
+            &ctx(),
+            &[],
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(out.catches.len(), 1);
+        assert_eq!(out.catches[0].decision, CatchDecision::StrongCatch);
+        assert!(
+            out.catches[0].evidence.is_none(),
+            "production config must not surface execution evidence"
+        );
     }
 
     fn ranked(kind: SymbolKind) -> RankedTarget {

@@ -12,6 +12,7 @@ mod analyze;
 mod checkout;
 mod config;
 mod context;
+mod demo;
 mod error;
 mod executor;
 mod gate;
@@ -27,6 +28,7 @@ mod test_repo;
 
 pub use analyze::{analyze, AnalyzeOptions, AnalyzeReport};
 pub use config::{load_repo_config, parse_backend, parse_strategy, resolve_trusted, TrustedFlags};
+pub use demo::{run_demo, DemoLang, DemoOptions, DemoOutcome};
 pub use doctor::{describe_provider, run_doctor, DoctorReport};
 pub use error::{OrchestratorError, Result};
 pub use executor::SandboxExecutor;

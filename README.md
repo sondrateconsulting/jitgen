@@ -57,11 +57,32 @@ docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
 Full recipes (checksum verification, the "container IS the sandbox" CI model) live in
 [docs/ci.md → Getting jitgen onto the runner](docs/ci.md#getting-jitgen-onto-the-runner).
 
+## See it catch a real bug — one command, no setup
+
+Before anything else, watch jitgen catch a real regression **offline, with no API key**:
+
+```bash
+jitgen demo        # builds a tiny seeded-bug repo and runs the REAL catch pipeline against it
+```
+
+It prints exactly what happened: the planted regression (a `+`→`-` operator swap), the test jitgen
+generated for it, the **real** sandbox runs on the good revision and the buggy one (one passes, one
+fails with an assertion), and the verdict — a **strong catch**. Add `--keep` to also get the seeded
+repo plus copy-paste commands that reproduce the catch **by hand** (just `git` and `/bin/sh`, no jitgen
+in the loop), or `--format sarif` to see the exact code-scanning artifact a CI gate would upload.
+
+**What it proves — and what it doesn't.** The demo replays a *recorded* LLM response, so it validates
+jitgen's whole pipeline end to end (diff parsing, sandboxed execution, catch classification, the
+flake-filter, the strong-catch assessment, and reporting) **offline** — but **not** LLM generation
+*quality*, which needs a real provider on your own code (see [docs/ci.md](docs/ci.md) and
+[docs/user-guide.md](docs/user-guide.md#from-the-demo-to-your-repo)).
+
 ## Quickstart
 
-Your first contact is **`analyze`** — a non-executing preview that needs **no toolchains, no API key,
-and no sandbox**. It reads only the git objects for your diff and prints the changed files, the
-languages/build tools it detected, and the risk-ranked targets it *would* generate tests for:
+Now point jitgen at **your** repo. Start with **`analyze`** — a non-executing preview that needs **no
+toolchains, no API key, and no sandbox**. It reads only the git objects for your diff and prints the
+changed files, the languages/build tools it detected, and the risk-ranked targets it *would* generate
+tests for:
 
 ```bash
 # Run these from the root of the repo you want to test (not the jitgen source tree); jitgen opens
@@ -96,6 +117,7 @@ jitgen resume  --run-id <id>
 jitgen report  --run-id <id> [--format human|json|markdown|junit|sarif|patch]
 jitgen doctor
 jitgen completions <bash|zsh|fish|powershell|elvish>       # print a shell completion script
+jitgen demo    [--lang sh] [--format human|sarif] [--keep] # offline proof: catch a seeded bug, no API key
 
 # Trusted options (CLI / user config outside the repo only): --state-dir, --config,
 # --sandbox <backend>, --unsafe-local-execution. See docs/architecture.md + docs/security.md.

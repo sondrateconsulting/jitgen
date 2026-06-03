@@ -322,6 +322,7 @@ mod tests {
             changed_path: None,
             changed_line: None,
             reproduction: "cargo test".into(),
+            evidence: None,
         }
     }
 

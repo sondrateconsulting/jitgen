@@ -10,11 +10,11 @@ use crate::hints::{gate_modifiers_without_master_note, mock_empty_run_hint, user
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use jitgen_core::{Mode, ProviderKind, SandboxBackend, Strategy};
 use jitgen_orchestrator::{
-    analyze, apply_to_repo, gate_exit_code, load_report, resolve_trusted, resume_run,
-    run_jit_generation, state_root_for, AnalyzeOptions, Baseline, GateVerdict, RunOptions,
-    TrustedFlags, DEFAULT_FAIL_THRESHOLD,
+    analyze, apply_to_repo, gate_exit_code, load_report, resolve_trusted, resume_run, run_demo,
+    run_jit_generation, state_root_for, AnalyzeOptions, Baseline, DemoLang, DemoOptions,
+    DemoOutcome, GateVerdict, RunOptions, TrustedFlags, DEFAULT_FAIL_THRESHOLD,
 };
-use jitgen_report::{render, sanitize_line, ReportFormat, RunReport};
+use jitgen_report::{render, sanitize, sanitize_line, ReportFormat, RunReport};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -46,6 +46,8 @@ enum Command {
     Doctor(DoctorArgs),
     /// Print a shell completion script to stdout (bash, zsh, fish, powershell, elvish).
     Completions(CompletionsArgs),
+    /// Offline proof (no API key) that catch mode catches a real seeded regression.
+    Demo(DemoArgs),
 }
 
 #[derive(Debug, Args)]
@@ -185,6 +187,20 @@ struct CompletionsArgs {
     shell: clap_complete::Shell,
 }
 
+#[derive(Debug, Args)]
+struct DemoArgs {
+    /// Which seeded fixture to run (`sh` = portable /bin/sh, no toolchain).
+    #[arg(long, value_enum, default_value_t = DemoLangArg::Sh)]
+    lang: DemoLangArg,
+    /// Output format: `human` (the teaching view) or `sarif` (the CI artifact a gate would upload).
+    #[arg(long, value_enum, default_value_t = DemoFormatArg::Human)]
+    format: DemoFormatArg,
+    /// Keep the seeded repo on disk (with the generated test written in) and print by-hand
+    /// reproduction commands, instead of cleaning it up.
+    #[arg(long)]
+    keep: bool,
+}
+
 // ---- value enums --------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -222,6 +238,23 @@ enum FormatArg {
 enum AnalyzeFormat {
     Human,
     Json,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DemoLangArg {
+    Sh,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DemoFormatArg {
+    Human,
+    Sarif,
+}
+
+impl From<DemoLangArg> for DemoLang {
+    fn from(l: DemoLangArg) -> Self {
+        match l {
+            DemoLangArg::Sh => DemoLang::Sh,
+        }
+    }
 }
 
 impl From<ModeArg> for Mode {
@@ -341,6 +374,7 @@ pub fn run() -> ExitCode {
         Command::Report(a) => cmd_report(a),
         Command::Doctor(a) => cmd_doctor(a),
         Command::Completions(a) => cmd_completions(a),
+        Command::Demo(a) => cmd_demo(a),
     }
 }
 
@@ -674,6 +708,163 @@ fn write_completions(
     shell.try_generate(&cmd, out)
 }
 
+/// `jitgen demo`: prove offline (no API key) that catch mode catches a real seeded regression. Builds
+/// the embedded `/bin/sh` fixture, runs the REAL catch pipeline (recorded provider, no LLM judge), and
+/// prints a radically transparent account — the diff, the generated test, the real base/head runs, and
+/// the verdict — so the green result reads as evidence, not theater. `--format sarif` emits the exact
+/// SARIF a CI gate would upload instead. Exits 0 on a successful demonstration (informational, never
+/// the findings gate); exits non-zero if the demo cannot run on this platform (non-unix), if it fails
+/// to produce its catch (a jitgen bug), or if writing the output fails (other than a broken pipe).
+fn cmd_demo(a: DemoArgs) -> ExitCode {
+    let outcome = match run_demo(&DemoOptions {
+        lang: a.lang.into(),
+        keep: a.keep,
+    }) {
+        Ok(o) => o,
+        Err(e) => return fail(&format!("jitgen demo: {e}")),
+    };
+    if outcome.report.catches.is_empty() {
+        return fail("jitgen demo: the demo did not produce a catch (this is a jitgen bug — please report it)");
+    }
+    let rendered = match a.format {
+        DemoFormatArg::Sarif => render(&outcome.report, ReportFormat::Sarif),
+        DemoFormatArg::Human => render_demo_human(&outcome),
+    };
+    // Write via `write_all` (not `print!`, which panics on a write error): `jitgen demo | head` closes
+    // the pipe early, and a broken-pipe write must be a clean exit, not a panic — same as completions.
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(rendered.as_bytes()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => fail(&format!("jitgen demo: cannot write output: {e}")),
+    }
+}
+
+/// Cap on a demo multi-line output block handed to `sanitize` (controls stripped, newlines kept). The
+/// evidence is already redacted + capped (`MAX_EVIDENCE_OUTPUT`) by the producer, so this never binds in
+/// practice; it bounds the render defensively.
+const DEMO_BLOCK_CAP: usize = 16 * 1024;
+
+/// Append one base/head sandbox-run block to the demo output: `<label> -> exit <N> (<verdict>):` then
+/// the run's (already redacted + capped) captured output, control-stripped and indented (or
+/// `(no output)`). Shows both runs so the passing base and the failing head are both visible (anti-theater).
+fn push_run_block(out: &mut String, label: &str, exit: Option<i32>, verdict: &str, output: &str) {
+    out.push_str(&format!(
+        "    {label} -> exit {} ({verdict}):\n",
+        exit.map_or_else(|| "?".into(), |c| c.to_string())
+    ));
+    let body = sanitize(output, DEMO_BLOCK_CAP); // strip controls, keep newlines
+    if body.trim().is_empty() {
+        out.push_str("        (no output)\n");
+    } else {
+        for l in body.lines() {
+            out.push_str(&format!("        {l}\n"));
+        }
+    }
+}
+
+/// Render the human "transparency" view of a demo run. Every value derived from the run (the diff, the
+/// generated test, the captured base/head output, paths) is routed through the report crate's
+/// control-stripping sinks — `sanitize` for multi-line blocks (keeps `\n`), `safe_for_terminal` for
+/// single-line fields — even though the demo fixture is jitgen's own content, to honor the
+/// producer-redacts / renderer-escapes split uniformly.
+fn render_demo_human(o: &DemoOutcome) -> String {
+    let line = |s: &str| safe_for_terminal(s, 2048); // single-line, control-stripped
+    let block = |s: &str| sanitize(s, DEMO_BLOCK_CAP); // multi-line, controls stripped, newlines kept
+    let mut out = String::new();
+    out.push_str("jitgen demo — offline proof that catch mode catches a real regression\n");
+    out.push_str(
+        "LLM: recorded fixture (no network, no API key)   ·   sandbox: constrained-local\n",
+    );
+    out.push_str(
+        "strategy: dodgy-diff (single-shot seeded-regression demo; the default catch strategy is intent-aware)\n\n",
+    );
+
+    let catch = match o.report.catches.first() {
+        Some(c) => c,
+        None => {
+            out.push_str("(no catch was produced — this is unexpected)\n");
+            return out;
+        }
+    };
+
+    out.push_str(&format!(
+        "Seeded repo:   base {} -> head {}\n",
+        line(&o.base_short),
+        line(&o.head_short)
+    ));
+    if let Some(kept) = &o.kept_repo {
+        out.push_str(&format!(
+            "Kept at:       {}\n",
+            line(&kept.display().to_string())
+        ));
+    }
+    out.push_str(&format!(
+        "\nThe regression (diff base->head of {}):\n",
+        line(&o.production_path)
+    ));
+    for l in block(&o.regression_diff).lines() {
+        out.push_str(&format!("    {l}\n"));
+    }
+    out.push_str(&format!(
+        "\nRecorded LLM response -> generated test ({}):\n",
+        line(&catch.path)
+    ));
+    for l in block(&catch.source).lines() {
+        out.push_str(&format!("    {l}\n"));
+    }
+    out.push_str("\nSandbox runs (real, no network):\n");
+    match &catch.evidence {
+        // Show both runs' captured output (control-stripped) — the passing base proves the test really
+        // ran, the failing head carries the genuine assertion the gate keyed on.
+        Some(ev) => {
+            push_run_block(&mut out, "base", ev.base_exit_code, "PASS", &ev.base_output);
+            push_run_block(&mut out, "head", ev.head_exit_code, "FAIL", &ev.head_output);
+        }
+        // Anti-theater: the demo ALWAYS surfaces evidence (`surface_evidence` is on for the injected
+        // path). If it is ever absent, say so LOUDLY rather than leave an empty section under a green
+        // verdict — an empty "Sandbox runs" with a StrongCatch is the exact theater the demo prevents.
+        None => out.push_str(
+            "    (!) execution evidence unavailable — the demo should always surface it; this is a \
+             jitgen bug, please report it.\n",
+        ),
+    }
+    out.push_str("\nVerdict (rules-only, no LLM judge):\n");
+    out.push_str(&format!(
+        "    base passed · head failed with an assertion · stable  =>  {:?} (tp {:.2})\n",
+        catch.decision, catch.tp_probability
+    ));
+    out.push_str("\n[ok] jitgen caught the seeded regression. This validated parsing + sandbox execution +\n");
+    out.push_str(
+        "     classification + flake-filter + assessment + reporting — NOT LLM quality (that\n",
+    );
+    out.push_str("     needs a real provider; see `jitgen doctor` and docs/ci.md).\n");
+
+    if let Some(kept) = &o.kept_repo {
+        let kp = line(&kept.display().to_string());
+        out.push_str("\nReproduce it yourself (no jitgen, no key):\n");
+        out.push_str(&format!("    cd {kp}\n"));
+        out.push_str(&format!(
+            "    git checkout {} -- {} && /bin/sh {} ; echo \"exit $?\"   # 0 = PASS\n",
+            line(&o.base_short),
+            line(&o.production_path),
+            line(&catch.path)
+        ));
+        out.push_str(&format!(
+            "    git checkout {} -- {} && /bin/sh {} ; echo \"exit $?\"   # nonzero = FAIL (assertion)\n",
+            line(&o.head_short),
+            line(&o.production_path),
+            line(&catch.path)
+        ));
+        out.push_str("    (only the production file is checked out per revision; the generated test stays in place)\n");
+    } else {
+        out.push_str(
+            "\nRe-run with `jitgen demo --keep` for the seeded repo + by-hand reproduction commands.\n",
+        );
+    }
+    out
+}
+
 /// Cap on a sanitized error message printed to the terminal. Generous for any real jitgen error
 /// envelope (a provider's own error text is already snippet-capped far below this upstream); tight
 /// enough to bound a hostile flood.
@@ -880,6 +1071,203 @@ mod tests {
     }
 
     #[test]
+    fn clap_parses_demo_subcommand_and_flags() {
+        // No args: defaults (sh, human, no keep).
+        let cli = Cli::try_parse_from(["jitgen", "demo"]).expect("parses with defaults");
+        match cli.command {
+            Command::Demo(a) => {
+                assert_eq!(a.lang, DemoLangArg::Sh);
+                assert_eq!(a.format, DemoFormatArg::Human);
+                assert!(!a.keep);
+            }
+            _ => panic!("expected demo"),
+        }
+        // Explicit flags.
+        let cli = Cli::try_parse_from([
+            "jitgen", "demo", "--lang", "sh", "--format", "sarif", "--keep",
+        ])
+        .expect("parses with flags");
+        match cli.command {
+            Command::Demo(a) => {
+                assert_eq!(a.format, DemoFormatArg::Sarif);
+                assert!(a.keep);
+            }
+            _ => panic!("expected demo"),
+        }
+        // A bogus format/lang is a usage error.
+        assert!(Cli::try_parse_from(["jitgen", "demo", "--format", "patch"]).is_err());
+        assert!(Cli::try_parse_from(["jitgen", "demo", "--lang", "cobol"]).is_err());
+    }
+
+    /// A synthetic demo outcome for renderer tests (no sandbox run). `base_output`/`head_output` can
+    /// carry an injection probe or multiple lines to exercise the control-stripping / block path.
+    fn demo_outcome(keep: Option<&str>, base_output: &str, head_output: &str) -> DemoOutcome {
+        use jitgen_core::{CatchClass, CatchDecision, TpBucket};
+        use jitgen_report::{CatchEvidence, CatchReport, RunSummary};
+        let report = RunReport {
+            schema_version: jitgen_report::REPORT_SCHEMA_VERSION,
+            jitgen_version: "0.0.0-test".into(),
+            run_id: "run-1".into(),
+            repo: "/tmp/demo".into(),
+            base: "base".into(),
+            head: "head".into(),
+            mode: Mode::Catch,
+            strategy: Strategy::DodgyDiff,
+            summary: RunSummary {
+                catches: 1,
+                ..RunSummary::default()
+            },
+            accepted: vec![],
+            catches: vec![CatchReport {
+                target: "t0".into(),
+                language: "demo".into(),
+                path: "jitgen-tests/math_t0.test.txt".into(),
+                source: ". ./math.sh\ngot=\"$(add 2 3)\"\n".into(),
+                class: CatchClass::WeakCatch,
+                decision: CatchDecision::StrongCatch,
+                tp_probability: 1.0,
+                bucket: TpBucket::VeryHigh,
+                rationale: "clean assertion".into(),
+                mutant: None,
+                changed_path: Some("math.sh".into()),
+                changed_line: Some(2),
+                reproduction: "by hand".into(),
+                evidence: Some(CatchEvidence {
+                    base_exit_code: Some(0),
+                    head_exit_code: Some(1),
+                    base_output: base_output.into(),
+                    head_output: head_output.into(),
+                }),
+            }],
+            rejected: vec![],
+            warnings: vec![],
+        };
+        DemoOutcome {
+            report,
+            kept_repo: keep.map(PathBuf::from),
+            base_short: "bf8a18d80276".into(),
+            head_short: "b4e7ab240b70".into(),
+            production_path: "math.sh".into(),
+            regression_diff: "- add() { echo $(( $1 + $2 )); }\n+ add() { echo $(( $1 - $2 )); }"
+                .into(),
+        }
+    }
+
+    #[test]
+    fn demo_human_render_shows_the_transparency_contract() {
+        let out = render_demo_human(&demo_outcome(
+            None,
+            "ok: add(2,3) == 5",
+            "assertion failed: add(2,3) expected 5 but got -1",
+        ));
+        // The honesty label: recorded, offline, no key.
+        assert!(
+            out.contains("recorded fixture (no network, no API key)"),
+            "{out}"
+        );
+        // The strategy disclosure (not the default).
+        assert!(
+            out.contains("dodgy-diff") && out.contains("intent-aware"),
+            "{out}"
+        );
+        // The seeded revisions + the regression diff.
+        assert!(
+            out.contains("bf8a18d80276") && out.contains("b4e7ab240b70"),
+            "{out}"
+        );
+        assert!(out.contains("- add() { echo $(( $1 + $2 )); }"), "{out}");
+        assert!(out.contains("+ add() { echo $(( $1 - $2 )); }"), "{out}");
+        // The generated test body + its path.
+        assert!(out.contains("jitgen-tests/math_t0.test.txt"), "{out}");
+        assert!(out.contains("got=\"$(add 2 3)\""), "{out}");
+        // The REAL base/head runs with the assertion line + the verdict.
+        assert!(out.contains("base -> exit 0 (PASS)"), "{out}");
+        assert!(
+            out.contains("ok: add(2,3) == 5"),
+            "base output shown: {out}"
+        );
+        assert!(out.contains("head -> exit 1 (FAIL)"), "{out}");
+        assert!(
+            out.contains("assertion failed: add(2,3) expected 5 but got -1"),
+            "{out}"
+        );
+        assert!(out.contains("StrongCatch"), "{out}");
+        // The honesty boundary: validates the pipeline, NOT LLM quality.
+        assert!(out.contains("NOT LLM quality"), "{out}");
+        // Without --keep, the user is pointed at --keep (no by-hand commands yet).
+        assert!(out.contains("--keep"), "{out}");
+        assert!(
+            !out.contains("git checkout"),
+            "no repro commands without --keep: {out}"
+        );
+    }
+
+    #[test]
+    fn demo_human_keep_prints_byhand_reproduction() {
+        let out = render_demo_human(&demo_outcome(
+            Some("/tmp/kept-demo"),
+            "ok",
+            "assertion failed",
+        ));
+        assert!(
+            out.contains("Kept at:") && out.contains("/tmp/kept-demo"),
+            "{out}"
+        );
+        assert!(out.contains("Reproduce it yourself"), "{out}");
+        // The commands check out only the production file per revision and run the generated test.
+        assert!(
+            out.contains("git checkout bf8a18d80276 -- math.sh"),
+            "{out}"
+        );
+        assert!(
+            out.contains("git checkout b4e7ab240b70 -- math.sh"),
+            "{out}"
+        );
+        assert!(
+            out.contains("/bin/sh jitgen-tests/math_t0.test.txt"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn demo_human_control_strips_untrusted_fields() {
+        // The producer redacts; the RENDERER must still control-strip so a hostile byte in any
+        // run-derived field can't recolor the terminal, move the cursor, or forge a line.
+        // Probe BOTH base and head output (head multi-line), to cover both evidence sides.
+        let base_probe = "ok \u{1b}[32mgreen\u{1b}]0;title\u{7}";
+        let head_probe = "assertion \u{1b}[31mfailed\rFORGED\nsecond line of failure";
+        let out = render_demo_human(&demo_outcome(None, base_probe, head_probe));
+        assert!(!out.contains('\u{1b}'), "no ESC survives: {out:?}");
+        assert!(!out.contains('\u{7}'), "no BEL survives");
+        assert!(!out.contains('\r'), "no CR survives");
+        // The textual content is preserved as inert data on both sides, including the 2nd head line.
+        assert!(out.contains("green"), "base content kept as data: {out}");
+        assert!(out.contains("failed"), "head content kept as data: {out}");
+        assert!(
+            out.contains("second line of failure"),
+            "multi-line head rendered: {out}"
+        );
+    }
+
+    #[test]
+    fn demo_human_missing_evidence_is_loud_not_a_silent_empty_section() {
+        // Anti-theater regression guard: if a catch ever lacks evidence, the render must say so
+        // LOUDLY — never leave an empty "Sandbox runs" section sitting under a green StrongCatch.
+        let mut o = demo_outcome(None, "ok", "assertion failed");
+        o.report.catches[0].evidence = None;
+        let out = render_demo_human(&o);
+        assert!(out.contains("Sandbox runs"), "{out}");
+        assert!(
+            out.contains("execution evidence unavailable") && out.contains("jitgen bug"),
+            "missing evidence must be flagged loudly: {out}"
+        );
+        assert!(
+            !out.contains("-> exit"),
+            "no run block should be rendered without evidence: {out}"
+        );
+    }
+
+    #[test]
     fn completions_script_is_generated_and_carries_the_live_flag_surface() {
         // Exercise the EXACT path cmd_completions uses (write_completions: build + try_generate), for
         // bash AND zsh — a bare/unbuilt Cli::command() omits clap's auto --version, the codex regression.
@@ -958,6 +1346,7 @@ mod tests {
                 }),
                 changed_path: Some("src/a.rs".into()),
                 changed_line: Some(1),
+                evidence: None,
                 reproduction: "cargo test".into(),
             }],
             rejected: vec![],

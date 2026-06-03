@@ -151,6 +151,7 @@ mod tests {
             mutant: None,
             changed_path: None,
             changed_line: None,
+            evidence: None,
             reproduction: "cargo test".into(),
         });
         let xml = render(&r);
@@ -177,6 +178,7 @@ mod tests {
             mutant: None,
             changed_path: None,
             changed_line: None,
+            evidence: None,
             reproduction: "x".into(),
         });
         let xml = render(&r);
@@ -209,6 +211,7 @@ mod tests {
                 mutant: None,
                 changed_path: None,
                 changed_line: None,
+                evidence: None,
                 reproduction: "x".into(),
             });
         }
@@ -226,6 +229,7 @@ mod tests {
             mutant: None,
             changed_path: None,
             changed_line: None,
+            evidence: None,
             reproduction: "x".into(),
         });
         let xml = render(&r);

@@ -11,6 +11,7 @@ mod mock;
 mod parse;
 mod provider;
 mod real;
+mod recorded;
 mod util;
 mod validate;
 
@@ -20,4 +21,5 @@ pub use provider::{
     make_provider, provider_is_mock, GenerationError, LlmProvider, LlmRequest, LlmResponse, Result,
 };
 pub use real::provider_key_env;
+pub use recorded::RecordedProvider;
 pub use validate::{validate_candidate, ValidationResult};
