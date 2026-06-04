@@ -34,6 +34,7 @@ The fastest way to understand jitgen is to watch it catch a real bug — **offli
 jitgen demo                    # human transparency view (the default)
 jitgen demo --keep             # also keep the seeded repo + print by-hand reproduction commands
 jitgen demo --format sarif     # the exact SARIF a CI gate would upload
+jitgen demo --lang rust        # opt-in: the same proof through a real cargo crate (needs a local toolchain)
 ```
 
 `demo` builds a tiny **seeded-bug repo** (a correct `/bin/sh` `add` on the base revision; a `+`→`-`
@@ -49,6 +50,12 @@ verdict — a **strong catch** — with no network and no key.
 
 With `--keep`, the printed reproduction commands run the generated test against base and head with
 plain `git` and `/bin/sh` — **no jitgen in the loop** — so you can confirm the pass→fail yourself.
+
+`--lang rust` runs the same proof through a real `cargo` crate (jitgen's built-in rust adapter +
+`cargo test`) instead of `/bin/sh`. It is **opt-in and best-effort**: it needs a working local
+`cargo`/`rustup` toolchain (which it discovers and injects into the sandbox), and falls back with a
+clear message — pointing you at the default `jitgen demo` — when none is found. Its `--keep`
+reproduction runs `cargo test`.
 
 ## First contact: `analyze` (no setup required)
 

@@ -7,6 +7,7 @@
 //! `TrustedConfig` extension and does not change the trust boundary.
 
 use jitgen_core::{SandboxBackend, TrustedConfig};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Default wall-clock timeout for one sandboxed execution.
@@ -67,6 +68,10 @@ pub struct ExecPolicy {
     /// Extra env var **names** to pass through, on top of the hardcoded baseline. Still subject to
     /// the deny-patterns in [`crate::env`].
     pub env_allowlist_extra: Vec<String>,
+    /// Extra env vars to **set to explicit values** (name → value), on top of the hardcoded baseline.
+    /// Trusted-only; still screened by the deny-patterns AND the managed/baseline guard in
+    /// [`crate::env`] (**deny beats set**; a managed/baseline name can never be shadowed).
+    pub env_set_extra: BTreeMap<String, String>,
     /// Wall-clock timeout for one execution.
     pub timeout: Duration,
     /// Cap on captured stdout/stderr each, bytes.
@@ -86,6 +91,7 @@ impl ExecPolicy {
             allow_unsafe_local: t.unsafe_local_execution,
             shell_allowed: t.shell_allowed,
             env_allowlist_extra: t.env_allowlist_extra.clone(),
+            env_set_extra: t.env_set_extra.clone(),
             timeout: DEFAULT_TIMEOUT,
             output_cap_bytes: DEFAULT_OUTPUT_CAP_BYTES,
             limits: ResourceLimits::default(),
@@ -121,11 +127,17 @@ mod tests {
             unsafe_local_execution: true,
             shell_allowed: true,
             env_allowlist_extra: vec!["CI".into()],
+            env_set_extra: BTreeMap::from([("RUSTUP_HOME".into(), "/home/u/.rustup".into())]),
             ..TrustedConfig::default()
         };
         let p = ExecPolicy::from_trusted(&t);
         assert!(p.allow_unsafe_local);
         assert!(p.shell_allowed);
         assert_eq!(p.env_allowlist_extra, vec!["CI"]);
+        assert_eq!(
+            p.env_set_extra.get("RUSTUP_HOME").map(String::as_str),
+            Some("/home/u/.rustup"),
+            "env_set_extra flows from trusted config verbatim"
+        );
     }
 }

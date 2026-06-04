@@ -8,7 +8,7 @@ Task: T1 (P1) — close the mock-default empty-evaluation gap
 > the decisions, and the architecture as built. The **shipped code is authoritative** for exact
 > behavior and output layout (`crates/jitgen-cli/src/cli.rs` `cmd_demo`/`render_demo_human`,
 > `crates/jitgen-orchestrator/src/demo.rs` `run_demo`); illustrative sketches below may differ in
-> incidental detail. Substantive decisions (the `/bin/sh` substrate, the deferred `--lang rust`, the
+> incidental detail. Substantive decisions (the `/bin/sh` substrate, the follow-up `--lang rust`, the
 > demo-gated evidence, the security model) match the implementation.
 
 ## Problem / premise
@@ -93,13 +93,13 @@ for **zero** T1 benefit. The demo needs an *embedded* fixture, not a user-suppli
 (Codex finding #7 explicitly warns the recorded provider must **not** be representable in repo config,
 env, or normal trusted-config paths.)
 
-## Recommended approach: A (demo) + B (onboarding docs), substrate = `/bin/sh` (rust opt-in deferred)
+## Recommended approach: A (demo) + B (onboarding docs), substrate = `/bin/sh` (rust opt-in is a follow-up)
 
 ### CLI surface
 
-`jitgen demo [--lang sh] [--format human|sarif] [--keep]`  (the planned `--lang rust` was **deferred** —
-see [Rust opt-in deferred to a follow-up](#rust-opt-in-deferred-to-a-follow-up); the CLI ships
-`--lang sh` only)
+`jitgen demo [--lang sh|rust] [--format human|sarif] [--keep]`  (`--lang sh` is the default; `--lang
+rust` is the opt-in follow-up shipped on the new `env_set_extra` capability — see the Rust opt-in
+section below)
 
 - No required args, no key, no network. Default `--lang sh`.
 - `--keep`: materialize the demo repo to a stable path, **explicitly write the generated test** into
@@ -250,27 +250,45 @@ illustrative; the **shipped `cli.rs::render_demo_human` is authoritative** for t
 ### Why `/bin/sh` is the default substrate (not rust/cargo)
 
 The sandbox env (`crates/jitgen-sandbox/src/env.rs`) gives the child a **synthetic `HOME`** and does
-**not** pass `RUSTUP_HOME`/`CARGO_HOME`, so `cargo test` (a rustup proxy) fails to find the toolchain
+**not** inherit `RUSTUP_HOME`/`CARGO_HOME`, so `cargo test` (a rustup proxy) fails to find the toolchain
 on a typical install. `/bin/sh` is **proven** to run under the constrained-local tier by the existing
 `e2e_tests.rs`, needs zero toolchain, and is fully offline/deterministic. So `/bin/sh` is the robust
-substrate; the rust variant was **deferred** (next section).
+default; the rust variant is **opt-in** and clearly best-effort (it now injects the toolchain env via
+the trusted `env_set_extra` capability — see below).
 
-### Rust opt-in deferred to a follow-up
+### Rust opt-in (`--lang rust`) — SHIPPED in a follow-up (on the new `env_set_extra` capability)
 
-A zero-dep cargo crate (`add` correct on base, regression on head) with a generated integration test
-run via `cargo test` was the planned opt-in. **It is deferred.** A feasibility spike (2026-06-03)
-confirmed the WS1 gotcha is fundamental, not incidental: under the sandbox's **synthetic `HOME`**,
-`cargo` (a rustup proxy) fails with `rustup could not choose a version of cargo` unless `RUSTUP_HOME`
-**and** `CARGO_HOME` are injected. But jitgen's sandbox env is an **allowlist-passthrough from the
-parent env** (`jitgen-sandbox/src/env.rs`) — it can only forward vars the parent *already has*, and the
-common default-rustup user has both **unset**. Injecting a value would need `std::env::set_var`
-(process-global, races with any concurrent env read → UB under the parallel test runner, and `unsafe`
-in edition 2024 vs `#![forbid(unsafe_code)]`) or a new sandbox "env-set" feature (a change to the
-**hostile-repo-facing** sandbox, far outside T1's scope). The `/bin/sh` demo already **fully closes
-T1** (a cold evaluator sees a real catch in one command). Both the Codex cold-read and the adversarial
-doc review recommended deferring rust; the user was re-asked a final time **with the spike data** and
-chose to **defer** (the deferral fallback they set). Filed as a backlog follow-up needing a sandbox
-env-set capability. The CLI ships `--lang sh` only.
+A zero-dep cargo crate (`add` correct on base, operator-swap regression on head) run through jitgen's
+**real rust adapter** (`cargo test`) — producing a genuine offline `StrongCatch`. Originally deferred
+because the spike confirmed a fundamental gotcha: under the sandbox's **synthetic `HOME`**, `cargo` (a
+rustup proxy) fails with `rustup could not choose a version of cargo` unless `RUSTUP_HOME` **and**
+`CARGO_HOME` are present, and jitgen's sandbox env was a pure **allowlist-passthrough** that can only
+forward vars the parent *already has* (the common default-rustup user has both **unset**), and
+`std::env::set_var` is process-global UB + `unsafe` vs `#![forbid(unsafe_code)]`. The follow-up adds the
+missing primitive and builds the demo on it:
+
+- **Prerequisite — `env_set_extra` (the sandbox "env-set" capability).** A `TrustedConfig.env_set_extra:
+  BTreeMap<String,String>` threaded into `jitgen-sandbox::build_env`, letting **trusted config** set a
+  sandbox env var to an explicit **value** (not just passthrough). It is screened by the **same**
+  credential/socket/loader deny-patterns and managed/baseline guard as `env_allowlist_extra` (**deny
+  beats set; PATH/HOME/TMPDIR/TERM/locale can never be shadowed**), plus a **value guard** requiring a
+  path-valued var to be an **absolute** path with every `:`-component absolute (a relative value would
+  resolve under the hostile child cwd = overlay) — only an explicit `SCALAR_VALUE_ALLOWLIST`
+  (`CARGO_NET_OFFLINE`) carries a non-absolute scalar — and a control-character rejection. **Trusted-only:**
+  it is absent from `RepoConfig`, listed in `FORBIDDEN_REPO_KEYS` (snake + kebab), `ResolvedConfig` is
+  not `Deserialize`, and **no CLI/`JITGEN_*` hook** exposes it (the demo sets it programmatically), so a
+  hostile repo can never reach it. Reviewed under its own security gate (security-reviewer +
+  `/santa-loop` Opus+Codex to NICE).
+- **The demo.** `run_rust_demo` discovers + **canonicalizes** `RUSTUP_HOME` (env or `$HOME/.rustup`) and
+  `CARGO_HOME` (env or a fresh private temp) to absolute, outside-repo paths, sets `CARGO_NET_OFFLINE=true`,
+  and injects them via `env_set_extra` so the sandboxed `cargo` resolves its toolchain. A `cargo
+  --version` precheck (per-command env, **never** `set_var`) fails fast with a pointer to the default
+  `/bin/sh` demo when no toolchain is usable. The fixture commits **no `.jitgen.yaml`** — jitgen's
+  built-in rust adapter handles `.rs` natively, so a generic `extensions: [rs]` adapter would
+  double-target `src/lib.rs`; relying on the real adapter yields exactly one catch.
+- **Host-fragile by nature, mirrored by tests.** The end-to-end test is `#[ignore]`d (ADR-0009 native
+  convention; run with `cargo test -p jitgen-orchestrator -- --ignored`); a toolchain-free unit test
+  guards the fixture invariants. `--lang sh` stays the default.
 
 ## Security analysis
 
@@ -306,9 +324,9 @@ env-set capability. The CLI ships `--lang sh` only.
    Wires the engine to the CLI with the full anti-theater output contract (rendering the report's
    evidence fields from Step 1), the confined `--keep` test-write + by-hand reproduction, the non-unix
    guard, and the RAII temp-dir cleanup; CLI tests.
-3. **Rust opt-in (`--lang rust`)** — **DEFERRED** to a backlog follow-up (see the rust section above:
-   the feasibility spike confirmed it's host-fragile under the sandbox's synthetic HOME and the agreed
-   deferral fallback fired). The `/bin/sh` demo fully closes T1; the CLI ships `--lang sh` only.
+3. **Rust opt-in (`--lang rust`)** — **SHIPPED** in a follow-up on the new trusted `env_set_extra`
+   sandbox capability (see the rust section above). The `/bin/sh` demo fully closed T1; `--lang rust`
+   adds a best-effort, toolchain-injecting `cargo` proof and `--lang sh` stays the default.
 4. **Docs + onboarding (approach B) + CHANGELOG.** README + user-guide + ci.md: "see a real catch in
    one command (no key)" up front; the honest scope boundary; the guided real-provider eval (`doctor`
    + 3 steps) for their own repo; `[Unreleased]` CHANGELOG entry.
@@ -328,8 +346,8 @@ env-set capability. The CLI ships `--lang sh` only.
   boundary, the by-hand reproduction); `--format sarif` emits valid SARIF with one result; `--keep`
   prints a path that exists **and contains the written generated test**; non-unix guard message
   (cfg-gated).
-- Rust variant: **deferred** (not shipped) — when revived as a follow-up it gets a precheck-guarded
-  integration test, `#[ignore]` if it needs a live toolchain, mirroring the existing `native` convention.
+- Rust variant: **shipped** as a follow-up — a precheck-guarded integration test, `#[ignore]`d (it needs
+  a live toolchain), mirroring the existing `native` convention (ADR-0009).
 - Full gate: `./scripts/check.sh` (fmt + clippy -D warnings + test + release build + Bazel) and
   `./scripts/audit.sh`; Bazel `build`/`test //...` + `--version` parity.
 
@@ -353,7 +371,8 @@ env-set capability. The CLI ships `--lang sh` only.
   completion in-process and does not advertise resume; the kept repo (`--keep`) is for by-hand
   inspection, not `jitgen resume`.
 - **Rust env-fragility** — the feasibility spike confirmed it (sandbox synthetic HOME vs the rustup
-  proxy); the rust variant is **DEFERRED** (see the rust section). Only `--lang sh` ships.
+  proxy); the rust variant is **shipped** as a follow-up on the new `env_set_extra` capability (see the
+  rust section), with `--lang sh` remaining the default and a precheck for a clean fall-back.
 
 ## Distribution
 

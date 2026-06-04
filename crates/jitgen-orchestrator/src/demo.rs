@@ -20,17 +20,21 @@ use git2::{Oid, Repository, Signature};
 use jitgen_core::{Mode, SandboxBackend, Strategy, TrustedConfig};
 use jitgen_llm::RecordedProvider;
 use jitgen_report::RunReport;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Which seeded fixture / toolchain the demo uses. `Sh` (the portable, zero-toolchain default) is the
-/// only variant today; a `cargo` (`--lang rust`) fixture was **deferred** (the sandbox's synthetic
-/// HOME breaks the rustup proxy — see the design doc) and would add another variant here as a follow-up.
+/// Which seeded fixture / toolchain the demo uses. `Sh` is the portable, zero-toolchain default;
+/// `Rust` is an opt-in `cargo` fixture (best-effort: needs a working local rust toolchain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DemoLang {
     /// Generic `.jitgen.yaml` adapter running `/bin/sh` (no toolchain; runs under constrained-local).
     #[default]
     Sh,
+    /// A zero-dep `cargo` crate (correct `add` on base, operator-swap regression on head). Opt-in and
+    /// best-effort: requires a working local rust toolchain (`cargo`/`rustup`), which the demo discovers
+    /// and injects into the sandbox via the trusted `env_set_extra` capability.
+    Rust,
 }
 
 /// Options for [`run_demo`].
@@ -60,6 +64,8 @@ pub struct DemoOutcome {
     pub production_path: String,
     /// The base→head diff of the production file (for display).
     pub regression_diff: String,
+    /// Which fixture produced this outcome (drives the lang-specific by-hand reproduction in the CLI).
+    pub lang: DemoLang,
 }
 
 /// The seeded production file (correct on base; regressed on head).
@@ -98,6 +104,47 @@ echo "ok: add(2,3) == 5"
 ```
 "#;
 
+// ---- rust fixture (opt-in `--lang rust`) ---------------------------------------------------------
+
+/// Seeded production file for the rust fixture (correct on base; regressed on head).
+const RUST_PRODUCTION_PATH: &str = "src/lib.rs";
+
+/// Zero-dep cargo manifest. `edition = "2021"` for broad rustc compatibility (NOT 2024). The lib crate
+/// name is `jitgen_demo` — the generated integration test calls `jitgen_demo::add`.
+const CARGO_TOML: &str =
+    "[package]\nname = \"jitgen_demo\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n";
+
+/// Base (correct) production code: `add` sums its two arguments.
+const LIB_RS_BASE: &str =
+    "//! jitgen demo crate (offline rust fixture).\npub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}\n";
+
+/// Head (regressed) production code: a plausible operator-swap typo (`+` became `-`).
+const LIB_RS_HEAD: &str =
+    "//! jitgen demo crate (offline rust fixture).\npub fn add(a: i64, b: i64) -> i64 {\n    a - b\n}\n";
+
+// NB: the rust fixture commits NO `.jitgen.yaml`. jitgen's built-in **rust adapter** handles `.rs`
+// natively (tree-sitter target selection + `cargo test`), so a generic `.jitgen.yaml` with
+// `extensions: [rs]` would double-target `src/lib.rs` (rust adapter AND generic adapter → two catches).
+// Relying on the real rust adapter yields exactly one target/catch and exercises the genuine product
+// path; the demo's only job is to inject the toolchain env (`env_set_extra`) so `cargo` resolves under
+// the sandbox's synthetic HOME.
+
+/// The recorded LLM response for the rust fixture: a fenced `rust` integration test calling
+/// `jitgen_demo::add(2,3)`. It passes on base (2+3==5) and on head fails with a genuine `assert_eq!`
+/// panic — an assertion marker, no env-looking phrase. Downstream this is parsed, copied into `tests/`,
+/// and run by `cargo test` through the real pipeline.
+const RECORDED_RUST_RESPONSE: &str = r#"Here is a focused integration test for the changed `add` function:
+
+```rust
+// jitgen-generated test for add() (replayed from a recorded fixture)
+#[test]
+fn add_two_and_three_is_five() {
+    let got = jitgen_demo::add(2, 3);
+    assert_eq!(got, 5, "add(2,3) expected 5 but got {}", got);
+}
+```
+"#;
+
 /// Process-global nonce so concurrent demo runs never collide on a temp dir.
 static NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -116,6 +163,7 @@ pub fn run_demo(opts: &DemoOptions) -> Result<DemoOutcome> {
     }
     match opts.lang {
         DemoLang::Sh => run_sh_demo(opts.keep),
+        DemoLang::Rust => run_rust_demo(opts.keep),
     }
 }
 
@@ -155,18 +203,9 @@ fn run_sh_demo(keep: bool) -> Result<DemoOutcome> {
     let provider = Box::new(RecordedProvider::single(RECORDED_RESPONSE));
     let report = run_jit_generation_inner(&opts, Some(provider))?;
 
-    // On --keep, write the generated test into the kept repo (the real run materializes candidates only
-    // into ephemeral overlays that are deleted) so the printed by-hand reproduction actually works.
-    // Only the REPO is retained; `state_temp` still drops at function end → the state dir is cleaned.
-    let kept_repo = if keep {
-        if let Some(catch) = report.catches.first() {
-            // Confined writer (lexical + per-component symlink checks), never a bare fs::write.
-            crate::checkout::write_file(&repo_dir, &catch.path, catch.source.as_bytes())?;
-        }
-        Some(repo_temp.into_path()) // disarm the repo guard only; keep the repo tree
-    } else {
-        None // `repo_temp` drops here → repo tree removed
-    };
+    // On --keep, retain the repo (with the generated test written in) for by-hand inspection; only the
+    // REPO is kept — `state_temp` still drops at function end → the state dir is cleaned.
+    let kept_repo = finalize_kept_repo(keep, &repo_dir, &report, repo_temp)?;
 
     Ok(DemoOutcome {
         report,
@@ -175,7 +214,29 @@ fn run_sh_demo(keep: bool) -> Result<DemoOutcome> {
         head_short: short_oid(head),
         production_path: PRODUCTION_PATH.to_string(),
         regression_diff: regression_diff(MATH_SH_BASE, MATH_SH_HEAD),
+        lang: DemoLang::Sh,
     })
+}
+
+/// On `--keep`, write the generated test into the kept repo (the real run materializes candidates only
+/// into ephemeral overlays that `OverlayGuard` deletes, so the printed by-hand reproduction needs its
+/// own confined write) and return the retained repo path; without `--keep`, `repo_temp` drops here so
+/// the repo tree is removed. Shared by the sh and rust demos. The state / cargo-home temps are never
+/// retained (jitgen-internal bookkeeping).
+fn finalize_kept_repo(
+    keep: bool,
+    repo_dir: &Path,
+    report: &RunReport,
+    repo_temp: TempDir,
+) -> Result<Option<PathBuf>> {
+    if !keep {
+        return Ok(None); // `repo_temp` drops here → repo tree removed
+    }
+    if let Some(catch) = report.catches.first() {
+        // Confined writer (lexical + per-component symlink checks), never a bare fs::write.
+        crate::checkout::write_file(repo_dir, &catch.path, catch.source.as_bytes())?;
+    }
+    Ok(Some(repo_temp.into_path())) // disarm the repo guard only; keep the repo tree
 }
 
 /// Seed the two-commit fixture repo: base (correct) then head (regressed). Returns `(base, head)`.
@@ -192,6 +253,168 @@ fn seed_sh_repo(repo_dir: &Path) -> Result<(Oid, Oid)> {
     let head = commit(
         &repo,
         &[(PRODUCTION_PATH, MATH_SH_HEAD)],
+        "regress: add() subtracts instead of summing",
+    )?;
+    Ok((base, head))
+}
+
+/// Run the **opt-in** rust demo: a zero-dep `cargo` crate exercised through the same real catch
+/// pipeline as the `/bin/sh` demo. It is best-effort and host-fragile by nature — under the sandbox's
+/// synthetic `HOME`, `cargo` (a rustup proxy) cannot resolve a toolchain unless `RUSTUP_HOME`/
+/// `CARGO_HOME` are present, which this demo discovers and injects via the trusted `env_set_extra`
+/// capability. A precheck fails fast (pointing at the default `/bin/sh` demo) when no toolchain is
+/// usable, so a host without `cargo` gets a clear message instead of a confusing deep failure.
+fn run_rust_demo(keep: bool) -> Result<DemoOutcome> {
+    let repo_temp = TempDir::new("repo-rust")?;
+    let state_temp = TempDir::new("state-rust")?;
+    // A private `CARGO_HOME` fallback used **only when the parent env has no `CARGO_HOME`** (see
+    // `discover_rust_env`), so the demo never pollutes the default `~/.cargo`. Always cleaned up — even
+    // on `--keep` (jitgen-internal bookkeeping, like the state dir), and harmlessly unused when the
+    // parent already sets `CARGO_HOME`.
+    let cargo_temp = TempDir::new("cargo-home")?;
+    let repo_dir = repo_temp.path().to_path_buf();
+    let state_dir = state_temp.path().to_path_buf();
+
+    // Discover + canonicalize the toolchain env (absolute, outside-repo paths — which the sandbox's
+    // env_set_extra value guard requires), then verify it actually resolves a toolchain before doing
+    // the (slower) fixture build.
+    let env_set = discover_rust_env(cargo_temp.path())?;
+    cargo_precheck(&env_set)?;
+
+    let (base, head) = seed_rust_repo(&repo_dir)?;
+
+    let trusted = TrustedConfig {
+        mode: Mode::Catch,
+        strategy: Strategy::DodgyDiff,
+        sandbox_backend: SandboxBackend::Local,
+        unsafe_local_execution: true,
+        state_dir: Some(state_dir.to_string_lossy().into_owned()),
+        // The toolchain env the sandboxed `cargo` needs under the synthetic HOME (trusted, absolute).
+        env_set_extra: env_set,
+        ..TrustedConfig::default()
+    };
+
+    let opts = RunOptions {
+        repo: repo_dir.clone(),
+        base: base.to_string(),
+        head: head.to_string(),
+        trusted,
+    };
+
+    let provider = Box::new(RecordedProvider::single(RECORDED_RUST_RESPONSE));
+    let report = run_jit_generation_inner(&opts, Some(provider))?;
+
+    let kept_repo = finalize_kept_repo(keep, &repo_dir, &report, repo_temp)?;
+
+    Ok(DemoOutcome {
+        report,
+        kept_repo,
+        base_short: short_oid(base),
+        head_short: short_oid(head),
+        production_path: RUST_PRODUCTION_PATH.to_string(),
+        regression_diff: regression_diff(LIB_RS_BASE, LIB_RS_HEAD),
+        lang: DemoLang::Rust,
+    })
+}
+
+/// Discover the trusted toolchain env to inject for the rust demo: `RUSTUP_HOME` (from the parent env
+/// or `$HOME/.rustup`), `CARGO_HOME` (from the parent env or the fresh private temp), and
+/// `CARGO_NET_OFFLINE=true`. Both home paths are **canonicalized** so they are absolute and symlink-free
+/// (satisfying the sandbox value guard, and neutralizing any `/proc/self/cwd`-style pseudo-path); a
+/// missing `RUSTUP_HOME` fails fast with a pointer to the default `/bin/sh` demo.
+fn discover_rust_env(cargo_home_fallback: &Path) -> Result<BTreeMap<String, String>> {
+    let rustup_raw = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")))
+        .ok_or_else(|| {
+            rust_demo_unavailable("cannot determine RUSTUP_HOME (set RUSTUP_HOME or HOME)")
+        })?;
+    let rustup_home = rustup_raw.canonicalize().map_err(|e| {
+        rust_demo_unavailable(&format!(
+            "RUSTUP_HOME {} is not accessible ({e}) — install rustup, or set RUSTUP_HOME",
+            rustup_raw.display()
+        ))
+    })?;
+
+    let cargo_raw = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cargo_home_fallback.to_path_buf());
+    let cargo_home = cargo_raw.canonicalize().map_err(|e| {
+        rust_demo_unavailable(&format!(
+            "CARGO_HOME {} is not accessible ({e})",
+            cargo_raw.display()
+        ))
+    })?;
+
+    let mut env = BTreeMap::new();
+    env.insert("RUSTUP_HOME".to_string(), abs_string(&rustup_home)?);
+    env.insert("CARGO_HOME".to_string(), abs_string(&cargo_home)?);
+    // Belt-and-suspenders offline (the argv already passes `cargo test --offline`); a scalar value, so
+    // it is accepted by the sandbox value guard via the scalar allowlist.
+    env.insert("CARGO_NET_OFFLINE".to_string(), "true".to_string());
+    Ok(env)
+}
+
+/// Render a canonicalized path as an absolute env value, refusing a non-absolute result defensively
+/// (canonicalize already yields absolute; this makes the env_set_extra precondition explicit).
+fn abs_string(p: &Path) -> Result<String> {
+    if !p.is_absolute() {
+        return Err(rust_demo_unavailable(&format!(
+            "toolchain path {} is not absolute",
+            p.display()
+        )));
+    }
+    Ok(p.to_string_lossy().into_owned())
+}
+
+/// Probe that `cargo --version` runs with the discovered toolchain env. The env is applied to the
+/// **child command only** (`Command::env`) — never `std::env::set_var`, which would be process-global
+/// `unsafe`. On failure, point the evaluator at the default `/bin/sh` demo (no toolchain needed).
+fn cargo_precheck(env: &BTreeMap<String, String>) -> Result<()> {
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("--version");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    // Distinguish "cargo not on PATH / not spawnable" from "cargo ran but failed" (e.g. RUSTUP_HOME has
+    // no installed toolchain), and surface the underlying reason — both point at the default demo.
+    match cmd.output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(rust_demo_unavailable(&format!(
+            "`cargo --version` exited {} — check that RUSTUP_HOME has an installed toolchain",
+            o.status
+        ))),
+        Err(e) => Err(rust_demo_unavailable(&format!(
+            "`cargo` could not be run ({e}) — it must be on PATH"
+        ))),
+    }
+}
+
+/// A consistent "rust demo unavailable" error that always points at the zero-toolchain default.
+fn rust_demo_unavailable(detail: &str) -> OrchestratorError {
+    OrchestratorError::Invalid {
+        what: "rust-demo",
+        detail: format!(
+            "{detail}. The `--lang rust` demo needs a local rust toolchain; run `jitgen demo` \
+             (the default /bin/sh demo) which needs no toolchain."
+        ),
+    }
+}
+
+/// Seed the two-commit rust fixture repo: base (correct `add`) then head (operator-swap regression).
+fn seed_rust_repo(repo_dir: &Path) -> Result<(Oid, Oid)> {
+    let repo = Repository::init(repo_dir)?;
+    let base = commit(
+        &repo,
+        &[
+            ("Cargo.toml", CARGO_TOML),
+            (RUST_PRODUCTION_PATH, LIB_RS_BASE),
+        ],
+        "seed: correct add()",
+    )?;
+    let head = commit(
+        &repo,
+        &[(RUST_PRODUCTION_PATH, LIB_RS_HEAD)],
         "regress: add() subtracts instead of summing",
     )?;
     Ok((base, head))
@@ -428,5 +651,92 @@ mod tests {
         let d = regression_diff(MATH_SH_BASE, MATH_SH_HEAD);
         assert!(d.contains("- add() { echo $(( $1 + $2 )); }"), "{d}");
         assert!(d.contains("+ add() { echo $(( $1 - $2 )); }"), "{d}");
+    }
+
+    // ---- rust fixture (opt-in) -----------------------------------------------------------------
+
+    #[test]
+    fn rust_fixture_is_well_formed_without_a_toolchain() {
+        // No toolchain needed: the recorded response extracts a non-empty rust integration test that
+        // calls the crate (which jitgen's built-in rust adapter materializes into `tests/` and runs via
+        // `cargo test`), the manifest names the `jitgen_demo` lib crate, and the seeded diff is the
+        // operator swap. Guards the fixture invariants the `#[ignore]`d end-to-end test depends on.
+        let body = jitgen_llm::extract_code(RECORDED_RUST_RESPONSE);
+        assert!(
+            body.contains("jitgen_demo::add") && body.contains("assert_eq!"),
+            "rust test body: {body}"
+        );
+        assert!(
+            CARGO_TOML.contains("name = \"jitgen_demo\"")
+                && CARGO_TOML.contains("edition = \"2021\""),
+            "manifest names the crate + pins an edition: {CARGO_TOML}"
+        );
+        let d = regression_diff(LIB_RS_BASE, LIB_RS_HEAD);
+        assert!(d.contains("a + b") && d.contains("a - b"), "diff: {d}");
+    }
+
+    #[test]
+    #[ignore = "live rust toolchain; run with `cargo test -p jitgen-orchestrator -- --ignored` on a host with cargo"]
+    fn rust_demo_produces_a_strong_catch_offline() {
+        // The opt-in analogue of the headline sh proof: with no key and no network, the real sandbox +
+        // rules assessor turn the replayed rust test into a genuine StrongCatch against the seeded
+        // operator-swap regression — using the trusted env_set_extra capability to make `cargo` resolve
+        // its toolchain under the synthetic HOME. `#[ignore]`d because it needs a live toolchain (ADR-0009
+        // native convention); a precheck inside run_demo fails fast with a clear message when absent.
+        let outcome = run_demo(&DemoOptions {
+            lang: DemoLang::Rust,
+            keep: false,
+        })
+        .expect("rust demo runs (needs a local cargo toolchain)");
+        assert_eq!(outcome.lang, DemoLang::Rust);
+        let r = &outcome.report;
+        assert_eq!(r.mode, Mode::Catch);
+        assert_eq!(r.catches.len(), 1, "exactly one catch: {r:?}");
+        let catch = &r.catches[0];
+        assert_eq!(
+            catch.decision,
+            CatchDecision::StrongCatch,
+            "must be a StrongCatch, got {:?} ({})",
+            catch.decision,
+            catch.rationale
+        );
+        // It points at the changed production file, and runs the recorded candidate (not a plant).
+        assert_eq!(catch.changed_path.as_deref(), Some(RUST_PRODUCTION_PATH));
+        assert_eq!(
+            catch.source,
+            jitgen_llm::extract_code(RECORDED_RUST_RESPONSE),
+            "the catch must run the recorded rust test"
+        );
+        // Real execution evidence: base passes, head fails with a genuine assertion (no env-marker).
+        let ev = catch.evidence.as_ref().expect("evidence populated");
+        assert_eq!(
+            ev.base_exit_code,
+            Some(0),
+            "base passed: {:?}",
+            ev.base_output
+        );
+        assert_ne!(ev.head_exit_code, Some(0), "head failed");
+        let head = ev.head_output.to_ascii_lowercase();
+        assert!(
+            head.contains("panicked") || head.contains("assertion"),
+            "head evidence carries the assertion marker: {:?}",
+            ev.head_output
+        );
+        for marker in [
+            "no such file",
+            "command not found",
+            "not found",
+            "permission denied",
+        ] {
+            assert!(
+                !head.contains(marker),
+                "head output must carry no env-marker ({marker:?}): {:?}",
+                ev.head_output
+            );
+        }
+        assert!(
+            r.accepted.is_empty(),
+            "catch mode never accepts landable tests"
+        );
     }
 }

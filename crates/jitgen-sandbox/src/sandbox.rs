@@ -41,17 +41,12 @@ impl Sandbox {
     /// Select a backend fail-closed from the detected-available set.
     pub fn new(available: &[Backend], policy: ExecPolicy) -> Result<Self> {
         let backend = select(available, &policy)?;
-        // Surface (don't swallow) any trusted `env_allowlist_extra` entries the deny-patterns refuse.
-        let warnings = policy
-            .env_allowlist_extra
-            .iter()
-            .filter(|n| crate::env::is_denied(n))
-            .map(|n| {
-                format!(
-                    "env_allowlist_extra {n:?} ignored: matches a credential/socket deny-pattern"
-                )
-            })
-            .collect();
+        // Surface (don't swallow) every refusal `build_env` would apply to the trusted
+        // `env_allowlist_extra` / `env_set_extra` entries — deny-pattern AND managed/baseline shadow —
+        // so a misconfigured trusted env (e.g. an attempt to set HOME/PATH, or a denied credential/loader
+        // var) is visible to the operator at construction, not silently dropped at run time. Computed via
+        // the SAME `extra_refusal` classifier `build_env` uses, so the surfaced set cannot drift.
+        let warnings = crate::env::extra_refusal_warnings(&policy);
         Ok(Self {
             backend,
             policy,
@@ -192,6 +187,59 @@ mod tests {
         );
         // A clean entry produces no warning.
         assert!(!sb.warnings().iter().any(|w| w.contains("\"CI\"")));
+    }
+
+    #[test]
+    fn denied_env_set_extra_is_surfaced_as_a_warning() {
+        // The explicit-set capability is screened identically: a credential-shaped name surfaces as
+        // refused at construction, a clean toolchain var (RUSTUP_HOME) does not.
+        let policy = ExecPolicy {
+            backend: SandboxBackend::SandboxExec,
+            env_set_extra: std::collections::BTreeMap::from([
+                ("AWS_SECRET_ACCESS_KEY".into(), "x".into()),
+                ("RUSTUP_HOME".into(), "/home/u/.rustup".into()),
+            ]),
+            ..ExecPolicy::default()
+        };
+        let sb = Sandbox::new(&[Backend::SandboxExec], policy).unwrap();
+        assert!(
+            sb.warnings()
+                .iter()
+                .any(|w| w.contains("env_set_extra") && w.contains("AWS_SECRET_ACCESS_KEY")),
+            "denied env_set_extra should surface: {:?}",
+            sb.warnings()
+        );
+        // A clean entry produces no warning.
+        assert!(!sb.warnings().iter().any(|w| w.contains("RUSTUP_HOME")));
+    }
+
+    #[test]
+    fn managed_shadow_in_env_set_extra_surfaces_as_a_warning() {
+        // Regression guard for the silent-failure finding: a managed/baseline shadow attempt in trusted
+        // config is REFUSED by build_env but must ALSO be visible to the operator at construction — not
+        // only deny-pattern names. Sandbox::new now surfaces both classes via the shared classifier.
+        let policy = ExecPolicy {
+            backend: SandboxBackend::SandboxExec,
+            env_set_extra: std::collections::BTreeMap::from([
+                ("HOME".into(), "/evil".into()),
+                ("PATH".into(), "/overlay/evil".into()),
+                ("home".into(), "/evil2".into()),
+                ("RUSTUP_HOME".into(), "/home/u/.rustup".into()),
+            ]),
+            ..ExecPolicy::default()
+        };
+        let sb = Sandbox::new(&[Backend::SandboxExec], policy).unwrap();
+        for n in ["HOME", "PATH", "home"] {
+            assert!(
+                sb.warnings()
+                    .iter()
+                    .any(|w| w.contains(n) && w.contains("managed")),
+                "managed/baseline shadow {n:?} must surface: {:?}",
+                sb.warnings()
+            );
+        }
+        // The clean toolchain var is accepted (no warning).
+        assert!(!sb.warnings().iter().any(|w| w.contains("RUSTUP_HOME")));
     }
 
     #[cfg(unix)]

@@ -189,7 +189,8 @@ struct CompletionsArgs {
 
 #[derive(Debug, Args)]
 struct DemoArgs {
-    /// Which seeded fixture to run (`sh` = portable /bin/sh, no toolchain).
+    /// Which seeded fixture to run: `sh` (portable /bin/sh, no toolchain — the default) or `rust`
+    /// (opt-in, best-effort; needs a local `cargo`/`rustup` toolchain).
     #[arg(long, value_enum, default_value_t = DemoLangArg::Sh)]
     lang: DemoLangArg,
     /// Output format: `human` (the teaching view) or `sarif` (the CI artifact a gate would upload).
@@ -242,6 +243,7 @@ enum AnalyzeFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DemoLangArg {
     Sh,
+    Rust,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DemoFormatArg {
@@ -253,6 +255,7 @@ impl From<DemoLangArg> for DemoLang {
     fn from(l: DemoLangArg) -> Self {
         match l {
             DemoLangArg::Sh => DemoLang::Sh,
+            DemoLangArg::Rust => DemoLang::Rust,
         }
     }
 }
@@ -842,21 +845,35 @@ fn render_demo_human(o: &DemoOutcome) -> String {
 
     if let Some(kept) = &o.kept_repo {
         let kp = line(&kept.display().to_string());
+        // The test-run command differs by fixture: the sh demo runs the generated test directly under
+        // /bin/sh; the rust demo runs the crate's suite via `cargo test` (the generated test was written
+        // into `tests/` by --keep, so cargo picks it up). Either way only the production file is checked
+        // out per revision, so the same generated test goes pass→fail with no jitgen in the loop.
+        let (runner, stays) = match o.lang {
+            DemoLang::Sh => (
+                format!("/bin/sh {}", line(&catch.path)),
+                "the generated test stays in place",
+            ),
+            DemoLang::Rust => (
+                "cargo test".to_string(),
+                "the generated test stays in tests/",
+            ),
+        };
         out.push_str("\nReproduce it yourself (no jitgen, no key):\n");
         out.push_str(&format!("    cd {kp}\n"));
         out.push_str(&format!(
-            "    git checkout {} -- {} && /bin/sh {} ; echo \"exit $?\"   # 0 = PASS\n",
+            "    git checkout {} -- {} && {runner} ; echo \"exit $?\"   # 0 = PASS\n",
             line(&o.base_short),
             line(&o.production_path),
-            line(&catch.path)
         ));
         out.push_str(&format!(
-            "    git checkout {} -- {} && /bin/sh {} ; echo \"exit $?\"   # nonzero = FAIL (assertion)\n",
+            "    git checkout {} -- {} && {runner} ; echo \"exit $?\"   # nonzero = FAIL (assertion)\n",
             line(&o.head_short),
             line(&o.production_path),
-            line(&catch.path)
         ));
-        out.push_str("    (only the production file is checked out per revision; the generated test stays in place)\n");
+        out.push_str(&format!(
+            "    (only the production file is checked out per revision; {stays})\n"
+        ));
     } else {
         out.push_str(
             "\nRe-run with `jitgen demo --keep` for the seeded repo + by-hand reproduction commands.\n",
@@ -967,6 +984,8 @@ mod tests {
             SandboxBackend::SandboxExec
         );
         assert_eq!(ReportFormat::from(FormatArg::Sarif), ReportFormat::Sarif);
+        assert_eq!(DemoLang::from(DemoLangArg::Sh), DemoLang::Sh);
+        assert_eq!(DemoLang::from(DemoLangArg::Rust), DemoLang::Rust);
     }
 
     #[test]
@@ -1082,13 +1101,14 @@ mod tests {
             }
             _ => panic!("expected demo"),
         }
-        // Explicit flags.
+        // Explicit flags, incl. the opt-in rust fixture.
         let cli = Cli::try_parse_from([
-            "jitgen", "demo", "--lang", "sh", "--format", "sarif", "--keep",
+            "jitgen", "demo", "--lang", "rust", "--format", "sarif", "--keep",
         ])
         .expect("parses with flags");
         match cli.command {
             Command::Demo(a) => {
+                assert_eq!(a.lang, DemoLangArg::Rust);
                 assert_eq!(a.format, DemoFormatArg::Sarif);
                 assert!(a.keep);
             }
@@ -1102,6 +1122,16 @@ mod tests {
     /// A synthetic demo outcome for renderer tests (no sandbox run). `base_output`/`head_output` can
     /// carry an injection probe or multiple lines to exercise the control-stripping / block path.
     fn demo_outcome(keep: Option<&str>, base_output: &str, head_output: &str) -> DemoOutcome {
+        demo_outcome_lang(DemoLang::Sh, keep, base_output, head_output)
+    }
+
+    /// As [`demo_outcome`] but with an explicit fixture lang (for the lang-aware reproduction block).
+    fn demo_outcome_lang(
+        lang: DemoLang,
+        keep: Option<&str>,
+        base_output: &str,
+        head_output: &str,
+    ) -> DemoOutcome {
         use jitgen_core::{CatchClass, CatchDecision, TpBucket};
         use jitgen_report::{CatchEvidence, CatchReport, RunSummary};
         let report = RunReport {
@@ -1150,6 +1180,7 @@ mod tests {
             production_path: "math.sh".into(),
             regression_diff: "- add() { echo $(( $1 + $2 )); }\n+ add() { echo $(( $1 - $2 )); }"
                 .into(),
+            lang,
         }
     }
 
@@ -1227,6 +1258,28 @@ mod tests {
             out.contains("/bin/sh jitgen-tests/math_t0.test.txt"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn demo_human_keep_reproduction_is_lang_aware_for_rust() {
+        // The rust fixture's by-hand reproduction runs the crate's suite via `cargo test` (not /bin/sh),
+        // while still checking out only the production file per revision.
+        let out = render_demo_human(&demo_outcome_lang(
+            DemoLang::Rust,
+            Some("/tmp/kept-rust"),
+            "ok",
+            "assertion failed",
+        ));
+        assert!(out.contains("Reproduce it yourself"), "{out}");
+        assert!(
+            out.contains("cargo test"),
+            "rust repro uses cargo test: {out}"
+        );
+        assert!(
+            !out.contains("/bin/sh "),
+            "rust repro must not use /bin/sh: {out}"
+        );
+        assert!(out.contains("the generated test stays in tests/"), "{out}");
     }
 
     #[test]

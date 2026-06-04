@@ -658,6 +658,28 @@ mod tests {
     use jitgen_report::AcceptedTest;
     use std::cell::RefCell;
 
+    #[test]
+    fn config_fingerprint_changes_with_env_set_extra() {
+        // env_set_extra affects the sandbox env a candidate runs under, so changing it MUST invalidate
+        // the per-target cache (else a demo/run could reload a stale outcome produced under a different
+        // toolchain env). The whole TrustedConfig is serialized into the fingerprint, so this holds.
+        let base = TrustedConfig::default();
+        let with_set = TrustedConfig {
+            env_set_extra: std::collections::BTreeMap::from([(
+                "RUSTUP_HOME".into(),
+                "/abs/.rustup".into(),
+            )]),
+            ..TrustedConfig::default()
+        };
+        assert_ne!(
+            config_fingerprint(&base),
+            config_fingerprint(&with_set),
+            "changing env_set_extra must change the config fingerprint"
+        );
+        // Same config → stable fingerprint.
+        assert_eq!(config_fingerprint(&base), config_fingerprint(&base));
+    }
+
     fn ranked(id: &str) -> RankedTarget {
         RankedTarget {
             target: Target {

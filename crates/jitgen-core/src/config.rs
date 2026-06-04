@@ -8,6 +8,7 @@
 
 use crate::mode::{Mode, Strategy};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Maximum accepted size of a `.jitgen.yaml` file (DoS bound; security §9). Callers enforce this
 /// before handing bytes to [`RepoConfig::parse_yaml`].
@@ -31,6 +32,8 @@ pub const FORBIDDEN_REPO_KEYS: &[&str] = &[
     "env_allowlist",
     "env-allowlist",
     "env_allowlist_extra",
+    "env_set_extra",
+    "env-set-extra",
     "sandbox",
     "sandbox_backend",
     "sandbox-backend",
@@ -191,6 +194,13 @@ pub struct TrustedConfig {
     pub shell_allowed: bool,
     /// Additional env var names to pass into the sandbox (on top of the hardcoded baseline).
     pub env_allowlist_extra: Vec<String>,
+    /// Additional env vars to **set to explicit values** in the sandbox (name → value), on top of the
+    /// hardcoded baseline. **Trusted-only**: a repo can never set this — it is absent from
+    /// [`RepoConfig`] and listed in [`FORBIDDEN_REPO_KEYS`]. Each entry is screened by the sandbox's
+    /// credential/socket deny-patterns (**deny beats set**) and may **never** shadow a managed/baseline
+    /// name (`PATH`/`HOME`/`TMPDIR`/`TERM`/locale); see `jitgen_sandbox::build_env`. Used e.g. to inject
+    /// `RUSTUP_HOME`/`CARGO_HOME`/`CARGO_NET_OFFLINE` for the `jitgen demo --lang rust` toolchain.
+    pub env_set_extra: BTreeMap<String, String>,
     pub sandbox_backend: SandboxBackend,
     /// Permit the no-isolation local sandbox tier (fail-open). Off by default.
     pub unsafe_local_execution: bool,
@@ -213,6 +223,7 @@ impl Default for TrustedConfig {
             provider: ProviderConfig::default(),
             shell_allowed: false,
             env_allowlist_extra: Vec::new(),
+            env_set_extra: BTreeMap::new(),
             sandbox_backend: SandboxBackend::Auto,
             unsafe_local_execution: false,
             state_dir: None,
@@ -291,6 +302,25 @@ real_llm: true
     }
 
     #[test]
+    fn repo_config_cannot_set_env_set_extra() {
+        // env_set_extra is trusted-only: a hostile repo must never inject explicit sandbox env values
+        // (e.g. to point RUSTUP_HOME/LD_PRELOAD-style vars at attacker content). It is in
+        // FORBIDDEN_REPO_KEYS (both snake- and kebab-case) so it is surfaced as ignored, and RepoConfig
+        // has no such field so serde drops it regardless. Defense-in-depth, mirroring env_allowlist_extra.
+        for key in ["env_set_extra", "env-set-extra"] {
+            let yaml = format!("id: x\nextensions: [x]\n{key}:\n  RUSTUP_HOME: /tmp/evil\n");
+            let (cfg, warnings) = RepoConfig::parse_yaml(&yaml).unwrap();
+            // The benign fields still parse…
+            assert_eq!(cfg.id.as_deref(), Some("x"));
+            // …and the trusted-only key is surfaced as ignored, never honored.
+            assert!(
+                warnings.iter().any(|w| w.contains(key)),
+                "expected ignore-warning for '{key}', got {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
     fn provider_config_parses_partial_yaml_and_kind_spellings() {
         // A trusted config may set only the provider fields it cares about; the rest default.
         let p: ProviderConfig = serde_yaml::from_str("kind: anthropic\nreal_llm: true\n").unwrap();
@@ -317,6 +347,34 @@ real_llm: true
         assert!(!t.shell_allowed);
         assert!(!t.unsafe_local_execution);
         assert_eq!(t.sandbox_backend, SandboxBackend::Auto);
+        assert!(t.env_set_extra.is_empty());
+    }
+
+    #[test]
+    fn trusted_config_without_env_set_extra_loads_as_empty_map() {
+        // Back-compat: an OLD persisted config.json (written before env_set_extra existed) must
+        // deserialize cleanly with an empty env_set_extra — the struct-level `#[serde(default)]` fills
+        // the missing field. Emulate the old shape by stripping the key from a serialized config so the
+        // test can't drift on enum spellings.
+        let mut t = TrustedConfig {
+            env_allowlist_extra: vec!["CI".into()],
+            unsafe_local_execution: true,
+            ..TrustedConfig::default()
+        };
+        t.env_set_extra
+            .insert("RUSTUP_HOME".into(), "/abs/.rustup".into());
+        let mut value = serde_json::to_value(&t).unwrap();
+        value.as_object_mut().unwrap().remove("env_set_extra");
+        assert!(value.get("env_set_extra").is_none(), "emulated old config");
+
+        let loaded: TrustedConfig = serde_json::from_value(value)
+            .expect("old config.json without env_set_extra still parses");
+        assert!(
+            loaded.env_set_extra.is_empty(),
+            "a missing env_set_extra must default to an empty map"
+        );
+        assert_eq!(loaded.env_allowlist_extra, vec!["CI"]);
+        assert!(loaded.unsafe_local_execution);
     }
 
     #[test]

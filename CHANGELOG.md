@@ -21,6 +21,22 @@ run state and report formats.
   emits the exact code-scanning artifact a CI gate would upload. Closes the acquisition gap where the
   offline mock yields zero catches, so a cold evaluator could not see jitgen's value without first wiring
   a real provider and secrets. The README and user guide now lead with it. (T1)
+- **`jitgen demo --lang rust` — an opt-in `cargo` proof.** Alongside the default `/bin/sh` fixture, a
+  zero-dep cargo crate (correct `add` on base, operator-swap regression on head) is run through jitgen's
+  **real rust adapter** (`cargo test`) to produce a genuine offline **strong catch** — no key, no
+  network. It is best-effort: under the sandbox's synthetic `HOME`, `cargo` needs `RUSTUP_HOME`/
+  `CARGO_HOME`, so the demo discovers and **canonicalizes** them (env or `$HOME/.rustup`; env or a fresh
+  private temp) to absolute, outside-repo paths and injects them via the new trusted `env_set_extra`
+  sandbox capability, with a `cargo --version` precheck that fails fast (pointing at the default demo)
+  when no toolchain is available. `--lang sh` stays the default. (T1 follow-up)
+- **Trusted-only sandbox `env_set_extra` capability.** `TrustedConfig.env_set_extra` (name → value) lets
+  trusted config **set** a sandbox env var to an explicit value (not just allowlist-passthrough),
+  screened by the same credential/socket/loader deny-patterns and managed/baseline guard as
+  `env_allowlist_extra` (deny beats set; `PATH`/`HOME`/`TMPDIR`/`TERM`/locale can never be shadowed),
+  plus a value guard that requires path-valued vars to be **absolute** (every `:`-component) and rejects
+  control characters. It is **trusted-only** — absent from `.jitgen.yaml`/`RepoConfig`, listed in
+  `FORBIDDEN_REPO_KEYS`, with no CLI/`JITGEN_*` hook — so a hostile repo can never reach it. Powers the
+  rust demo's toolchain injection; back-compat (`#[serde(default)]`, no schema bump). (T1 follow-up)
 - **Community & disclosure files (WS4).** A root [`SECURITY.md`](SECURITY.md) vulnerability-disclosure
   policy (GitHub private vulnerability reporting; scope tied to the threat model in
   [docs/security.md](docs/security.md)), a [`CONTRIBUTING.md`](CONTRIBUTING.md) (the Cargo + Bazel dual

@@ -365,6 +365,37 @@ mod tests {
     }
 
     #[test]
+    fn config_file_env_set_extra_is_parsed_and_flows_through() {
+        // env_set_extra is trusted-only with NO CLI/JITGEN_* hook, so a `--config` file (outside the
+        // repo) is its only operator entry point. Verify it round-trips from real YAML into the resolved
+        // TrustedConfig (covers the deserialize link the JSON back-compat unit test doesn't exercise).
+        let dir = std::env::temp_dir().join(format!("jitgen-cfg-eset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trusted.yaml");
+        std::fs::write(
+            &path,
+            "env_set_extra:\n  RUSTUP_HOME: /abs/.rustup\n  CARGO_NET_OFFLINE: \"true\"\n",
+        )
+        .unwrap();
+        let flags = TrustedFlags {
+            config_file: Some(path),
+            ..TrustedFlags::default()
+        };
+        let cfg = resolve_trusted(&flags, no_repo(), |_| None).unwrap();
+        assert_eq!(
+            cfg.env_set_extra.get("RUSTUP_HOME").map(String::as_str),
+            Some("/abs/.rustup")
+        );
+        assert_eq!(
+            cfg.env_set_extra
+                .get("CARGO_NET_OFFLINE")
+                .map(String::as_str),
+            Some("true")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn config_file_inside_repo_is_rejected() {
         // A repo-shipped trusted config must NOT be honored (ADR-0010, S1/F9): `--config` pointing
         // inside the repo is refused.
