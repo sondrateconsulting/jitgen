@@ -18,6 +18,15 @@ are load-bearing, not stylistic.
   always-working dev build; Bazel (Bzlmod) is the canonical build
   ([ADR-0001](docs/decisions/0001-rust-default-and-bazel-monorepo.md)) and is exercised by the check
   script when present.
+  - *Optional speed-up:* `.bazelrc` `try-import`s a gitignored, per-machine `user.bazelrc`. Point
+    `--disk_cache` there at one **absolute** path outside every worktree (Bazel does not expand `~`
+    or `%workspace%` to a shared location) so a clean build in any worktree reuses compiled actions
+    instead of recompiling. Never commit `user.bazelrc`, and CI must not depend on it.
+
+    ```text
+    # user.bazelrc (gitignored)
+    build --disk_cache=/abs/path/outside/worktrees/jitgen-bazel-disk-cache
+    ```
 - Native test toolchains (Node, JDK + Maven/Gradle, Python + pytest) are only needed to run the
   language **e2e** tests natively; the unit/integration suite is fully offline.
 
@@ -31,8 +40,16 @@ cargo test  --workspace            # offline; deterministic mock LLM (no network
 Before opening a PR, run the full gate — it must pass:
 
 ```bash
-./scripts/check.sh    # cargo fmt --check + clippy -D warnings + cargo test + release build + (bazel build/test //...)
+./scripts/check.sh    # cargo fmt --check + clippy -D warnings + cargo test + release build + (bazel build/test //... + test-cache policy)
 ```
+
+When Bazel is present, the gate also runs `scripts/check-test-cache-policy.sh`, which enforces the
+**fail-closed remote test-cache policy**: every macro-generated `rust_test` is non-remote-cacheable by
+default, so a future remote cache can never serve a stale false-PASS. A test is eligible for remote
+caching only after a per-crate hermeticity audit — pass `test_cache = "remote_ok"` to the
+`jitgen_rust_*` macro in its `BUILD.bazel` **and** add its label to
+[`bazel/remote_cacheable_tests.txt`](bazel/remote_cacheable_tests.txt). A raw, macro-bypassing
+`rust_test()` is caught too (no `no-remote-cache` tag, not allowlisted → build fails).
 
 `./scripts/check.sh` is **offline by design**. Supply-chain auditing is a separate script, because it
 fetches the RustSec advisory database:

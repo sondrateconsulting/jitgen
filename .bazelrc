@@ -14,8 +14,17 @@ build --incompatible_strict_action_env
 # hinge on ambient connectivity. This does NOT make tests fully hermetic (current time, host files,
 # $HOME/tmp, CPU, etc. remain undeclared), but it closes the common cases. Loopback (127.0.0.1) stays
 # up, so the one unit test that binds a local server (jitgen-llm/src/http.rs) still runs sandboxed.
-# (A test needing real outbound network would tag its rust_test "requires-network"; the bazel/defs.bzl
-# macros do not forward tags to the generated rust_test today, so that would need a macro tweak. None need it.)
+# (A test needing real outbound network would tag its rust_test "requires-network". The bazel/defs.bzl
+# macros set a cache-policy tag (no-remote-cache) but do not forward ARBITRARY tags, so a
+# requires-network test would still need the macro extended. None need it today.)
 test --test_env=TZ=UTC
 test --test_env=LC_ALL=C
 test --sandbox_default_allow_network=false
+
+# Per-machine local overrides (gitignored). Holds settings that must NOT be committed:
+# a shared --disk_cache path for cross-worktree build reuse (T0), and later a dev
+# remote-cache read credential. Bazel does NOT expand ~ or env vars in rc files, and
+# %workspace% is per-worktree, so put an ABSOLUTE --disk_cache path (outside every
+# worktree) in user.bazelrc. CI must NOT rely on this file — it is PR-controlled; CI
+# passes cache flags via a trusted out-of-checkout rc instead.
+try-import %workspace%/user.bazelrc

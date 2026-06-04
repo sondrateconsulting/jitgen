@@ -9,6 +9,18 @@ run state and report formats.
 ## [Unreleased]
 
 ### Added
+- **Local Bazel `--disk_cache` for cross-worktree build reuse.** `.bazelrc` now `try-import`s a
+  gitignored, per-machine `user.bazelrc` where each developer points `--disk_cache` at one absolute
+  path outside every worktree, so a clean build in any worktree reuses compiled actions instead of
+  recompiling (measured 35.9s cold → 0.8s warm, 136/136 actions served from the disk cache). The
+  committed config carries no machine-specific path; CI must not rely on this PR-controllable file. (T0)
+- **Fail-closed remote test-cache policy.** Every macro-generated `rust_test` (`//bazel:defs.bzl`) is now
+  non-remote-cacheable by default (`tags=["no-remote-cache"]`); a crate opts in only after a per-crate
+  hermeticity audit via `test_cache = "remote_ok"`, and `scripts/check-test-cache-policy.sh` (wired into
+  `scripts/check.sh`) fails the build if any `rust_test` is remote-cacheable without an audit-allowlist
+  entry. The gate reads structured `streamed_jsonproto` for exact tag membership and runs its query with
+  `--no{workspace,home,system}_rc` so a committed `user.bazelrc` cannot hide a target from it. This
+  prevents a future remote cache from silently serving a stale false-PASS test result. (T1)
 - **`jitgen demo` — offline proof that catch mode catches a real bug (T1).** A new subcommand that, with
   **no API key and no network**, builds a tiny embedded seeded-bug repo (a correct `/bin/sh` `add` on the
   base revision; a `+`→`-` operator-swap regression on head) and runs jitgen's **real** catch pipeline

@@ -82,6 +82,9 @@ if [ -n "$BAZEL" ]; then
   elif [ "$code" -ne 0 ]; then
     exit "$code"
   fi
+
+  section "test-cache policy (fail-closed remote caching)"
+  bash scripts/check-test-cache-policy.sh
 else
   echo
   echo "NOTE: neither bazel nor bazelisk found on PATH; skipped the canonical Bazel build."

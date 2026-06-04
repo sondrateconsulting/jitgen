@@ -4,6 +4,8 @@
 *.rs.bk
 # Bazel (symlinks only; MODULE.bazel.lock IS committed for reproducible canonical builds)
 /bazel-*
+# Per-machine Bazel overrides (disk_cache path, dev cache read credential) — never commit
+/user.bazelrc
 # jitgen runtime state (never commit run state / overlays)
 .jitgen/
 # OS / editor

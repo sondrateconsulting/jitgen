@@ -1,0 +1,12 @@
+# Audited remote-cacheable rust_test targets (fail-closed policy).
+# Enforced by scripts/check-test-cache-policy.sh; default set by //bazel:defs.bzl.
+#
+# A target appears here ONLY after a per-crate hermeticity audit (Phase 3 / T6) confirms
+# its test reads NO host state (git config, $HOME, TZ, locale, network, /tmp, CPU, UID, ...).
+# Remote-caching a test result requires BOTH: test_cache = "remote_ok" in the crate's
+# BUILD.bazel AND its label listed here.
+#
+# Format: one Bazel label per line, with a trailing audit note, e.g.
+#   //crates/jitgen-core:jitgen-core_test  # audited 2026-06-15: pure value types, no host I/O
+#
+# EMPTY today — nothing has been audited, so every rust_test is local_only (fail-closed).
