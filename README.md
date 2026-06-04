@@ -69,7 +69,9 @@ It prints exactly what happened: the planted regression (a `+`→`-` operator sw
 generated for it, the **real** sandbox runs on the good revision and the buggy one (one passes, one
 fails with an assertion), and the verdict — a **strong catch**. Add `--keep` to also get the seeded
 repo plus copy-paste commands that reproduce the catch **by hand** (just `git` and `/bin/sh`, no jitgen
-in the loop), or `--format sarif` to see the exact code-scanning artifact a CI gate would upload.
+in the loop), or `--format sarif` to see the exact code-scanning artifact a CI gate would upload. Add
+`--lang rust` to run the same proof through a real `cargo` crate instead of `/bin/sh` (opt-in,
+best-effort; needs a local `cargo`/`rustup` toolchain).
 
 **What it proves — and what it doesn't.** The demo replays a *recorded* LLM response, so it validates
 jitgen's whole pipeline end to end (diff parsing, sandboxed execution, catch classification, the
@@ -117,7 +119,7 @@ jitgen resume  --run-id <id>
 jitgen report  --run-id <id> [--format human|json|markdown|junit|sarif|patch]
 jitgen doctor
 jitgen completions <bash|zsh|fish|powershell|elvish>       # print a shell completion script
-jitgen demo    [--lang sh] [--format human|sarif] [--keep] # offline proof: catch a seeded bug, no API key
+jitgen demo    [--lang sh|rust] [--format human|sarif] [--keep] # offline proof: catch a seeded bug, no API key
 
 # Trusted options (CLI / user config outside the repo only): --state-dir, --config,
 # --sandbox <backend>, --unsafe-local-execution. See docs/architecture.md + docs/security.md.
