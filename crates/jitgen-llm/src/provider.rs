@@ -105,6 +105,7 @@ pub trait LlmProvider {
 /// Whether [`make_provider`] would fall back to the offline [`MockProvider`](crate::MockProvider) for
 /// this config — the **master switch**: true unless `real_llm` is on AND a non-mock kind is selected.
 /// Exposed so callers like `doctor` describe the same effective provider without duplicating the rule.
+#[must_use = "this is the mock-vs-real master switch; ignoring the result skips the safety decision"]
 pub fn provider_is_mock(provider: &jitgen_core::ProviderConfig) -> bool {
     !provider.real_llm || provider.kind == ProviderKind::Mock
 }

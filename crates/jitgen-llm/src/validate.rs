@@ -43,6 +43,7 @@ const DANGEROUS: &[(&str, &str)] = &[
 /// and a whitespace-collapsed copy, so spacing tricks (`Command :: new`, `os . system`) cannot evade
 /// the gate (F5/T1 review #6). This is a heuristic tripwire only — the F7 sandbox is the real
 /// containment boundary; we never trust generated code merely because it passes here.
+#[must_use = "the validation verdict must be acted on before using the candidate"]
 pub fn validate_candidate(source: &str) -> ValidationResult {
     let source = char_prefix(source, MAX_VALIDATE_BYTES);
     let lower = source.to_ascii_lowercase();

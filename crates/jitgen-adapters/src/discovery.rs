@@ -45,6 +45,7 @@ impl AdapterRegistry {
     }
 
     /// Detect which adapters apply to the repository.
+    #[must_use = "the detection profile selects which adapters run; discarding it does nothing"]
     pub fn detect(&self, repo: &RepoSnapshot) -> DetectionProfile {
         let detected = self
             .adapters
