@@ -181,6 +181,22 @@ struct Capture {
 }
 
 /// Spawn a reader that drains `reader` into a shared, `cap`-bounded buffer.
+///
+/// Invariant: **every** operation performed while holding the buffer lock is panic-free, so the
+/// reader never poisons the mutex today. Under the guard it reads `g.len()`, computes
+/// `take = (cap - len).min(n)`, slices `chunk[..take]`, calls `Vec::extend_from_slice`, and does an
+/// atomic `store` — each is infallible here:
+/// - `chunk[..take]` is always in bounds: the [`Read`] contract guarantees `n <= chunk.len()` and
+///   `take <= n`, so the slice never exceeds `chunk`.
+/// - `extend_from_slice` only allocates; on OOM it aborts via `handle_alloc_error` under the standard
+///   allocator rather than unwinding (and `take <= cap <= REDACT_WINDOW`, so no capacity overflow).
+/// - the length read, arithmetic, branch, and atomic `store` cannot panic.
+///
+/// [`collect`] still recovers from a poisoned guard via `into_inner()` as forward-looking hardening.
+/// If you add a *fallible* operation under the guard (an out-of-range index, an `unwrap`, a fallible
+/// call) — or register a global allocator that *unwinds* instead of aborting on allocation failure —
+/// re-check this: keep the lock scope panic-free so recovery stays a safety net, not a load-bearing
+/// path.
 fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let truncated = Arc::new(AtomicBool::new(false));
@@ -200,6 +216,9 @@ fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture
                     };
                     if g.len() < cap {
                         let take = (cap - g.len()).min(n);
+                        // `take <= n <= chunk.len()` so the slice is in bounds, and
+                        // `extend_from_slice` aborts (not unwinds) on OOM — the guarded region stays
+                        // panic-free. See the `spawn_capture` doc invariant before adding anything.
                         g.extend_from_slice(&chunk[..take]);
                         if take < n {
                             trunc_w.store(true, Ordering::Relaxed);
@@ -239,7 +258,17 @@ fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
     if finished {
         let _ = cap.handle.join();
     }
-    let buf = cap.buf.lock().map(|g| g.clone()).unwrap_or_default();
+    // Recover the captured bytes even if the reader thread panicked while holding the lock — a
+    // poisoned mutex still holds the bytes written before the panic. `unwrap_or_default()` would
+    // instead silently drop ALL captured output (and the truncated flag below would not signal it).
+    // Keep the lock scope tight: take the guard, clone, drop.
+    let buf = {
+        let guard = cap
+            .buf
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clone()
+    };
     let truncated = cap.truncated.load(Ordering::Relaxed) || !finished;
     (buf, truncated)
 }
@@ -342,6 +371,102 @@ mod tests {
         let (buf, trunc) = collect(Some(cap));
         assert_eq!(buf, b"hi");
         assert!(!trunc);
+    }
+
+    /// Build a `Capture` whose reader thread has already panicked **while holding the buffer lock**,
+    /// poisoning the mutex — the exact state `collect` must recover from. `initial` seeds the buffer
+    /// (the bytes written before the panic); `truncated` is the flag the cap would carry at panic
+    /// time. The thread is bounded-waited to completion so the mutex is guaranteed poisoned and the
+    /// handle is `is_finished()` before we hand it to `collect`.
+    /// (The deliberate panic prints a backtrace to stderr — expected, harmless.)
+    fn poisoned_capture(initial: &[u8], truncated: bool) -> Capture {
+        let buf = Arc::new(Mutex::new(initial.to_vec()));
+        let writer = Arc::clone(&buf);
+        let handle = thread::spawn(move || {
+            let _guard = writer.lock().unwrap();
+            panic!("simulate a reader panic while holding the capture lock");
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "test setup timed out waiting for the spawned thread to panic"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        Capture {
+            buf,
+            truncated: Arc::new(AtomicBool::new(truncated)),
+            handle,
+        }
+    }
+
+    #[test]
+    fn collect_recovers_bytes_from_a_poisoned_capture_mutex() {
+        // A poisoned mutex (reader panicked while holding the lock) must still yield the bytes
+        // written before the panic, not the empty buffer the old `unwrap_or_default()` returned.
+        let cap = poisoned_capture(b"partial output", false);
+        let (bytes, truncated) = collect(Some(cap));
+        assert_eq!(
+            bytes, b"partial output",
+            "a poisoned mutex must still yield the captured bytes, not an empty buffer"
+        );
+        // The reader finished (panicked) and the cap was not hit, so poison alone must not
+        // spuriously flag truncation.
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn collect_preserves_truncation_flag_through_poison_recovery() {
+        // If output was already truncated when the reader panicked, poison recovery must NOT clear
+        // that signal — otherwise the caller would skip the redaction tail-guard on a real cap hit.
+        // This pins the `truncated` half of the contract: a hard-coded `false` would fail here.
+        let cap = poisoned_capture(b"capped output", true);
+        let (bytes, truncated) = collect(Some(cap));
+        assert_eq!(bytes, b"capped output");
+        assert!(
+            truncated,
+            "a pre-existing truncation flag must survive poison recovery"
+        );
+    }
+
+    #[test]
+    fn collect_flags_truncation_when_a_poisoned_reader_never_finished() {
+        // An escaped descendant can keep the reader thread alive past COLLECT_GRACE while the buffer
+        // mutex is *also* poisoned. `collect` must (a) give up at the grace deadline, (b) still
+        // recover the bytes via `into_inner()` even though it never `join`s the unfinished reader,
+        // and (c) flag truncation via the `|| !finished` branch. This intentionally waits the full
+        // COLLECT_GRACE (~2s) — the reader staying unfinished is the exact condition under test.
+        let buf = Arc::new(Mutex::new(b"prefix before poison".to_vec()));
+        // Poison the mutex from a short-lived thread, distinct from the still-running handle below.
+        let poisoner = Arc::clone(&buf);
+        let ph = thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the capture mutex");
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ph.is_finished() {
+            assert!(Instant::now() < deadline, "poisoner did not finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+        // A reader handle that stays alive (blocked on `rx`) for the whole grace window, so `collect`
+        // observes `!finished`. It exits when `tx` drops at the end of this test.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let cap = Capture {
+            buf,
+            truncated: Arc::new(AtomicBool::new(false)),
+            handle,
+        };
+        let (bytes, truncated) = collect(Some(cap));
+        assert_eq!(bytes, b"prefix before poison");
+        assert!(
+            truncated,
+            "an unfinished reader must flag truncation even when poison recovery runs"
+        );
+        drop(tx); // release the parked reader thread
     }
 
     #[test]
