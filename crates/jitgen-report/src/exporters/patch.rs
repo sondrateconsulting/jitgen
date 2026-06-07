@@ -53,12 +53,9 @@ fn file_addition(t: &AcceptedTest) -> String {
     out.push_str("--- /dev/null\n");
     out.push_str(&format!("+++ b/{path}\n"));
 
-    let lines: Vec<&str> = if body.is_empty() {
-        Vec::new()
-    } else {
-        // Split keeping awareness of a trailing newline (git's "\ No newline at end of file").
-        body.split('\n').collect()
-    };
+    // `body` is non-empty here (the empty case returned the canonical empty-blob form above). Split
+    // keeping awareness of a trailing newline (git's "\ No newline at end of file").
+    let lines: Vec<&str> = body.split('\n').collect();
     let trailing_newline = body.ends_with('\n');
     // Number of content lines (excluding the empty element produced by a trailing '\n').
     let content_lines: Vec<&str> = if trailing_newline {
