@@ -11,6 +11,9 @@ use jitgen_core::{ProviderConfig, ProviderKind};
 
 mod anthropic;
 mod openai;
+mod secret;
+
+pub(crate) use secret::Secret;
 
 /// Default Anthropic model when trusted config does not pin one. Overridable via `provider.model`.
 /// (Current strong coding model; see env/model notes in docs/user-guide.md — bump as models evolve.)
@@ -61,11 +64,67 @@ fn default_key_env(kind: ProviderKind) -> Option<&'static str> {
     }
 }
 
-/// Read the API key from the trusted-named env var. The **name** is safe to show (it is config, not
-/// the secret); the **value** is never logged or returned in an error.
-fn read_key(env_var: &str) -> Result<String> {
-    match std::env::var(env_var) {
-        Ok(v) if !v.trim().is_empty() => Ok(v),
+/// Where a provider obtains its API key at generate time. Production resolves from the trusted-named
+/// env var; tests inject a literal so the full request path (header placement, status mapping) is
+/// exercised without mutating the shared process environment (`set_var`/`remove_var` are not
+/// thread-safe under the parallel test runner; this crate is edition 2021, and the `unsafe`
+/// requirement for those calls lands with edition 2024).
+///
+/// SECURITY: the resolved key is always a [`Secret`] (redacting `Debug`, no `Display`), so the value
+/// stays protected even if this enum is ever formatted; the `Env` variant holds only the (safe) var
+/// name. In production the raw value is exposed solely via [`Secret::expose`], at the auth-header
+/// boundary in each provider, never logged.
+pub(crate) enum KeySource {
+    /// Read the value from this trusted-named env var (the production path).
+    Env(String),
+    /// A literal value supplied directly. Test-only.
+    #[cfg(test)]
+    Literal(Secret),
+}
+
+impl KeySource {
+    /// Resolve the key value. The env var NAME is safe to show (it is config); the VALUE is never
+    /// logged or returned in an error.
+    pub(crate) fn resolve(&self) -> Result<Secret> {
+        match self {
+            KeySource::Env(var) => read_key(var),
+            #[cfg(test)]
+            KeySource::Literal(v) => Ok(v.clone()),
+        }
+    }
+}
+
+/// Read the API key from the trusted-named env var, then validate it. The **name** is safe to show (it
+/// is config, not the secret); the **value** is never logged or returned in an error.
+fn read_key(env_var: &str) -> Result<Secret> {
+    key_from_var_result(env_var, std::env::var(env_var))
+}
+
+/// Map the result of `std::env::var` to a validated [`Secret`], distinguishing the failure modes so
+/// the diagnostic is accurate. Pure (the caller supplies the lookup result), so every branch —
+/// including the otherwise-hard-to-reach non-UTF-8 case — is unit-testable without mutating the env.
+fn key_from_var_result(
+    env_var: &str,
+    result: std::result::Result<String, std::env::VarError>,
+) -> Result<Secret> {
+    match result {
+        Ok(v) => key_from_value(env_var, Some(v)),
+        Err(std::env::VarError::NotPresent) => key_from_value(env_var, None),
+        // A set-but-non-UTF-8 value is a distinct failure: reporting "not set" would send the user
+        // chasing the wrong problem (re-exporting a key that is, in fact, already exported).
+        Err(std::env::VarError::NotUnicode(_)) => Err(GenerationError::Config(format!(
+            "API key env var `{env_var}` is set but contains non-UTF-8 bytes; re-export it as valid UTF-8"
+        ))),
+    }
+}
+
+/// Validate a key `value` and wrap it in a [`Secret`]. Pure (no process env), so it is unit-testable
+/// without mutating the global environment: an absent (`None`) or blank value yields a Config error
+/// naming the var. The non-UTF-8 case is handled earlier in [`key_from_var_result`] and never
+/// reaches here as `None`.
+fn key_from_value(env_var: &str, value: Option<String>) -> Result<Secret> {
+    match value {
+        Some(v) if !v.trim().is_empty() => Ok(Secret::new(v)),
         _ => Err(GenerationError::Config(format!(
             "API key env var `{env_var}` is not set (or is empty); export it before running with --real-llm"
         ))),
@@ -198,13 +257,76 @@ mod tests {
     }
 
     #[test]
-    fn read_key_reads_a_set_var() {
-        // Unique name avoids cross-test interference under the parallel test runner.
-        let name = "JITGEN_TEST_KEY_READ_OK";
-        std::env::set_var(name, "sk-secret-value");
-        let got = read_key(name).unwrap();
-        std::env::remove_var(name);
-        assert_eq!(got, "sk-secret-value");
+    fn key_from_value_accepts_nonblank_and_rejects_blank_or_absent() {
+        // Pure validation — no process-env mutation, so it is race-free under the parallel runner.
+        assert_eq!(
+            key_from_value("FOO", Some("sk-secret-value".into()))
+                .unwrap()
+                .expose(),
+            "sk-secret-value"
+        );
+        assert!(matches!(
+            key_from_value("FOO", None),
+            Err(GenerationError::Config(_))
+        ));
+        assert!(matches!(
+            key_from_value("FOO", Some(String::new())),
+            Err(GenerationError::Config(_))
+        ));
+        assert!(matches!(
+            key_from_value("FOO", Some("   ".into())),
+            Err(GenerationError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn key_from_var_result_distinguishes_non_utf8_from_unset() {
+        use std::ffi::OsString;
+        // Ok → validated and wrapped.
+        assert_eq!(
+            key_from_var_result("FOO", Ok("sk-secret-value".into()))
+                .unwrap()
+                .expose(),
+            "sk-secret-value"
+        );
+        // NotPresent → the "not set" diagnostic.
+        let unset = key_from_var_result("FOO", Err(std::env::VarError::NotPresent)).unwrap_err();
+        assert!(unset.to_string().contains("not set"));
+        // NotUnicode → a DISTINCT diagnostic that says the var IS set (not "not set").
+        let non_utf8 = key_from_var_result(
+            "FOO",
+            Err(std::env::VarError::NotUnicode(OsString::from("x"))),
+        )
+        .unwrap_err();
+        let msg = non_utf8.to_string();
+        assert!(msg.contains("non-UTF-8"));
+        assert!(!msg.contains("not set"));
+    }
+
+    #[test]
+    fn key_source_literal_resolves_without_env() {
+        assert_eq!(
+            KeySource::Literal(Secret::new("sk-secret-value".into()))
+                .resolve()
+                .unwrap()
+                .expose(),
+            "sk-secret-value"
+        );
+    }
+
+    // `Secret` tests live here (a sibling of the `secret` module, not a child) so they cannot reach
+    // the private field and must go through `new`/`expose` — the same boundary production code uses.
+    #[test]
+    fn secret_debug_is_redacted() {
+        let s = Secret::new("sk-super-secret".into());
+        let rendered = format!("{s:?}");
+        assert!(!rendered.contains("sk-super-secret"));
+        assert!(rendered.contains("REDACTED"));
+    }
+
+    #[test]
+    fn secret_expose_returns_the_raw_value() {
+        assert_eq!(Secret::new("sk-raw-value".into()).expose(), "sk-raw-value");
     }
 
     #[test]

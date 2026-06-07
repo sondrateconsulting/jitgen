@@ -4,7 +4,7 @@
 //! `ProviderKind::Local` (a localhost server such as Ollama/LM Studio; key optional). The two differ
 //! only in the default key-env (via [`super::provider_key_env`]) and the reported name.
 
-use super::{http_error_message, read_key, MAX_OUTPUT_TOKENS};
+use super::{http_error_message, KeySource, MAX_OUTPUT_TOKENS};
 use crate::http::{validate_endpoint, Header, HttpTransport};
 use crate::provider::{GenerationError, LlmProvider, LlmRequest, LlmResponse, Result};
 use jitgen_core::ProviderConfig;
@@ -14,8 +14,8 @@ pub(crate) struct OpenAiProvider<T: HttpTransport> {
     transport: T,
     base_url: Option<String>,
     model: Option<String>,
-    /// Env var to read the bearer key from. `None` ⇒ no auth header (a keyless local server).
-    key_env: Option<String>,
+    /// Where the bearer key comes from. `None` ⇒ no auth header (a keyless local server).
+    key: Option<KeySource>,
     name: &'static str,
 }
 
@@ -34,9 +34,17 @@ impl<T: HttpTransport> OpenAiProvider<T> {
             base_url: cfg.base_url.clone(),
             model: cfg.model.clone(),
             // Defaults per kind: OPENAI_API_KEY for OpenAiCompatible, none for Local (unless set).
-            key_env: super::provider_key_env(cfg),
+            key: super::provider_key_env(cfg).map(KeySource::Env),
             name,
         }
+    }
+
+    /// Override the key with a literal value (test seam — exercises `generate` without touching the
+    /// process environment).
+    #[cfg(test)]
+    pub(crate) fn with_key(mut self, key: &str) -> Self {
+        self.key = Some(KeySource::Literal(super::Secret::new(key.to_string())));
+        self
     }
 }
 
@@ -61,13 +69,11 @@ impl<T: HttpTransport> LlmProvider for OpenAiProvider<T> {
         let endpoint = format!("{}/chat/completions", base.trim_end_matches('/'));
         validate_endpoint(&endpoint).map_err(GenerationError::Config)?;
 
-        // Read the key (if a key env is configured) and build the bearer header. `auth` outlives the
-        // request so the header can borrow it.
-        let key = match &self.key_env {
-            Some(env) => Some(read_key(env)?),
-            None => None,
-        };
-        let auth = key.as_ref().map(|k| format!("Bearer {k}"));
+        // Resolve the key (if one is configured) and build the bearer header. `auth` outlives the
+        // request so the header can borrow it. Resolution happens AFTER endpoint validation so a
+        // misconfigured remote http:// base is rejected before any key is touched.
+        let key = self.key.as_ref().map(KeySource::resolve).transpose()?;
+        let auth = key.as_ref().map(|k| format!("Bearer {}", k.expose()));
         let mut headers: Vec<Header<'_>> = Vec::new();
         if let Some(a) = &auth {
             headers.push(("authorization", a.as_str()));
@@ -193,14 +199,12 @@ mod tests {
 
     #[test]
     fn generate_sends_bearer_key_only_in_header() {
-        let env = "JITGEN_TEST_OPENAI_KEY";
-        std::env::set_var(env, "sk-openai-SECRET");
         let provider = OpenAiProvider::new_openai(
-            &openai_cfg("https://api.example.com/v1", "gpt-x", env),
+            &openai_cfg("https://api.example.com/v1", "gpt-x", "UNUSED_KEY_ENV"),
             FakeTransport::ok(200, r#"{"choices":[{"message":{"content":"ok"}}]}"#),
-        );
+        )
+        .with_key("sk-openai-SECRET");
         let out = provider.generate(&req());
-        std::env::remove_var(env);
         assert_eq!(out.unwrap().raw, "ok");
 
         let cap = provider.transport.captured();
@@ -262,9 +266,13 @@ mod tests {
 
     #[test]
     fn remote_plain_http_base_is_rejected() {
-        let cfg = openai_cfg("http://api.example.com/v1", "gpt-x", "X");
-        let p = OpenAiProvider::new_openai(&cfg, FakeTransport::ok(200, "{}"));
-        // validate_endpoint rejects remote http:// before any key read.
+        // Ordering guard: a remote http:// base must be rejected by endpoint validation BEFORE the
+        // key is resolved. With a valid literal key and a 200 transport, the only path to an error is
+        // the endpoint check — so a `Config` error proves validation ran first (a skipped check would
+        // instead surface a `Provider` parse error on the empty `{}` body).
+        let cfg = openai_cfg("http://api.example.com/v1", "gpt-x", "UNUSED_KEY_ENV");
+        let p = OpenAiProvider::new_openai(&cfg, FakeTransport::ok(200, "{}"))
+            .with_key("sk-openai-SECRET");
         assert!(matches!(
             p.generate(&req()).unwrap_err(),
             GenerationError::Config(_)
@@ -273,15 +281,28 @@ mod tests {
 
     #[test]
     fn generate_maps_transport_failure_to_provider_error() {
-        let env = "JITGEN_TEST_OPENAI_KEY_2";
-        std::env::set_var(env, "sk-openai-SECRET");
         let p = OpenAiProvider::new_openai(
-            &openai_cfg("https://api.example.com/v1", "gpt-x", env),
+            &openai_cfg("https://api.example.com/v1", "gpt-x", "UNUSED_KEY_ENV"),
             FakeTransport::fail("connection reset"),
-        );
+        )
+        .with_key("sk-openai-SECRET");
         let err = p.generate(&req()).unwrap_err();
-        std::env::remove_var(env);
         assert!(matches!(err, GenerationError::Provider(_)));
         assert!(err.to_string().contains("connection reset"));
+    }
+
+    #[test]
+    fn generate_maps_non_2xx_to_provider_error() {
+        // The non-2xx branch in `generate` maps the status + provider `error.message` to a Provider
+        // error, prefixed with the provider name (mirrors the Anthropic coverage).
+        let p = OpenAiProvider::new_openai(
+            &openai_cfg("https://api.example.com/v1", "gpt-x", "UNUSED_KEY_ENV"),
+            FakeTransport::ok(401, r#"{"error":{"message":"invalid api key"}}"#),
+        )
+        .with_key("sk-openai-SECRET");
+        let err = p.generate(&req()).unwrap_err();
+        assert!(matches!(err, GenerationError::Provider(_)));
+        assert!(err.to_string().contains("401"));
+        assert!(err.to_string().contains("invalid api key"));
     }
 }

@@ -1,7 +1,7 @@
 //! Anthropic Messages API provider (`POST {base}/v1/messages`).
 
 use super::{
-    http_error_message, read_key, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION,
+    http_error_message, KeySource, ANTHROPIC_DEFAULT_BASE, ANTHROPIC_VERSION,
     DEFAULT_ANTHROPIC_MODEL, MAX_OUTPUT_TOKENS,
 };
 use crate::http::{validate_endpoint, HttpTransport};
@@ -13,7 +13,7 @@ pub(crate) struct AnthropicProvider<T: HttpTransport> {
     transport: T,
     base_url: String,
     model: String,
-    key_env: String,
+    key: KeySource,
 }
 
 impl<T: HttpTransport> AnthropicProvider<T> {
@@ -28,9 +28,19 @@ impl<T: HttpTransport> AnthropicProvider<T> {
                 .model
                 .clone()
                 .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string()),
-            key_env: super::provider_key_env(cfg)
-                .unwrap_or_else(|| super::ANTHROPIC_KEY_ENV.to_string()),
+            key: KeySource::Env(
+                super::provider_key_env(cfg)
+                    .unwrap_or_else(|| super::ANTHROPIC_KEY_ENV.to_string()),
+            ),
         }
+    }
+
+    /// Override the key with a literal value (test seam — exercises `generate` without touching the
+    /// process environment).
+    #[cfg(test)]
+    pub(crate) fn with_key(mut self, key: &str) -> Self {
+        self.key = KeySource::Literal(super::Secret::new(key.to_string()));
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -46,10 +56,10 @@ impl<T: HttpTransport> LlmProvider for AnthropicProvider<T> {
     fn generate(&self, req: &LlmRequest) -> Result<LlmResponse> {
         let endpoint = self.endpoint();
         validate_endpoint(&endpoint).map_err(GenerationError::Config)?;
-        let key = read_key(&self.key_env)?;
+        let key = self.key.resolve()?;
         let body = anthropic_body(&self.model, req);
         let headers = [
-            ("x-api-key", key.as_str()),
+            ("x-api-key", key.expose()),
             ("anthropic-version", ANTHROPIC_VERSION),
         ];
         let outcome = self
@@ -169,17 +179,15 @@ mod tests {
 
     #[test]
     fn generate_sends_key_only_in_header_and_returns_text() {
-        let env = "JITGEN_TEST_ANTHROPIC_KEY";
-        std::env::set_var(env, "sk-ant-SECRET");
         let provider = AnthropicProvider::new(
-            &cfg(env),
+            &cfg("UNUSED_KEY_ENV"),
             FakeTransport::ok(
                 200,
                 r#"{"content":[{"type":"text","text":"```rust\nfn t(){}\n```"}]}"#,
             ),
-        );
+        )
+        .with_key("sk-ant-SECRET");
         let out = provider.generate(&req());
-        std::env::remove_var(env);
 
         let out = out.unwrap();
         assert!(out.raw.contains("fn t()"));
@@ -203,14 +211,12 @@ mod tests {
 
     #[test]
     fn generate_maps_non_2xx_to_provider_error() {
-        let env = "JITGEN_TEST_ANTHROPIC_KEY_2";
-        std::env::set_var(env, "sk-ant-SECRET");
         let provider = AnthropicProvider::new(
-            &cfg(env),
+            &cfg("UNUSED_KEY_ENV"),
             FakeTransport::ok(401, r#"{"error":{"message":"invalid x-api-key"}}"#),
-        );
+        )
+        .with_key("sk-ant-SECRET");
         let err = provider.generate(&req()).unwrap_err();
-        std::env::remove_var(env);
         assert!(matches!(err, GenerationError::Provider(_)));
         assert!(err.to_string().contains("401"));
         assert!(err.to_string().contains("invalid x-api-key"));
@@ -218,6 +224,9 @@ mod tests {
 
     #[test]
     fn generate_errors_when_key_unset() {
+        // Exercises the production Env path (no `with_key`): the named var is assumed absent from the
+        // ambient environment. This reads — never mutates — the environment, so it is race-free under
+        // the parallel runner (the pure blank/absent cases are covered by `key_from_value` in mod.rs).
         let provider = AnthropicProvider::new(
             &cfg("JITGEN_TEST_ANTHROPIC_UNSET_KEY"),
             FakeTransport::ok(200, "{}"),
@@ -228,12 +237,32 @@ mod tests {
 
     #[test]
     fn generate_maps_transport_failure_to_provider_error() {
-        let env = "JITGEN_TEST_ANTHROPIC_KEY_3";
-        std::env::set_var(env, "sk-ant-SECRET");
-        let provider = AnthropicProvider::new(&cfg(env), FakeTransport::fail("connection refused"));
+        let provider = AnthropicProvider::new(
+            &cfg("UNUSED_KEY_ENV"),
+            FakeTransport::fail("connection refused"),
+        )
+        .with_key("sk-ant-SECRET");
         let err = provider.generate(&req()).unwrap_err();
-        std::env::remove_var(env);
         assert!(matches!(err, GenerationError::Provider(_)));
         assert!(err.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn generate_rejects_remote_http_base_before_resolving_key() {
+        // Ordering guard: a remote http:// base must be rejected by endpoint validation BEFORE the
+        // key is resolved. With a valid literal key and a 200 transport, the only path to an error is
+        // the endpoint check — so a `Config` error proves validation ran first (a skipped check would
+        // instead surface a `Provider` parse error on the empty `{}` body).
+        let cfg = ProviderConfig {
+            kind: ProviderKind::Anthropic,
+            base_url: Some("http://api.example.com".into()),
+            ..Default::default()
+        };
+        let provider =
+            AnthropicProvider::new(&cfg, FakeTransport::ok(200, "{}")).with_key("sk-ant-SECRET");
+        assert!(matches!(
+            provider.generate(&req()).unwrap_err(),
+            GenerationError::Config(_)
+        ));
     }
 }
