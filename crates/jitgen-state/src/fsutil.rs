@@ -94,10 +94,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Lowercase-hex SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
+    // `fmt::Write` (scoped, unnamed) so `write!` targets the pre-sized String in place — one
+    // allocation total, vs `push_str(&format!(...))` which heap-allocates a String per byte. Writing
+    // to a String is infallible, so the Result is discarded.
+    use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
     let mut s = String::with_capacity(digest.len() * 2);
     for b in digest {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
@@ -123,5 +127,17 @@ mod tests {
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+        // SHA-256("abc") — its 6th digest byte is `0x01`, so this also locks the leading-zero padding
+        // that the `write!("{b:02x}")` encoding must preserve.
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // Encoding invariant: always 64 lowercase hex chars.
+        let h = sha256_hex(b"jitgen");
+        assert_eq!(h.len(), 64);
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 }
