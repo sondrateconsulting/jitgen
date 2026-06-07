@@ -38,6 +38,11 @@ pub use target::{RiskScore, SymbolKind, Target};
 /// changes; persisted alongside data so older runs can be migrated.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// The marker appended to a string truncated by a length cap. Single source of truth so every cap
+/// site (report fields, persisted state error strings, LLM context packing) shows the SAME suffix
+/// rather than drifting (`…[truncated]` vs `…[capped]`).
+pub const TRUNCATION_MARKER: &str = "…[truncated]";
+
 /// The crate (and binary) semantic version, taken from Cargo at build time.
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

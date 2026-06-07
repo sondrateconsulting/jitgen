@@ -56,7 +56,10 @@ fn ensure_safe_run_id(run_id: &str) -> Result<()> {
 /// (the F5 redactor + F7 sandbox output handling) which must pass already-redacted strings here.
 const MAX_ERROR_LEN: usize = 8 * 1024;
 
-/// Truncate `s` to at most `max` bytes on a UTF-8 char boundary, appending a marker if cut.
+/// Cap a stored string: if it exceeds `max` bytes, keep a `max`-byte UTF-8-boundary prefix and append
+/// the shared [`jitgen_core::TRUNCATION_MARKER`] (same suffix as the report/context cap sites). The cut
+/// result is therefore up to `max + TRUNCATION_MARKER.len()` bytes — fine here, since the only caller
+/// caps the persisted `error` field whose ceiling ([`MAX_ERROR_LEN`]) dwarfs the marker.
 fn cap_str(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -65,7 +68,7 @@ fn cap_str(s: &str, max: usize) -> String {
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…[truncated]", &s[..end])
+    format!("{}{}", &s[..end], jitgen_core::TRUNCATION_MARKER)
 }
 
 fn init_pragmas(conn: &Connection) -> Result<()> {
@@ -650,6 +653,40 @@ mod tests {
         // Changed inputs → step reset AND its artifact rows dropped.
         run.record_step("s1", 1, "k", "hash-B").unwrap();
         assert!(run.artifacts().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finish_step_caps_oversized_error_with_the_shared_marker() {
+        // `cap_str` truncates the persisted `error` and appends the shared marker. This guards the
+        // state cap site against drifting from the report/context suffix: an over-`MAX_ERROR_LEN`
+        // message must round-trip ending in `jitgen_core::TRUNCATION_MARKER`, bounded by
+        // `MAX_ERROR_LEN + marker` (the marker is appended OUTSIDE the prefix here — see `cap_str`).
+        let root = temp_root("cap-error");
+        let store = RunStore::open(&root).unwrap();
+        let run = store.create_run(&meta("run-cap")).unwrap();
+
+        run.record_step("s1", 1, "execute", "h").unwrap();
+        let huge = "e".repeat(MAX_ERROR_LEN * 2);
+        run.finish_step("s1", StepStatus::Failed, Some(&huge))
+            .unwrap();
+        let stored = run.step("s1").unwrap().unwrap().error.unwrap();
+        assert!(
+            stored.ends_with(jitgen_core::TRUNCATION_MARKER),
+            "stored error should end with the shared marker, got tail: {:?}",
+            &stored[stored.len().saturating_sub(24)..]
+        );
+        assert!(stored.len() <= MAX_ERROR_LEN + jitgen_core::TRUNCATION_MARKER.len());
+
+        // A short error is stored verbatim — no marker appended.
+        run.record_step("s2", 2, "execute", "h").unwrap();
+        run.finish_step("s2", StepStatus::Failed, Some("boom"))
+            .unwrap();
+        assert_eq!(
+            run.step("s2").unwrap().unwrap().error.as_deref(),
+            Some("boom")
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

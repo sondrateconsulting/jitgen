@@ -14,8 +14,9 @@
 //!
 //! All public helpers sanitize internally, so callers cannot forget step 1.
 
-/// Truncation marker appended when a value is capped.
-const CAP_MARKER: &str = "…[capped]";
+/// Truncation marker appended when a value is capped. Shared across crates via `jitgen_core` so the
+/// report, state, and context cap sites never drift to different suffixes.
+const CAP_MARKER: &str = jitgen_core::TRUNCATION_MARKER;
 
 /// Default caps (bytes) for the common field classes. Generous enough for real content, tight enough
 /// to bound a hostile flood.
@@ -323,6 +324,23 @@ mod tests {
         let s = "héllo wörld 🌍 ".repeat(100);
         for max in 0..40 {
             let out = cap(&s, max);
+            assert!(out.len() <= max, "max={max} len={}", out.len());
+            assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn cap_appends_shared_marker_and_respects_max_around_marker_length() {
+        // A clearly-over-cap value ends with the shared marker and never exceeds `max`. Exercises the
+        // boundary straddling the marker's own byte length (the marker is multi-byte: `…` + text), so a
+        // longer/shorter shared marker can never make `cap` exceed `max` or split a UTF-8 boundary.
+        let long = "x".repeat(100);
+        let marker_len = jitgen_core::TRUNCATION_MARKER.len();
+        let ample = cap(&long, marker_len + 26);
+        assert!(ample.ends_with(jitgen_core::TRUNCATION_MARKER), "{ample}");
+        assert!(ample.len() <= marker_len + 26);
+        for max in marker_len.saturating_sub(4)..=(marker_len + 1) {
+            let out = cap(&long, max);
             assert!(out.len() <= max, "max={max} len={}", out.len());
             assert!(std::str::from_utf8(out.as_bytes()).is_ok());
         }

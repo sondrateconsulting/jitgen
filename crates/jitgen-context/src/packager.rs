@@ -9,7 +9,8 @@ use jitgen_core::{ContextBudget, ContextBundle, ContextItem, ContextItemKind, Ta
 /// Rough chars-per-token used to approximate the token budget.
 const CHARS_PER_TOKEN: usize = 4;
 
-const TRUNC_MARKER: &str = "…[truncated]";
+/// Shared with the report and state cap sites via `jitgen_core` so the truncation suffix never drifts.
+const TRUNC_MARKER: &str = jitgen_core::TRUNCATION_MARKER;
 
 /// Hard ceiling on bytes fed to the redaction regexes per item, independent of the (usually much
 /// smaller) per-file cap. Bounds worst-case regex work even if a future caller (stdout, repair
