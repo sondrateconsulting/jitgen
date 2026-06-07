@@ -99,220 +99,239 @@ pub fn process_target(
         ..TargetOutcome::default()
     };
 
+    let pipeline = Pipeline {
+        provider,
+        executor,
+        rt,
+        context,
+        prompt_hints,
+        cfg,
+    };
+
     // Strategy A: harden / dodgy-diff produce candidates the orchestrator must run+classify+repair.
     for candidate in generated.candidates {
-        process_candidate(
-            provider,
-            executor,
-            rt,
-            context,
-            prompt_hints,
-            cfg,
-            candidate,
-            &mut out,
-        )?;
+        pipeline.candidate(candidate, &mut out)?;
     }
 
     // Strategy B: intent-aware already ran+classified each killing test; harvest the weak catches.
     for harvested in generated.catches {
-        process_harvested(provider, executor, rt, context, cfg, harvested, &mut out)?;
+        pipeline.harvested(harvested, &mut out)?;
     }
 
     Ok(out)
 }
 
-/// Run a harden/dodgy candidate through repair → flake → (assess) → accept/reject.
-#[allow(clippy::too_many_arguments)]
-fn process_candidate(
-    provider: &dyn LlmProvider,
-    executor: &dyn Executor,
-    rt: &RankedTarget,
-    context: &ContextBundle,
-    prompt_hints: &[String],
-    cfg: &RunConfig,
-    candidate: jitgen_core::TestCandidate,
-    out: &mut TargetOutcome,
-) -> Result<()> {
-    let language = rt.target.adapter.as_str();
-    let template = build_template(
-        context,
-        cfg,
-        language,
-        rt.target.symbol.as_deref(),
-        prompt_hints,
-    );
+/// The invariant collaborators for processing one ranked target: the LLM provider, the sandbox
+/// executor, the target + its context bundle, the repo prompt hints, and the run config. Bundling them
+/// lets each pipeline stage be a small method instead of repeating a 6+-argument signature (and the
+/// matching `#[allow(clippy::too_many_arguments)]`).
+struct Pipeline<'a> {
+    provider: &'a dyn LlmProvider,
+    executor: &'a dyn Executor,
+    rt: &'a RankedTarget,
+    context: &'a ContextBundle,
+    prompt_hints: &'a [String],
+    cfg: &'a RunConfig,
+}
 
-    let report = repair_loop(
-        provider,
-        executor,
-        candidate,
-        &template,
-        cfg.mode,
-        &cfg.repair_cfg,
-    )?;
-    let candidate = report.candidate.clone();
-    let path = candidate.rel_path.clone();
+impl Pipeline<'_> {
+    /// Run a harden/dodgy candidate through repair → flake → classify → accept/catch/reject.
+    fn candidate(
+        &self,
+        candidate: jitgen_core::TestCandidate,
+        out: &mut TargetOutcome,
+    ) -> Result<()> {
+        let language = self.rt.target.adapter.as_str();
+        let template = build_template(
+            self.context,
+            self.cfg,
+            language,
+            self.rt.target.symbol.as_deref(),
+            self.prompt_hints,
+        );
 
-    if report.outcome != RepairOutcome::Accepted {
-        out.rejected.push(reject(
-            rt,
-            &path,
-            match report.outcome {
-                RepairOutcome::Exhausted => "repair budget exhausted before reaching goal",
-                RepairOutcome::Rejected => "failed static validation (dangerous construct)",
-                RepairOutcome::Accepted => unreachable!(),
-            },
-            Some(report.classified.class),
-        ));
-        return Ok(());
-    }
+        let report = repair_loop(
+            self.provider,
+            self.executor,
+            candidate,
+            &template,
+            self.cfg.mode,
+            &self.cfg.repair_cfg,
+        )?;
+        let candidate = report.candidate.clone();
+        let path = candidate.rel_path.clone();
 
-    // Flake filter: rerun to drop nondeterministic results.
-    let stable = match cfg.mode {
-        Mode::Harden => flake_filter_single(executor, &candidate, &Variant::Head, &cfg.flake_cfg)?,
-        Mode::Catch => flake_filter_catch(executor, &candidate, &cfg.flake_cfg)?,
-    };
-    if !stable.stable {
-        out.rejected.push(reject(
-            rt,
-            &path,
-            "flaky (nondeterministic across reruns)",
-            Some(CatchClass::Flaky),
-        ));
-        return Ok(());
-    }
-
-    match (cfg.mode, stable.class()) {
-        (Mode::Harden, CatchClass::HardenPass) => match accept_landable(rt, &candidate, language) {
-            Ok(t) => out.accepted.push(t),
-            Err(reason) => {
-                out.rejected
-                    .push(reject(rt, &path, reason, Some(CatchClass::HardenPass)))
-            }
-        },
-        (Mode::Catch, CatchClass::WeakCatch) => {
-            // Re-derive the observed base+head execution for assessment via one more paired run.
-            let exec = jitgen_core::CatchExecution {
-                base: executor.run_candidate(&candidate, &Variant::Base)?,
-                head: executor.run_candidate(&candidate, &Variant::Head)?,
-            };
-            report_assessed_catch(provider, rt, &candidate, &exec, None, context, cfg, out);
-        }
-        (_, class) => {
+        if report.outcome != RepairOutcome::Accepted {
             out.rejected.push(reject(
-                rt,
+                self.rt,
                 &path,
-                "did not reach the goal class",
-                Some(class),
+                match report.outcome {
+                    RepairOutcome::Exhausted => "repair budget exhausted before reaching goal",
+                    RepairOutcome::Rejected => "failed static validation (dangerous construct)",
+                    RepairOutcome::Accepted => unreachable!(),
+                },
+                Some(report.classified.class),
             ));
+            return Ok(());
         }
-    }
-    Ok(())
-}
 
-/// Process an intent-aware harvested catch (already replayed on base+head).
-fn process_harvested(
-    provider: &dyn LlmProvider,
-    executor: &dyn Executor,
-    rt: &RankedTarget,
-    context: &ContextBundle,
-    cfg: &RunConfig,
-    harvested: HarvestedCatch,
-    out: &mut TargetOutcome,
-) -> Result<()> {
-    let path = harvested.candidate.rel_path.clone();
-    if harvested.class != CatchClass::WeakCatch {
-        out.rejected.push(reject(
-            rt,
-            &path,
-            "replay was not a weak catch",
-            Some(harvested.class),
+        // Flake filter: rerun to drop nondeterministic results.
+        let stable = match self.cfg.mode {
+            Mode::Harden => flake_filter_single(
+                self.executor,
+                &candidate,
+                &Variant::Head,
+                &self.cfg.flake_cfg,
+            )?,
+            Mode::Catch => flake_filter_catch(self.executor, &candidate, &self.cfg.flake_cfg)?,
+        };
+        if !stable.stable {
+            out.rejected.push(reject(
+                self.rt,
+                &path,
+                "flaky (nondeterministic across reruns)",
+                Some(CatchClass::Flaky),
+            ));
+            return Ok(());
+        }
+
+        self.classify_stable(&candidate, &path, stable.class(), out)
+    }
+
+    /// Dispatch a repaired, flake-stable candidate by (mode, class): accept a landable harden pass,
+    /// assess + surface a weak catch, or reject anything that did not reach the goal class.
+    fn classify_stable(
+        &self,
+        candidate: &jitgen_core::TestCandidate,
+        path: &str,
+        class: CatchClass,
+        out: &mut TargetOutcome,
+    ) -> Result<()> {
+        let language = self.rt.target.adapter.as_str();
+        match (self.cfg.mode, class) {
+            (Mode::Harden, CatchClass::HardenPass) => {
+                match accept_landable(self.rt, candidate, language) {
+                    Ok(t) => out.accepted.push(t),
+                    Err(reason) => out.rejected.push(reject(
+                        self.rt,
+                        path,
+                        reason,
+                        Some(CatchClass::HardenPass),
+                    )),
+                }
+            }
+            (Mode::Catch, CatchClass::WeakCatch) => {
+                // Re-derive the observed base+head execution for assessment via one more paired run.
+                let exec = jitgen_core::CatchExecution {
+                    base: self.executor.run_candidate(candidate, &Variant::Base)?,
+                    head: self.executor.run_candidate(candidate, &Variant::Head)?,
+                };
+                self.report_assessed_catch(candidate, &exec, None, out);
+            }
+            (_, class) => {
+                out.rejected.push(reject(
+                    self.rt,
+                    path,
+                    "did not reach the goal class",
+                    Some(class),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Process an intent-aware harvested catch (already replayed on base+head).
+    fn harvested(&self, harvested: HarvestedCatch, out: &mut TargetOutcome) -> Result<()> {
+        let path = harvested.candidate.rel_path.clone();
+        if harvested.class != CatchClass::WeakCatch {
+            out.rejected.push(reject(
+                self.rt,
+                &path,
+                "replay was not a weak catch",
+                Some(harvested.class),
+            ));
+            return Ok(());
+        }
+        // The flake filter must CONFIRM a stable weak catch: `stable.stable` alone is insufficient — an
+        // initial one-off WeakCatch whose confirmation runs are all a stable `NoCatch` is also "stable",
+        // and assessing the original (stale) WeakCatch evidence could manufacture a strong catch (T1/F9).
+        let stable = flake_filter_catch(self.executor, &harvested.candidate, &self.cfg.flake_cfg)?;
+        if !(stable.stable && stable.class() == CatchClass::WeakCatch) {
+            out.rejected.push(reject(
+                self.rt,
+                &path,
+                "did not stably reproduce as a weak catch across reruns",
+                Some(if stable.stable {
+                    stable.class()
+                } else {
+                    CatchClass::Flaky
+                }),
+            ));
+            return Ok(());
+        }
+        let mutant = MutantInfo {
+            id: harvested.mutant.id.clone(),
+            risk_description: redact(&harvested.mutant.risk_description).text,
+            path: redact(&harvested.mutant.path).text,
+        };
+        // Assess a FRESH confirmed base+head execution (not the original replay) so the evidence the
+        // assessor sees matches the stable confirmation above.
+        let exec = jitgen_core::CatchExecution {
+            base: self
+                .executor
+                .run_candidate(&harvested.candidate, &Variant::Base)?,
+            head: self
+                .executor
+                .run_candidate(&harvested.candidate, &Variant::Head)?,
+        };
+        self.report_assessed_catch(&harvested.candidate, &exec, Some(mutant), out);
+        Ok(())
+    }
+
+    /// Assess a confirmed weak catch and **surface it** as a [`CatchReport`] carrying the assessor's
+    /// decision. Every assessed weak catch is reported — a `StrictlyWeak` or `Uncertain` verdict is
+    /// surfaced at a *lower severity* (`jitgen_report::severity_of`) rather than dropped, so the report
+    /// is transparent about what the run found. Only a `StrongCatch` can trip the findings gate
+    /// (`gate.rs`), so surfacing the weaker verdicts never changes the exit code. (Pre-assessment
+    /// failures — flaky, off-goal, repair-exhausted — are filtered into `rejected` upstream of this.)
+    fn report_assessed_catch(
+        &self,
+        candidate: &jitgen_core::TestCandidate,
+        exec: &jitgen_core::CatchExecution,
+        mutant: Option<MutantInfo>,
+        out: &mut TargetOutcome,
+    ) {
+        let judge: Option<&dyn LlmProvider> = if self.cfg.real_llm {
+            Some(self.provider)
+        } else {
+            None
+        };
+        let assessment = assess(exec, true, Some(self.context), judge, &self.cfg.assess_cfg);
+        let language = self.rt.target.adapter.as_str();
+        let path = candidate.rel_path.clone();
+
+        out.catches.push(CatchReport::from_assessment(
+            self.rt.target.id.to_string(),
+            language,
+            report_path(&path),
+            redact(&candidate.source).text,
+            &assessment,
+            mutant,
+            // The changed production location this catch concerns (for line-precise SARIF): the
+            // target's changed file + the first line of its changed span. For a symbol target that span
+            // start is the symbol's declaration line (the changed *unit*); for a hunk target it is the
+            // changed hunk line. Authoritative (diff / tree-sitter derived), unlike the LLM-supplied
+            // mutant path. Always `Some` for a newly produced report — a stored pre-E6 report
+            // deserializes these fields as `None`.
+            Some(report_path(&self.rt.target.path)),
+            Some(self.rt.target.span.start),
+            redact(&reproduction(language, &candidate.rel_path)).text,
+            // The deterministic base+head evidence the assessor gated on, surfaced (redacted + capped)
+            // so `jitgen demo` can SHOW the passing/failing runs. Gated to the demo path only: a
+            // production run against a hostile repo must NOT persist arbitrary test output (S1).
+            self.cfg.surface_evidence.then(|| catch_evidence(exec)),
         ));
-        return Ok(());
     }
-    // The flake filter must CONFIRM a stable weak catch: `stable.stable` alone is insufficient — an
-    // initial one-off WeakCatch whose confirmation runs are all a stable `NoCatch` is also "stable",
-    // and assessing the original (stale) WeakCatch evidence could manufacture a strong catch (T1/F9).
-    let stable = flake_filter_catch(executor, &harvested.candidate, &cfg.flake_cfg)?;
-    if !(stable.stable && stable.class() == CatchClass::WeakCatch) {
-        out.rejected.push(reject(
-            rt,
-            &path,
-            "did not stably reproduce as a weak catch across reruns",
-            Some(if stable.stable {
-                stable.class()
-            } else {
-                CatchClass::Flaky
-            }),
-        ));
-        return Ok(());
-    }
-    let mutant = MutantInfo {
-        id: harvested.mutant.id.clone(),
-        risk_description: redact(&harvested.mutant.risk_description).text,
-        path: redact(&harvested.mutant.path).text,
-    };
-    // Assess a FRESH confirmed base+head execution (not the original replay) so the evidence the
-    // assessor sees matches the stable confirmation above.
-    let exec = jitgen_core::CatchExecution {
-        base: executor.run_candidate(&harvested.candidate, &Variant::Base)?,
-        head: executor.run_candidate(&harvested.candidate, &Variant::Head)?,
-    };
-    report_assessed_catch(
-        provider,
-        rt,
-        &harvested.candidate,
-        &exec,
-        Some(mutant),
-        context,
-        cfg,
-        out,
-    );
-    Ok(())
-}
-
-/// Assess a confirmed weak catch and **surface it** as a [`CatchReport`] carrying the assessor's
-/// decision. Every assessed weak catch is reported — a `StrictlyWeak` or `Uncertain` verdict is
-/// surfaced at a *lower severity* (`jitgen_report::severity_of`) rather than dropped, so the report is
-/// transparent about what the run found. Only a `StrongCatch` can trip the findings gate (`gate.rs`),
-/// so surfacing the weaker verdicts never changes the exit code. (Pre-assessment failures — flaky,
-/// off-goal, repair-exhausted — are filtered into `rejected` upstream of this function.)
-#[allow(clippy::too_many_arguments)]
-fn report_assessed_catch(
-    provider: &dyn LlmProvider,
-    rt: &RankedTarget,
-    candidate: &jitgen_core::TestCandidate,
-    exec: &jitgen_core::CatchExecution,
-    mutant: Option<MutantInfo>,
-    context: &ContextBundle,
-    cfg: &RunConfig,
-    out: &mut TargetOutcome,
-) {
-    let judge: Option<&dyn LlmProvider> = if cfg.real_llm { Some(provider) } else { None };
-    let assessment = assess(exec, true, Some(context), judge, &cfg.assess_cfg);
-    let language = rt.target.adapter.as_str();
-    let path = candidate.rel_path.clone();
-
-    out.catches.push(CatchReport::from_assessment(
-        rt.target.id.to_string(),
-        language,
-        report_path(&path),
-        redact(&candidate.source).text,
-        &assessment,
-        mutant,
-        // The changed production location this catch concerns (for line-precise SARIF): the target's
-        // changed file + the first line of its changed span. For a symbol target that span start is the
-        // symbol's declaration line (the changed *unit*); for a hunk target it is the changed hunk line.
-        // Authoritative (diff / tree-sitter derived), unlike the LLM-supplied mutant path. Always `Some`
-        // for a newly produced report — a stored pre-E6 report deserializes these fields as `None`.
-        Some(report_path(&rt.target.path)),
-        Some(rt.target.span.start),
-        redact(&reproduction(language, &candidate.rel_path)).text,
-        // The deterministic base+head evidence the assessor gated on, surfaced (redacted + capped) so
-        // `jitgen demo` can SHOW the passing/failing runs. Gated to the demo path only: a production
-        // run against a hostile repo must NOT persist arbitrary test output into the report (S1).
-        cfg.surface_evidence.then(|| catch_evidence(exec)),
-    ));
 }
 
 /// Max chars of redacted base/head output kept per side in a [`CatchEvidence`] (bounds the report
@@ -803,16 +822,19 @@ mod tests {
             ..RunConfig::default()
         };
         let mut out = TargetOutcome::default();
-        process_harvested(
-            &MockProvider::new(),
-            &PassBothExec,
-            &ranked(SymbolKind::Function),
-            &ctx(),
-            &cfg,
-            harvested,
-            &mut out,
-        )
-        .unwrap();
+        let provider = MockProvider::new();
+        let executor = PassBothExec;
+        let rt = ranked(SymbolKind::Function);
+        let context = ctx();
+        let pipeline = Pipeline {
+            provider: &provider,
+            executor: &executor,
+            rt: &rt,
+            context: &context,
+            prompt_hints: &[],
+            cfg: &cfg,
+        };
+        pipeline.harvested(harvested, &mut out).unwrap();
         assert!(
             out.catches.is_empty(),
             "non-reproducing catch must not be reported: {out:?}"

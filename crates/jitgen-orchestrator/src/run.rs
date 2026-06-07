@@ -200,45 +200,23 @@ fn drive_run(
     let overlays_root = run.dir().join("overlays");
     std::fs::create_dir_all(&overlays_root)?;
     let state_root = store.root().to_path_buf();
-
     let config_fp = config_fingerprint(trusted);
-    let provider_ref = provider.as_ref();
-    let outcomes = drive_targets(run, &ranked, &config_fp, |rt| {
-        let adapter =
-            registry
-                .adapter(&rt.target.adapter)
-                .ok_or_else(|| OrchestratorError::Invalid {
-                    what: "adapter",
-                    detail: format!("no adapter {:?} for target", rt.target.adapter.as_str()),
-                })?;
-        let executor = SandboxExecutor::new(
-            repo,
-            &snapshot,
-            &resolved,
-            adapter,
-            &rt.target,
-            base_oid,
-            head_oid,
-            &sandbox,
-            &state_root,
-            &overlays_root,
-        );
-        let context = crate::context::build_context(
-            &snapshot,
-            &rt.target,
-            &changes,
-            resolved.mode(),
-            ContextBudget::default(),
-        );
-        process_target(
-            provider_ref,
-            &executor,
-            rt,
-            &context,
-            &resolved.repo.prompt_hints,
-            &run_config,
-        )
-    })?;
+
+    let driver = TargetDriver {
+        registry: &registry,
+        repo,
+        snapshot: &snapshot,
+        resolved: &resolved,
+        changes: &changes,
+        sandbox: &sandbox,
+        provider: provider.as_ref(),
+        run_config: &run_config,
+        base_oid,
+        head_oid,
+        state_root: &state_root,
+        overlays_root: &overlays_root,
+    };
+    let outcomes = drive_targets(run, &ranked, &config_fp, |rt| driver.process(rt))?;
 
     // Warnings can echo untrusted repo input (e.g. a non-allowlisted `grammar:` value from
     // `.jitgen.yaml`), so redact every warning before it enters the report (conformance #6, S1/F9).
@@ -256,9 +234,72 @@ fn drive_run(
         &outcomes,
         warnings,
     );
+    persist_report(run, &report)?;
+    Ok(report)
+}
 
-    // Persist the canonical report artifact (re-renderable by `jitgen report --run-id`).
-    let bytes = serde_json::to_vec_pretty(&report).map_err(|e| OrchestratorError::Config {
+/// The inputs one ranked target needs to be processed. Bundling them lets the per-target closure in
+/// [`drive_run`] stay a one-liner instead of a 30-line nested block, and avoids a too-many-arguments
+/// free function. Every field is a read-only borrow of `drive_run`'s locals, except the two `Oid`s
+/// which are `Copy` values.
+struct TargetDriver<'a> {
+    registry: &'a AdapterRegistry,
+    repo: &'a Repository,
+    snapshot: &'a RepoSnapshot,
+    resolved: &'a ResolvedConfig,
+    changes: &'a ChangeSet,
+    sandbox: &'a Sandbox,
+    provider: &'a dyn LlmProvider,
+    run_config: &'a RunConfig,
+    base_oid: Oid,
+    head_oid: Oid,
+    state_root: &'a Path,
+    overlays_root: &'a Path,
+}
+
+impl TargetDriver<'_> {
+    /// Build the executor + context for one ranked target and run it through the generation pipeline.
+    fn process(&self, rt: &RankedTarget) -> Result<TargetOutcome> {
+        let adapter = self.registry.adapter(&rt.target.adapter).ok_or_else(|| {
+            OrchestratorError::Invalid {
+                what: "adapter",
+                detail: format!("no adapter {:?} for target", rt.target.adapter.as_str()),
+            }
+        })?;
+        let executor = SandboxExecutor::new(
+            self.repo,
+            self.snapshot,
+            self.resolved,
+            adapter,
+            &rt.target,
+            self.base_oid,
+            self.head_oid,
+            self.sandbox,
+            self.state_root,
+            self.overlays_root,
+        );
+        let context = crate::context::build_context(
+            self.snapshot,
+            &rt.target,
+            self.changes,
+            self.resolved.mode(),
+            ContextBudget::default(),
+        );
+        process_target(
+            self.provider,
+            &executor,
+            rt,
+            &context,
+            &self.resolved.repo.prompt_hints,
+            self.run_config,
+        )
+    }
+}
+
+/// Persist the canonical report as the `report.json` artifact (re-renderable by `jitgen report
+/// --run-id`). Recorded as a final terminal step so a resumed run rewrites it idempotently.
+fn persist_report(run: &RunHandle, report: &RunReport) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(report).map_err(|e| OrchestratorError::Config {
         detail: format!("failed to serialize report: {e}"),
     })?;
     run.record_step(
@@ -270,7 +311,7 @@ fn drive_run(
     run.begin_step("report")?;
     run.publish_artifact("report.json", &bytes, "report", "report")?;
     run.finish_step("report", StepStatus::Succeeded, None)?;
-    Ok(report)
+    Ok(())
 }
 
 /// Drive each ranked target with per-target checkpointing. A target whose step is already `succeeded`
