@@ -626,7 +626,8 @@ pub fn read_blob_at(repo: &Repository, oid: Oid, rel_path: &str) -> Result<Optio
 }
 
 /// Reject a repo-relative path that is empty, absolute, contains `..`, a backslash, a Windows
-/// drive-prefix, or root/prefix components (F3/S1 review #1). Lexical; safe for cross-platform input.
+/// drive-prefix, root/prefix components, or contains no real path segments (only `.` components, e.g.
+/// `"."` or `"./."`) (F3/S1 review #1). Lexical; safe for cross-platform input.
 pub fn reject_unsafe_rel(rel: &str) -> Result<()> {
     if rel.is_empty() || rel.contains('\\') {
         return Err(GitError::UnsafePath(rel.to_string()));
@@ -636,11 +637,22 @@ pub fn reject_unsafe_rel(rel: &str) -> Result<()> {
     if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
         return Err(GitError::UnsafePath(rel.to_string()));
     }
+    let mut saw_normal = false;
     for comp in Path::new(rel).components() {
         match comp {
-            Component::Normal(_) | Component::CurDir => {}
+            Component::Normal(_) => saw_normal = true,
+            Component::CurDir => {}
             _ => return Err(GitError::UnsafePath(rel.to_string())),
         }
+    }
+    // A path made only of `.` components ("." / "./." / "./") has no real (Normal) segment, so it does
+    // not name a file. Reject it — requiring at least one real segment — mirroring the lone-dot check
+    // in `jitgen-materialize`'s overlay validator (`validate_rel`). Note: that validator additionally
+    // caps path length and component depth; this guard is purely lexical and intentionally does not —
+    // length bounds, where a caller admits non-tree input (e.g. mutant paths parsed from provider
+    // output), are applied at that caller's parse site, not here.
+    if !saw_normal {
+        return Err(GitError::UnsafePath(rel.to_string()));
     }
     Ok(())
 }
@@ -773,8 +785,31 @@ mod tests {
             read_blob_at(&repo, head, "/etc/passwd"),
             Err(GitError::UnsafePath(_))
         ));
+        // The lone-dot rejection also surfaces through the public read API (via resolve_blob_oid),
+        // not just the direct classifier — without it, `.` is silently treated as absent (Ok(None))
+        // instead of rejected.
+        assert!(matches!(
+            read_blob_at(&repo, head, "."),
+            Err(GitError::UnsafePath(_))
+        ));
         assert!(reject_unsafe_rel("a/../b").is_err());
+        // A path that normalizes to the root (only `.` components) is rejected — it is not a file.
+        assert!(matches!(
+            reject_unsafe_rel("."),
+            Err(GitError::UnsafePath(_))
+        ));
+        assert!(matches!(
+            reject_unsafe_rel("./."),
+            Err(GitError::UnsafePath(_))
+        ));
+        assert!(matches!(
+            reject_unsafe_rel("./"),
+            Err(GitError::UnsafePath(_))
+        ));
+        // A `.` segment alongside a real segment is harmless (normalized away) and still accepted.
         assert!(reject_unsafe_rel("src/lib.rs").is_ok());
+        assert!(reject_unsafe_rel("./src/lib.rs").is_ok());
+        assert!(reject_unsafe_rel("a/./b").is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
