@@ -212,7 +212,15 @@ fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture
                     // thread can snapshot between chunks even if a later read blocks forever.
                     let mut g = match buf_w.lock() {
                         Ok(g) => g,
-                        Err(_) => break,
+                        // A poisoned buffer lock (a panic while holding the guard) leaves the
+                        // capture an arbitrary prefix — the same partial-data contract as the
+                        // read-error arm below — so flag truncation before breaking. Unreachable
+                        // today (the guarded body only `extend`s, never panics), kept as the
+                        // fail-closed default: every early break from this loop flags truncation.
+                        Err(_) => {
+                            trunc_w.store(true, Ordering::Relaxed);
+                            break;
+                        }
                     };
                     if g.len() < cap {
                         let take = (cap - g.len()).min(n);
@@ -227,7 +235,14 @@ fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture
                         trunc_w.store(true, Ordering::Relaxed);
                     }
                 }
-                Err(_) => break,
+                // A mid-stream read error (e.g. a transient pipe glitch before the child exits)
+                // leaves the captured bytes an arbitrary prefix — exactly the truncated contract.
+                // Flag it before breaking so `redact_capped` applies its cap-boundary tail guard;
+                // a clean EOF (`Ok(0)` above) returns the complete stream and is NOT flagged.
+                Err(_) => {
+                    trunc_w.store(true, Ordering::Relaxed);
+                    break;
+                }
             }
         }
     });
@@ -378,7 +393,8 @@ mod tests {
     /// (the bytes written before the panic); `truncated` is the flag the cap would carry at panic
     /// time. The thread is bounded-waited to completion so the mutex is guaranteed poisoned and the
     /// handle is `is_finished()` before we hand it to `collect`.
-    /// (The deliberate panic prints a backtrace to stderr — expected, harmless.)
+    /// (The deliberate panic prints a panic message to stderr — expected, harmless; a backtrace only
+    /// if `RUST_BACKTRACE` is set.)
     fn poisoned_capture(initial: &[u8], truncated: bool) -> Capture {
         let buf = Arc::new(Mutex::new(initial.to_vec()));
         let writer = Arc::clone(&buf);
@@ -467,6 +483,132 @@ mod tests {
             "an unfinished reader must flag truncation even when poison recovery runs"
         );
         drop(tx); // release the parked reader thread
+    }
+
+    #[test]
+    fn capture_flags_truncation_on_mid_stream_read_error() {
+        use std::io;
+
+        // A reader that yields some bytes, then fails with an I/O error *before* EOF — a transient
+        // pipe glitch mid-stream. The partial bytes must survive AND the result must be flagged
+        // truncated, so `redact_capped` applies its cap-boundary tail guard to that boundary. The
+        // cap (1 KiB) is far larger than the payload, so the only path to `truncated` is the error
+        // arm — distinguishing this from a clean EOF (`Ok(0)`), which must NOT flag truncation.
+        struct FailAfter {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl Read for FailAfter {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.pos < self.data.len() {
+                    let n = (self.data.len() - self.pos).min(buf.len());
+                    buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                    self.pos += n;
+                    Ok(n)
+                } else {
+                    Err(io::Error::other("transient pipe glitch"))
+                }
+            }
+        }
+
+        let reader = FailAfter {
+            data: b"partial output".to_vec(),
+            pos: 0,
+        };
+        let cap = spawn_capture(reader, 1024);
+        let (buf, trunc) = collect(Some(cap));
+        assert_eq!(buf, b"partial output");
+        assert!(trunc, "a mid-stream read error must flag truncation");
+    }
+
+    #[test]
+    fn capture_flags_truncation_when_buffer_lock_is_poisoned() {
+        use std::sync::mpsc;
+
+        // Drive the reader to the `buf_w.lock()` poison arm *deterministically* (no sleeps): the
+        // reader parks inside `read()` until we have poisoned the shared buffer mutex, then returns
+        // bytes so its very next `buf_w.lock()` observes the poison and takes the `Err` arm. That
+        // arm must flag truncation (a poisoned lock leaves a partial prefix). The reader cannot have
+        // locked yet while parked in `read()`, so the poisoning is race-free. The deliberate panic
+        // that poisons the mutex is muted with a temporary no-op panic hook so the run stays quiet.
+        struct GatedRead {
+            entered: mpsc::Sender<()>,
+            proceed: mpsc::Receiver<()>,
+            done: bool,
+        }
+        impl Read for GatedRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.done {
+                    return Ok(0);
+                }
+                // Announce we are inside read() (reader is alive, has NOT locked), then block.
+                let _ = self.entered.send(());
+                let _ = self.proceed.recv();
+                self.done = true;
+                let n = b"partial".len().min(buf.len());
+                buf[..n].copy_from_slice(&b"partial"[..n]);
+                Ok(n)
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let cap = spawn_capture(
+            GatedRead {
+                entered: entered_tx,
+                proceed: proceed_rx,
+                done: false,
+            },
+            1024,
+        );
+
+        // Wait (bounded) until the reader is parked inside read() so it cannot hold buf's lock yet.
+        // `recv_timeout` (not `recv`) so a future regression that never reaches read() fails loudly
+        // instead of hanging the test forever.
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader never entered read()");
+
+        // Poison the shared buffer mutex on THIS thread (no helper thread — no extra spawn failure
+        // point): panicking while holding the guard makes the guard's Drop mark the mutex poisoned.
+        // Mute the expected panic with a temporary no-op hook. The panic MUST be bracketed by
+        // `catch_unwind` because `set_hook` itself panics if called while the thread is unwinding —
+        // catch_unwind absorbs the poison panic so the thread is no longer panicking when we restore
+        // the real hook on the next line. Restoration runs before the assertions below, so a later
+        // failure here still prints. Residual: the hook is process-global, so while installed it also
+        // swallows the diagnostics of any *concurrent* panic in the process (e.g. a sibling poison
+        // test); only this test mutates the hook, and the window is a single catch_unwind.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoner = Arc::clone(&cap.buf);
+        // Expected to return Err (the closure's only panic is the intended one) — discard it; the
+        // poison is the desired effect, not a failure to propagate.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _g = poisoner.lock().unwrap();
+            panic!("poison the capture buffer mutex");
+        }));
+        std::panic::set_hook(prev_hook);
+
+        // Release the reader: read() returns bytes, then buf_w.lock() observes the poison.
+        proceed_tx.send(()).unwrap();
+
+        // Wait for the reader to actually finish (via the poison arm) BEFORE collecting, so the only
+        // route to `truncated` is the poison-arm store — not `collect`'s `!finished` grace-timeout
+        // fallback. This makes the test a strict regression guard: revert the store and it fails.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cap.handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "reader did not finish after release"
+            );
+            thread::yield_now();
+        }
+
+        let (_buf, trunc) = collect(Some(cap));
+        assert!(
+            trunc,
+            "a poisoned buffer-lock early-break must flag truncation"
+        );
     }
 
     #[test]
