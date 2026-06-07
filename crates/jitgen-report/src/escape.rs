@@ -170,9 +170,6 @@ pub fn md_inline(s: &str, max: usize) -> String {
     out
 }
 
-/// Marker used to neutralize a code-fence run found inside untrusted block content.
-const FENCE_NEUTRAL: &str = "`\u{200B}`\u{200B}`";
-
 /// Sanitize untrusted multi-line content for embedding **inside a fenced Markdown code block**.
 /// Backtick runs of length >= 3 (which could close the fence) are neutralized; controls are stripped;
 /// length is capped. The caller wraps the result in a fence (this crate uses a `~~~` fence, which a
@@ -216,7 +213,6 @@ pub fn md_code_block(s: &str, max: usize) -> String {
     }
     flush(&mut out, &mut backticks, '`');
     flush(&mut out, &mut tildes, '~');
-    let _ = FENCE_NEUTRAL; // documented constant; the inline logic above implements the neutralization
     out
 }
 
