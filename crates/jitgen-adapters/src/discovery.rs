@@ -4,6 +4,7 @@ use crate::builtin::{GenericAdapter, JavaAdapter, PythonAdapter, RustAdapter, Ty
 use crate::snapshot::RepoSnapshot;
 use crate::spi::{AdapterContext, DetectionResult, LanguageAdapter};
 use jitgen_core::{AdapterId, ChangeSet, RepoConfig, Target, TargetId};
+use std::collections::HashMap;
 
 /// Which adapters apply to a repository, with their detection evidence.
 #[derive(Debug, Clone)]
@@ -71,6 +72,36 @@ impl AdapterRegistry {
                 targets.extend(a.analyze_changes(ctx, changes));
             }
         }
+        // Cross-adapter de-duplication: keep, per file path, only the targets from the FIRST adapter to
+        // claim that path. Registry order lists the specific builtin adapters before the generic one, so
+        // a redundantly-configured generic adapter (e.g. `extensions: [rs]` alongside the Rust builtin)
+        // can no longer double-count one changed file as two catches. Targets from the *same* adapter
+        // for a path (distinct symbols/spans) are all preserved, and a path no builtin emitted a target
+        // for still reaches the generic adapter (ownership is recorded from emitted targets, not
+        // detection). Builtin spans (symbol-granular) and generic spans (hunk-granular) differ, so this
+        // keys on path — not (path, span) — to actually collapse the overlap.
+        //
+        // Two passes so the ownership map can borrow paths/ids straight out of `targets` without
+        // cloning: `retain` hands its closure only a per-element borrow, too short-lived to store in a
+        // map that outlives the call. The immutable pass builds a keep-mask (ending those borrows),
+        // then `retain` drains it.
+        let mut path_owner: HashMap<&str, &AdapterId> = HashMap::with_capacity(targets.len());
+        let keep: Vec<bool> = targets
+            .iter()
+            .map(|t| match path_owner.get(t.path.as_str()) {
+                Some(&owner) => owner == &t.adapter,
+                None => {
+                    path_owner.insert(t.path.as_str(), &t.adapter);
+                    true
+                }
+            })
+            .collect();
+        let mut keep = keep.into_iter();
+        // `keep` has exactly one entry per target (built from the same `targets` with no mutation
+        // between), and `retain` calls the predicate once per element in order — so `next()` is always
+        // `Some`. `expect` (not `unwrap_or(false)`) surfaces any future break of that 1:1 alignment
+        // loudly instead of silently dropping a target.
+        targets.retain(|_| keep.next().expect("keep mask has one entry per target"));
         for (i, t) in targets.iter_mut().enumerate() {
             t.id = TargetId::new(format!("t{i}"));
         }
@@ -219,6 +250,176 @@ mod tests {
 
     fn no_files() -> Vec<(String, Vec<u8>)> {
         Vec::new()
+    }
+
+    #[test]
+    fn generic_overlapping_a_builtin_does_not_double_target() {
+        // A repo with the Rust builtin AND a redundantly-configured generic adapter for the same `rs`
+        // extension. Without cross-adapter dedup both would emit a target for src/lib.rs (the builtin a
+        // symbol-granular one, the generic a hunk-granular one) → one changed file counted as two
+        // catches. The builtin must win (registry order) and the file must be targeted exactly once.
+        let repo_cfg = RepoConfig {
+            id: Some("custom-rust".to_string()),
+            extensions: vec!["rs".to_string()],
+            test_argv: vec!["cargo".to_string(), "test".to_string()],
+            ..RepoConfig::default()
+        };
+        let reg = AdapterRegistry::with_builtins(&repo_cfg);
+        let snap = RepoSnapshot::new(
+            ["Cargo.toml".to_string(), "src/lib.rs".to_string()],
+            [(
+                "src/lib.rs".to_string(),
+                b"fn changed() {\n  let x = 1;\n}\n".to_vec(),
+            )],
+        );
+        // Both adapters detect this repo.
+        let ids = reg.detect(&snap).adapter_ids();
+        assert!(ids.iter().any(|i| i.as_str() == "rust"));
+        assert!(ids.iter().any(|i| i.as_str() == "custom-rust"));
+
+        let cfg = ResolvedConfig::new(TrustedConfig::default(), repo_cfg, vec![]);
+        let ctx = ctx(&snap, &cfg);
+        let targets = reg.analyze(
+            &ctx,
+            &changeset("src/lib.rs", LineRange::new(2, 2).unwrap()),
+        );
+        assert_eq!(
+            targets.len(),
+            1,
+            "src/lib.rs must be targeted once, not once per overlapping adapter"
+        );
+        assert_eq!(
+            targets[0].adapter.as_str(),
+            "rust",
+            "the specific builtin adapter wins over the redundant generic one"
+        );
+    }
+
+    #[test]
+    fn distinct_symbols_in_one_file_are_not_collapsed() {
+        // No-over-collapse guard: the cross-adapter dedup keys on path, but must NOT drop distinct
+        // symbols owned by the SAME adapter. Two changed functions in one .rs file → two targets.
+        let repo_cfg = RepoConfig::default();
+        let reg = AdapterRegistry::with_builtins(&repo_cfg);
+        let snap = RepoSnapshot::new(
+            ["Cargo.toml".to_string(), "src/lib.rs".to_string()],
+            [(
+                "src/lib.rs".to_string(),
+                b"fn alpha() {\n  let a = 1;\n}\nfn beta() {\n  let b = 2;\n}\n".to_vec(),
+            )],
+        );
+        let cfg = ResolvedConfig::new(TrustedConfig::default(), repo_cfg, vec![]);
+        let changes = ChangeSet {
+            base: RevisionId::new("base"),
+            head: RevisionId::new("head"),
+            files: vec![FileChange {
+                path: "src/lib.rs".into(),
+                old_path: None,
+                kind: ChangeKind::Modified,
+                hunks: vec![LineRange::new(2, 2).unwrap(), LineRange::new(5, 5).unwrap()],
+            }],
+        };
+        let targets = reg.analyze(&ctx(&snap, &cfg), &changes);
+        assert_eq!(
+            targets.len(),
+            2,
+            "two changed symbols in one file must survive path-keyed dedup"
+        );
+        assert!(targets.iter().all(|t| t.adapter.as_str() == "rust"));
+        let mut syms: Vec<_> = targets.iter().filter_map(|t| t.symbol.as_deref()).collect();
+        syms.sort_unstable();
+        assert_eq!(syms, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn non_overlapping_builtin_and_generic_both_survive() {
+        // Inverse of the dedup bug: the cross-adapter dedup must NOT suppress the generic adapter
+        // wholesale. A path no builtin owns still reaches it. The Rust builtin owns `src/lib.rs`; a
+        // generic configured for a DIFFERENT extension (`txt`) owns `notes.txt`. A change touching
+        // both files → two targets, one per adapter, both kept. Guards a buggy `retain` predicate that
+        // could drop every generic target when there is no overlap.
+        let repo_cfg = RepoConfig {
+            id: Some("docs".to_string()),
+            extensions: vec!["txt".to_string()],
+            test_argv: vec!["true".to_string()],
+            ..RepoConfig::default()
+        };
+        let reg = AdapterRegistry::with_builtins(&repo_cfg);
+        let snap = RepoSnapshot::new(
+            [
+                "Cargo.toml".to_string(),
+                "src/lib.rs".to_string(),
+                "notes.txt".to_string(),
+            ],
+            [
+                (
+                    "src/lib.rs".to_string(),
+                    b"fn changed() {\n  let x = 1;\n}\n".to_vec(),
+                ),
+                ("notes.txt".to_string(), b"alpha\nbeta\ngamma\n".to_vec()),
+            ],
+        );
+        // Both adapters detect this repo.
+        let ids = reg.detect(&snap).adapter_ids();
+        assert!(ids.iter().any(|i| i.as_str() == "rust"));
+        assert!(ids.iter().any(|i| i.as_str() == "docs"));
+
+        let cfg = ResolvedConfig::new(TrustedConfig::default(), repo_cfg, vec![]);
+        let changes = ChangeSet {
+            base: RevisionId::new("base"),
+            head: RevisionId::new("head"),
+            files: vec![
+                FileChange {
+                    path: "src/lib.rs".into(),
+                    old_path: None,
+                    kind: ChangeKind::Modified,
+                    hunks: vec![LineRange::new(2, 2).unwrap()],
+                },
+                FileChange {
+                    path: "notes.txt".into(),
+                    old_path: None,
+                    kind: ChangeKind::Modified,
+                    hunks: vec![LineRange::new(2, 2).unwrap()],
+                },
+            ],
+        };
+        let targets = reg.analyze(&ctx(&snap, &cfg), &changes);
+        assert_eq!(
+            targets.len(),
+            2,
+            "non-overlapping builtin + generic paths must both survive dedup"
+        );
+        let owner_of = |path: &str| {
+            targets
+                .iter()
+                .find(|t| t.path == path)
+                .map(|t| t.adapter.as_str().to_string())
+        };
+        assert_eq!(owner_of("src/lib.rs").as_deref(), Some("rust"));
+        assert_eq!(owner_of("notes.txt").as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn generic_adapter_is_registered_last() {
+        // The dedup in `analyze` makes the FIRST adapter to claim a path win, which is only correct
+        // while the specific builtins precede the generic adapter (so a redundant generic config can
+        // never out-rank a builtin). Lock that registry-order invariant: appending a new builtin
+        // after the generic in `with_builtins` would silently flip the winner to hunk-granular spans.
+        let reg = AdapterRegistry::with_builtins(&RepoConfig::default());
+        let ids: Vec<String> = reg
+            .adapters
+            .iter()
+            .map(|a| a.id().as_str().to_string())
+            .collect();
+        let generic_pos = ids
+            .iter()
+            .position(|i| i == "generic")
+            .expect("generic adapter must be registered");
+        assert_eq!(
+            generic_pos,
+            ids.len() - 1,
+            "the generic adapter must be registered last, after every builtin: {ids:?}"
+        );
     }
 
     #[test]
