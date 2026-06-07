@@ -183,7 +183,21 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Some sandboxed CI/review environments forbid binding a loopback socket (EPERM/EACCES,
+        // both surfaced as `PermissionDenied`). This test needs a real listener, so skip it loudly
+        // there rather than fail — the redirect-pinning guard is also covered statically by
+        // `transport_never_follows_redirects`. Any other bind error is unexpected and still fails.
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping redirect_is_returned_not_followed_so_no_second_request_is_made: \
+                     loopback bind not permitted in this environment ({e})"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error binding loopback listener: {e}"),
+        };
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
