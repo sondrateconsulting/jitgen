@@ -332,7 +332,16 @@ pub fn describe_provider(provider: &jitgen_core::ProviderConfig) -> String {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::OpenAiCompatible => "openai-compatible",
         ProviderKind::Local => "local",
-        ProviderKind::Mock => unreachable!("mock handled above"),
+        // Unreachable by contract (`provider_is_mock` returns true for Mock and is handled above), but
+        // a diagnostic command must never hard-panic in release — degrade to a label instead of
+        // `unreachable!`. The `debug_assert!` still surfaces a bypassed guard loudly in dev/CI.
+        ProviderKind::Mock => {
+            debug_assert!(
+                false,
+                "describe_provider reached Mock; provider_is_mock guard was bypassed"
+            );
+            "mock"
+        }
     };
     let model = provider.model.as_deref().unwrap_or("(provider default)");
     let key = match jitgen_llm::provider_key_env(provider) {
@@ -381,6 +390,11 @@ mod tests {
         // Reports presence, never the value.
         assert!(present.contains("is set") && !present.contains("sk-secret"));
     }
+
+    // No dedicated test for `describe_provider`'s `ProviderKind::Mock` arm: `provider_is_mock` returns
+    // true for every Mock config and is handled by the early return above, so the arm is unreachable
+    // from any caller (tests included) without a bypass seam — its `debug_assert!` is a defensive
+    // tripwire, not testable behavior. The reachable mock path is covered by the test above.
 
     fn report_with(tools: Vec<ToolStatus>) -> DoctorReport {
         DoctorReport {

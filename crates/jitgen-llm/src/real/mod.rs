@@ -30,7 +30,8 @@ pub(crate) const MAX_OUTPUT_TOKENS: u32 = 4096;
 /// Cap for an error-body snippet surfaced to the user.
 const SNIPPET_CAP: usize = 256;
 
-/// Build a real provider from trusted config (caller guarantees `real_llm == true && kind != Mock`).
+/// Build a real provider from trusted config. Callers must ensure `real_llm == true && kind != Mock`
+/// (`make_provider` does, via `provider_is_mock`); the `Mock` arm is handled defensively, not relied on.
 pub(crate) fn make_real<T: HttpTransport + 'static>(
     cfg: &ProviderConfig,
     transport: T,
@@ -41,8 +42,19 @@ pub(crate) fn make_real<T: HttpTransport + 'static>(
             Box::new(openai::OpenAiProvider::new_openai(cfg, transport))
         }
         ProviderKind::Local => Box::new(openai::OpenAiProvider::new_local(cfg, transport)),
-        // `make_provider` handles Mock before calling here.
-        ProviderKind::Mock => unreachable!("mock is handled by make_provider, not make_real"),
+        // `make_provider` routes Mock to the offline MockProvider before calling here, so this arm is
+        // unreachable by contract. Fall back to the mock rather than panic: the safe default is to
+        // never open a socket (ADR-0008), so if a future in-crate caller is added that bypasses the
+        // `provider_is_mock` guard, it degrades to offline behavior instead of crashing. The
+        // `debug_assert!` keeps the loud signal in dev/CI — a bypassed guard is a programming error,
+        // not a runtime condition — while release builds degrade gracefully.
+        ProviderKind::Mock => {
+            debug_assert!(
+                false,
+                "make_real reached Mock; provider_is_mock guard was bypassed"
+            );
+            Box::new(crate::mock::MockProvider::new())
+        }
     }
 }
 
@@ -244,6 +256,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(provider_key_env(&local), None);
+    }
+
+    // The Mock arm is unreachable by contract (see `make_real`); these two cfg-gated tests pin both
+    // halves — the `debug_assert!` panic in dev/CI, and the graceful offline-mock fallback in release.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "provider_is_mock guard was bypassed")]
+    fn make_real_panics_on_mock_kind_in_debug() {
+        let cfg = ProviderConfig {
+            kind: ProviderKind::Mock,
+            ..Default::default()
+        };
+        let _ = make_real(&cfg, FakeTransport::ok(200, "{}"));
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn make_real_falls_back_to_mock_for_mock_kind_in_release() {
+        let cfg = ProviderConfig {
+            kind: ProviderKind::Mock,
+            ..Default::default()
+        };
+        let p = make_real(&cfg, FakeTransport::ok(200, "{}"));
+        assert_eq!(p.name(), "mock");
     }
 
     #[test]
