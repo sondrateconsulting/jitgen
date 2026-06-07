@@ -393,11 +393,22 @@ impl RunHandle {
 
 fn row_to_step(r: &rusqlite::Row<'_>) -> rusqlite::Result<StepRecord> {
     let status_str: String = r.get(3)?;
+    // Fail loud on an unparseable status. Silently defaulting to `Pending` would re-queue a step that
+    // may have already `Succeeded`/`Failed` — a resume idempotency violation. An unknown value here
+    // means DB corruption or a state file written by a newer jitgen (a status this version doesn't
+    // know); surface it as a conversion failure rather than mis-resuming.
+    let status = StepStatus::parse(&status_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            3,
+            rusqlite::types::Type::Text,
+            format!("unknown step status: {status_str:?}").into(),
+        )
+    })?;
     Ok(StepRecord {
         step_id: r.get(0)?,
         kind: r.get(1)?,
         input_hash: r.get(2)?,
-        status: StepStatus::parse(&status_str).unwrap_or(StepStatus::Pending),
+        status,
         error: r.get(4)?,
         retry_count: r.get::<_, i64>(5)? as u32,
     })
@@ -499,6 +510,46 @@ mod tests {
         assert_eq!(run.step("b").unwrap().unwrap().retry_count, 1);
         run.finish_step("b", StepStatus::Succeeded, None).unwrap();
         assert!(run.resume_point().unwrap().is_none(), "all steps done");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unknown_persisted_step_status_errors_instead_of_silent_pending() {
+        let root = temp_root("badstatus");
+        let store = RunStore::open(&root).unwrap();
+        let run = store.create_run(&meta("run-bad")).unwrap();
+        run.record_step("s1", 1, "diff", "h1").unwrap();
+        run.begin_step("s1").unwrap();
+        run.finish_step("s1", StepStatus::Succeeded, None).unwrap();
+
+        // Corrupt the persisted status directly — simulates DB corruption or a state file written by a
+        // newer jitgen carrying a status this version cannot parse.
+        let conn = Connection::open(run.dir().join("state.sqlite")).unwrap();
+        let corrupted = conn
+            .execute(
+                "UPDATE steps SET status = 'teleported' WHERE step_id = 's1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            corrupted, 1,
+            "the corrupting UPDATE must hit the row — guards against a silent no-op if the schema is renamed"
+        );
+        drop(conn);
+
+        // Reopen and read: an unparseable status must surface as an error, NOT silently degrade to
+        // `Pending` (which would re-run the already-succeeded step on resume).
+        let store = RunStore::open(&root).unwrap();
+        let run = store.open_run("run-bad").unwrap();
+        assert!(
+            matches!(run.step("s1"), Err(StateError::Sqlite(_))),
+            "single-step read must error on unknown status, not fall back to Pending"
+        );
+        assert!(run.steps().is_err(), "steps() must propagate the error");
+        assert!(
+            run.resume_point().is_err(),
+            "resume_point() must propagate the error (never silently re-run a done step)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
