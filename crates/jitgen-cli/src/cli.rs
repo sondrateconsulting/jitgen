@@ -586,8 +586,8 @@ fn print_gate_summary(verdict: &GateVerdict, threshold: f64) {
         let _ = writeln!(
             err,
             "jitgen: exit 3 (findings gate). Suppress a known catch by adding its fingerprint to a \
-             --baseline file (one per line), or re-run with --warn-only to keep it advisory. See \
-             https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md."
+             --baseline file (one per line), or re-run with --warn-only to keep it advisory. See {}.",
+            crate::hints::TROUBLESHOOTING_URL
         );
     }
 }

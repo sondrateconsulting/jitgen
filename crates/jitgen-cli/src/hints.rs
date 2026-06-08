@@ -6,10 +6,24 @@
 
 /// Canonical docs URLs the fix-hints point at. One source of truth, so a repo move or a switch to
 /// versioned/published docs is a single edit, not an 18-site find-replace (DRY; eng review).
-const TROUBLESHOOTING_URL: &str =
-    "https://github.com/sondrateconsulting/jitgen/blob/main/docs/troubleshooting.md";
-const USER_GUIDE_URL: &str =
-    "https://github.com/sondrateconsulting/jitgen/blob/main/docs/user-guide.md";
+///
+/// Pinned to the build's **version tag** (`/blob/v{CARGO_PKG_VERSION}/…`), not `main` (GP6a): a
+/// shipped binary's hints must resolve to the docs that match *that* binary, so a doc rename or move
+/// on `main` can't strand a user on a 404 or a page describing different behavior. Release builds are
+/// cut at a `vX.Y.Z` tag whose tree carries these `docs/…` files, so the URL always resolves; a dev
+/// build between releases points at the most recent release's docs (still consistent with the binary's
+/// behavior, never `main`). `pub(crate)` so the gate-summary sink in [`crate::cli`] shares the one
+/// source instead of hardcoding a parallel `main` URL.
+pub(crate) const TROUBLESHOOTING_URL: &str = concat!(
+    "https://github.com/sondrateconsulting/jitgen/blob/v",
+    env!("CARGO_PKG_VERSION"),
+    "/docs/troubleshooting.md"
+);
+const USER_GUIDE_URL: &str = concat!(
+    "https://github.com/sondrateconsulting/jitgen/blob/v",
+    env!("CARGO_PKG_VERSION"),
+    "/docs/user-guide.md"
+);
 
 /// Map a user-facing error message to a one-line fix hint, with a troubleshooting-docs pointer.
 ///
@@ -293,6 +307,20 @@ mod tests {
         // reference for cargo-install/docker-run users), sourced from the single consts.
         assert!(TROUBLESHOOTING_URL.starts_with("https://"));
         assert!(USER_GUIDE_URL.starts_with("https://"));
+        // GP6a: the URL must be pinned to THIS build's version tag, never `main` — a shipped binary's
+        // hints have to resolve to the docs that match it, not whatever `main` drifted to. Built from
+        // CARGO_PKG_VERSION at compile time, so this stays correct across version bumps automatically.
+        let version_tag = concat!("/blob/v", env!("CARGO_PKG_VERSION"), "/");
+        for url in [TROUBLESHOOTING_URL, USER_GUIDE_URL] {
+            assert!(
+                !url.contains("/blob/main/"),
+                "hint URL must not point at the moving `main` ref: {url}"
+            );
+            assert!(
+                url.contains(version_tag),
+                "hint URL must carry the build's version tag {version_tag}: {url}"
+            );
+        }
         let h = user_hint("jitgen run: git intake: git error: failed to resolve path '/x'");
         assert!(
             h.contains(TROUBLESHOOTING_URL),
