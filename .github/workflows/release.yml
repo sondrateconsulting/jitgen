@@ -59,10 +59,33 @@ jobs:
           set -euo pipefail
           ver="${GITHUB_REF_NAME//\//-}"          # sanitize slashes from dispatch branch refs
           name="jitgen-${ver}-${TARGET}"
+          # Stage the binary plus pre-generated shell completions, so a tarball user gets completions
+          # without running the subcommand themselves. Generated from the just-built, just-smoked binary
+          # so the scripts always match this release's live flag surface (build_command(), version included).
+          stage="$(mktemp -d)"
+          cp target/release/jitgen "${stage}/jitgen"
+          mkdir -p "${stage}/completions"
+          for sh in bash zsh fish; do
+            ./target/release/jitgen completions "${sh}" > "${stage}/completions/jitgen.${sh}"
+          done
           mkdir -p dist
-          tar -czf "dist/${name}.tar.gz" -C target/release jitgen
+          tar -czf "dist/${name}.tar.gz" -C "${stage}" jitgen completions
           ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           echo "artifact=${name}" >> "$GITHUB_OUTPUT"
+      - name: Verify the tarball ships the binary + completions
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.package.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          # Extract into a clean dir and assert the expected layout, so a packaging regression fails the
+          # release build instead of shipping an incomplete tarball.
+          check="$(mktemp -d)"
+          tar -xzf "dist/${ARTIFACT}.tar.gz" -C "${check}"
+          for f in jitgen completions/jitgen.bash completions/jitgen.zsh completions/jitgen.fish; do
+            test -s "${check}/${f}" || { echo "::error::tarball missing ${f}"; exit 1; }
+          done
+          echo "tarball layout OK: jitgen + completions/jitgen.{bash,zsh,fish}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.package.outputs.artifact }}
