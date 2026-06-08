@@ -232,7 +232,8 @@ jobs:
         with: { sarif_file: jitgen.sarif, category: jitgen }
 
   # Same-repo PRs land here: real provider. The key sits behind a protected Environment, and this job
-  # never runs for a fork — so the real key and untrusted fork-head code can never meet in one run.
+  # never runs for a fork — so the key never reaches fork code (a same-repo PR's unreviewed head still
+  # runs here with the key; see "Security model for CI" — policy trust tier, not an isolation boundary).
   advisory-real:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -276,7 +277,10 @@ Why it is shaped this way:
 - **Two jobs, split by trust.** A fork PR runs only `advisory-mock` (no secret, no `--real-llm`), so
   jitgen's master switch keeps the **offline mock** in force — deterministic and green (`0 catches` is
   the expected mock result, not a failure). A same-repo PR runs only `advisory-real`, which holds the
-  key. The real key and untrusted fork-head code therefore **never** meet in one job.
+  key, so the key never reaches **fork** code. This split is about keeping the key away from anonymous
+  fork PRs — it is **not** a claim that the key never coexists with unreviewed code: a same-repo PR's
+  head *is* unreviewed and runs in the key-bearing job. See [Security model](#security-model-for-ci)
+  for why same-repo is a *policy* trust tier and what actually protects the key there.
 - **`on: pull_request`** runs fork PRs *without* repo secrets by default. Never use
   `pull_request_target` — it runs untrusted PR-head code in the trusted base context **with** secrets.
 - **`fetch-depth: 0`** — jitgen diffs `base..head`; a shallow checkout may not contain the merge base.
@@ -429,6 +433,26 @@ especially on pull requests from forks — must preserve that boundary. The rule
   fork PRs run the keyless `advisory-mock` job instead. **Never check out untrusted fork-head code into
   a job that holds the key** — the split guarantees this, because the key-bearing job never runs for a
   fork.
+- **Same-repo is a *policy* trust tier, not an isolation boundary.** The split above keeps the key away
+  from anonymous *fork* code — but a same-repo PR still runs **unreviewed** head code in the **same
+  job** as the key, so "the key and untrusted code never meet" is true for *fork* PRs only. What keeps
+  the key safe on the same-repo path is defense-in-depth, not a guarantee they never coexist: (1) the
+  key is scoped to the single jitgen-run step's `env:`, not the checkout/build steps; (2) jitgen's env
+  allowlist + synthetic `HOME` keep it out of the untrusted test subprocess (last bullet); and (3) the
+  run happens inside a throwaway, jitgen-owned container that bounds blast radius and supplies the
+  network isolation the test tier itself does not (next bullet). The trust assumption is therefore
+  "**anyone who can push a branch to this repo**" — if that set is broad, add **required reviewers** to
+  the `jitgen-llm` Environment so a maintainer approves before the key-bearing run starts.
+- **Network isolation comes from the container, not the constrained-local tier.** Inside a job
+  container you pass `--unsafe-local-execution` to select the **constrained-local** tier, which bounds
+  the test command with a process group, rlimits, and output caps but has **no kernel-enforced network
+  or filesystem isolation** ([ADR-0003](decisions/0003-sandbox-strategy.md), `lib.rs` is
+  `#![forbid(unsafe_code)]` so it can't `unshare`/`setns`). Only jitgen's `os-sandbox` and container
+  *backends* conformance-test network denial; constrained-local is the no-OS-sandbox fallback. So in
+  the "container is the sandbox" model the **ephemeral, jitgen-owned container** provides the network/
+  filesystem boundary — which is exactly why it must be throwaway and jitgen-owned, never a shared or
+  long-lived runner. (On a runner with `bubblewrap`, jitgen selects the network-denying `os-sandbox`
+  tier with no flag, and that tier *does* cut the network itself.)
 - **Keep the key in a protected Environment / masked protected variable** (defense-in-depth), so a
   workflow-logic mistake still cannot leak it. The Environment sits on the same-repo job only, so fork
   PRs never touch it; if you add required reviewers to it, same-repo runs pause for approval before the

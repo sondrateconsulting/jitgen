@@ -53,15 +53,24 @@ Test commands and build scripts are attacker-controlled.
   as the isolation boundary: run jitgen *inside* it and pass the trusted `--unsafe-local-execution`
   flag (the constrained-local tier), with **no** Docker socket and **no** Docker-in-Docker. This is
   sound only because the container is **throwaway and jitgen-owned** and `--unsafe-local-execution` is
-  **trusted-config only** — a hostile `.jitgen.yaml` cannot set it. It is the inverse of the
-  **`--docker-image` tier** (jitgen spawning its *own* containers, which needs a Docker socket); do
-  **not** mount a Docker socket to satisfy the CI model. The published image is **digest-pinned** like
-  every toolchain image (threat #8); see [docs/ci.md](ci.md).
-- No network by default (enforced + **conformance-tested per backend**); cwd pinned to overlay;
-  resource limits **per backend** (containers via cgroup flags `--memory`/`--pids-limit`/`--cpus`;
-  firejail via `--rlimit-*`; OS-sandbox/constrained-local via a `ulimit` preamble applying CPU-time +
-  address-space only — process-count is omitted by design, see Residual risks); whole-process-group
-  timeout kill; output caps.
+  **trusted-config only** — a hostile `.jitgen.yaml` cannot set it. The constrained-local tier itself
+  provides **no kernel-enforced network/file isolation** ([ADR-0003](decisions/0003-sandbox-strategy.md);
+  crate-wide `#![forbid(unsafe_code)]` rules out `unshare`/`setns`) — in this model the **container**
+  supplies the network/filesystem boundary, not jitgen, which is the reason it must be ephemeral and
+  jitgen-owned. It is the inverse of the **`--docker-image` tier** (jitgen spawning its *own*
+  containers, which needs a Docker socket); do **not** mount a Docker socket to satisfy the CI model.
+  Note that "same-repo PR" is a **policy** trust decision (trust anyone with push access), **not** an
+  isolation boundary — a same-repo PR's unreviewed head code runs in the key-bearing job, kept safe by
+  the env allowlist below + the ephemeral container, not by a guarantee the key never meets it (see
+  [docs/ci.md](ci.md#security-model-for-ci)). The published image is **digest-pinned** like every
+  toolchain image (threat #8); see [docs/ci.md](ci.md).
+- No network by default on the **isolating** backends (OS-sandbox/container: enforced + **conformance-
+  tested per backend**; a backend that can't prove network denial is treated as unavailable). The
+  opt-in **constrained-local** tier does **not** itself cut the network — it relies on the surrounding
+  ephemeral container (above). cwd pinned to overlay; resource limits **per backend** (containers via
+  cgroup flags `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/constrained-
+  local via a `ulimit` preamble applying CPU-time + address-space only — process-count is omitted by
+  design, see Residual risks); whole-process-group timeout kill; output caps.
 - **Environment is a jitgen-owned hardcoded allowlist**, NOT inherited: a **synthetic `HOME`**, no
   `GITHUB_TOKEN`/`AWS_*`/`SSH_AUTH_SOCK`/`*_TOKEN`/`*_API_KEY`/npm·pip·cargo creds; deny-patterns
   applied even to trusted additions. argv-only execution; shell only via trusted `shell: true`.

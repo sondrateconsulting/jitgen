@@ -15,13 +15,19 @@
 #     construction, so a fork can never reach the LLM key.
 #   - Two jobs split by trust. The secret-bearing REAL job runs ONLY for same-repo PRs
 #     (`head.repo.full_name == github.repository`) AND only when the maintainer has flipped the
-#     `JITGEN_REAL_LLM` repo variable on; everything else runs the keyless offline MOCK. The real key
-#     and untrusted fork-head code therefore never meet in one job. The key additionally sits behind a
-#     protected Environment (`jitgen-llm`) as defense-in-depth.
+#     `JITGEN_REAL_LLM` repo variable on; everything else runs the keyless offline MOCK. This keeps the
+#     key away from anonymous FORK code, so the key and untrusted *fork-head* code never meet in one
+#     job. It is NOT a claim that the key never meets untrusted code at all: same-repo is a *policy*
+#     trust tier (trust anyone with push access), and a same-repo PR's UNREVIEWED head code does run in
+#     this key-bearing job. What protects the key there is defense-in-depth, not isolation: it is scoped
+#     to the jitgen-run step's `env:` only, the env allowlist keeps it out of the test subprocess, and
+#     it sits behind a protected Environment (`jitgen-llm`). Add required reviewers to that Environment
+#     if "anyone with push access" is too broad. See docs/ci.md "Security model for CI".
 #   - "The container IS the sandbox": every step runs INSIDE the digest-pinned jitgen image and passes
-#     `--unsafe-local-execution` (the constrained-local tier) — the throwaway container is the isolation
-#     boundary. No Docker socket, no Docker-in-Docker. (This is the inverse of jitgen's own
-#     `--docker-image` tier; see docs/ci.md + docs/security.md.)
+#     `--unsafe-local-execution` (the constrained-local tier). The constrained-local tier has NO
+#     kernel-enforced network/file isolation (ADR-0003) — the throwaway, jitgen-owned container is the
+#     isolation boundary, not jitgen. No Docker socket, no Docker-in-Docker. (This is the inverse of
+#     jitgen's own `--docker-image` tier; see docs/ci.md + docs/security.md.)
 #   - Catch mode is report-only: jitgen writes nothing into the repo, so it is safe on PR code.
 #   - The trusted provider config is written OUTSIDE the repo checkout, so a hostile PR's `.jitgen.yaml`
 #     cannot enable a real provider or redirect egress. Every executed step body is defined here in the
@@ -127,8 +133,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # SAME-REPO PRs with the real provider explicitly enabled land here. This job holds the key and never
-  # runs for a fork (it requires head.repo == github.repository), so the real key and untrusted
-  # fork-head code can never meet. It stays advisory (`--fail-on-catch --warn-only` => always exit 0).
+  # runs for a fork (it requires head.repo == github.repository), so the key never reaches *fork* code
+  # — but a same-repo PR's UNREVIEWED head still runs here with the key (a policy trust tier, not an
+  # isolation boundary; see the SECURITY MODEL header). It stays advisory (`--fail-on-catch
+  # --warn-only` => always exit 0).
   #
   # Enabling it is a CONFIG FLIP, not a rebuild (see the maintainer note in the PR / docs/ci.md):
   #   1. Set the `JITGEN_REAL_LLM` repository variable to `true` — this ALONE gates the job (a job-level
