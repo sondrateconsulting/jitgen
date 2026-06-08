@@ -1,0 +1,47 @@
+# gitleaks configuration for jitgen
+#
+# jitgen's whole job is to treat repositories as hostile, so it carries a *redaction*
+# subsystem (`jitgen-context::redact`) whose tests must feed it realistic-looking secrets
+# and assert they are scrubbed before anything is sent to an LLM, logged, or persisted. Those
+# fixtures are SYNTHETIC, non-functional placeholder values — not real credentials (verified by
+# the full-history scan on 2026-06-07: gitleaks 8.30.1 over every commit/ref found 0 real
+# credentials). Without this file a public-CI secret-scan gate would false-positive on jitgen's
+# own redaction corpus and block every PR.
+#
+# This config INHERITS gitleaks' built-in rules and only ADDS narrow allowlists. The allowlists
+# are deliberately scoped to (a) the dedicated redaction-corpus file and (b) the exact synthetic
+# constants reused as redaction inputs across crates — matched by their literal value, so a REAL
+# secret of the same type pasted anywhere is still detected.
+#
+# Note: the ~150 historical matches under `docs/reviews/**` (review transcripts that echo these
+# same fixtures) are intentionally NOT allowlisted here — that tree is removed from the repo and
+# its history by the going-public history scrub (GP1b), so the gate sees a clean tree, not a
+# masked one.
+
+title = "jitgen gitleaks configuration"
+
+[extend]
+# Keep all of gitleaks' default detection rules; this file only adds allowlists.
+useDefault = true
+
+[[allowlists]]
+description = "Redaction test corpus: every 'secret' in redact.rs is a synthetic fixture proving jitgen scrubs it. New fixtures added here must stay synthetic."
+paths = [
+  '''crates/jitgen-context/src/redact\.rs''',
+]
+
+[[allowlists]]
+description = "Canonical synthetic secrets reused as redaction inputs across crates (tests assert jitgen scrubs them). Matched by exact value, so a real credential of the same type is still caught."
+regexTarget = "match"
+regexes = [
+  # Fake GitHub PAT: sequential 0-9 / a-j / A-J runs. Shared across feedback/llm/orchestrator tests.
+  '''ghp_0123456789abcdefghijABCDEFGHIJ012345''',
+  # Fake GitLab PAT.
+  '''glpat-abcdefghij0123456789''',
+  # The jwt.io canonical example JWT (HS256, sub=1234567890).
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.SflKxwRJSMeKKF2QT4fwpMeJf36''',
+  # Slack webhook with all-zero workspace/channel IDs (structurally a placeholder).
+  '''hooks\.slack\.com/services/T00000000/B00000000/''',
+  # base64("abcdefghijklmnop") used as a fake `password=` value.
+  '''YWJjZGVmZ2hpamtsbW5vcA==''',
+]
