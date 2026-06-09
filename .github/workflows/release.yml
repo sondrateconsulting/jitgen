@@ -260,10 +260,10 @@ jobs:
               f="$(find digests -type f -name "${kind}-${arch}.digest" | head -1)"
               [ -n "$f" ] || { echo "::error::digest file ${kind}-${arch}.digest not found among downloaded artifacts"; exit 1; }
               v="$(tr -d '[:space:]' < "$f")"
-              case "$v" in
-                sha256:*) ;;
-                *) echo "::error::${kind}-${arch}.digest is not a sha256 digest: '${v}'"; exit 1 ;;
-              esac
+              # Require a COMPLETE digest (sha256: + 64 hex), not just the prefix, so a truncated/
+              # half-read value is rejected here rather than flowing into imagetools create.
+              [[ "$v" =~ ^sha256:[0-9a-f]{64}$ ]] \
+                || { echo "::error::${kind}-${arch}.digest is not a well-formed sha256 digest: '${v}'"; exit 1; }
               DG["${kind}-${arch}"]="$v"
             done
           done
@@ -279,12 +279,14 @@ jobs:
             "${SLIM_IMAGE}@${slim_amd}" "${SLIM_IMAGE}@${slim_arm}"
           fat_digest="$(docker buildx imagetools inspect "${FAT_IMAGE}:${REF}" --format '{{.Manifest.Digest}}')"
           slim_digest="$(docker buildx imagetools inspect "${SLIM_IMAGE}:${REF}" --format '{{.Manifest.Digest}}')"
-          # Guard the assembled manifest-list digests with the same sha256: check the per-arch read uses
-          # above: set -e already aborts an inspect that errors outright, but sign + SBOM-attest must never
-          # target a malformed/half-read digest, so reject anything that is not a sha256: value before it
-          # reaches $GITHUB_ENV and the signing steps.
-          case "$fat_digest"  in sha256:*) ;; *) echo "::error::fat manifest-list digest is not a sha256 digest: '${fat_digest}'";  exit 1 ;; esac
-          case "$slim_digest" in sha256:*) ;; *) echo "::error::slim manifest-list digest is not a sha256 digest: '${slim_digest}'"; exit 1 ;; esac
+          # Guard the assembled manifest-list digests with the same well-formed sha256 check the per-arch
+          # read uses above (full sha256: + 64 hex, not just the prefix): set -e already aborts an inspect
+          # that errors outright, but sign + SBOM-attest must never target a malformed/half-read digest, so
+          # reject anything that is not a complete sha256 digest before it reaches $GITHUB_ENV / signing.
+          [[ "$fat_digest"  =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::fat manifest-list digest is not a well-formed sha256 digest: '${fat_digest}'";  exit 1; }
+          [[ "$slim_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::slim manifest-list digest is not a well-formed sha256 digest: '${slim_digest}'"; exit 1; }
           echo "FAT_DIGEST=${fat_digest}"   >> "$GITHUB_ENV"
           echo "SLIM_DIGEST=${slim_digest}" >> "$GITHUB_ENV"
           echo "Published ${FAT_IMAGE}@${fat_digest}"
