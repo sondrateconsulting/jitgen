@@ -37,7 +37,7 @@ this is the reliable path — clone it (you need repo access) and build the rele
 git clone https://github.com/sondrateconsulting/jitgen
 cd jitgen
 cargo build --release        # first build is several minutes: cold C-heavy deps (libgit2, tree-sitter)
-./target/release/jitgen --version    # jitgen 0.2.0 (data-contract v1)
+./target/release/jitgen --version    # jitgen 0.2.1 (data-contract v1)
 # Put it on your PATH (or use the full target/release/jitgen path) so you can run it from other repos:
 export PATH="$PWD/target/release:$PATH"
 ```
@@ -49,7 +49,7 @@ public these need a `docker login` / token; copy the real tag and the digest it 
 [Releases page](https://github.com/sondrateconsulting/jitgen/releases) in place of the placeholders:
 
 ```bash
-# <release-tag> / <digest>: from the Releases page (e.g. v0.2.0 and the sha256 it prints).
+# <release-tag> / <digest>: from the Releases page (e.g. v0.2.1 and the sha256 it prints).
 cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag <release-tag> jitgen-cli
 docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
 ```
@@ -147,7 +147,7 @@ cargo test  --workspace          # offline; uses the deterministic mock LLM (no 
 # Bazel (canonical build) produces the identical binary + version string:
 bazel build //...
 bazel test  //...
-bazel run //:jitgen -- --version   # jitgen 0.2.0 (data-contract v1) — same under Cargo
+bazel run //:jitgen -- --version   # jitgen 0.2.1 (data-contract v1) — same under Cargo
 ```
 
 All tests run **offline** with a deterministic mock LLM provider. Real providers — Anthropic,

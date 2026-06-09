@@ -23,7 +23,7 @@ body:
     attributes:
       label: jitgen version
       description: Output of `jitgen --version`.
-      placeholder: jitgen 0.2.0 (data-contract v1)
+      placeholder: jitgen 0.2.1 (data-contract v1)
     validations:
       required: true
   - type: dropdown

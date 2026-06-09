@@ -12,7 +12,7 @@ See also: [architecture.md](architecture.md) · [security.md](security.md) ·
 ```bash
 cargo build --release          # first build is several minutes (cold C-heavy deps: libgit2, tree-sitter)
 ./target/release/jitgen --version
-# jitgen 0.2.0 (data-contract v1)
+# jitgen 0.2.1 (data-contract v1)
 ```
 
 Bazel (canonical build) produces the identical binary and version string:

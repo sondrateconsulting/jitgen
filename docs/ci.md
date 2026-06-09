@@ -157,14 +157,14 @@ consumers; the **exit code** is the gate.
 A tagged release (`v*`) publishes, from [`.github/workflows/release.yml`](../.github/workflows/release.yml),
 **per-platform binaries with SHA-256 checksums** and a **digest-pinned container image** — each
 smoke-tested (`--version` + `analyze` on a fixture) *before* it is published. Choose the acquisition path
-that fits your runner. The `v0.2.0` and `@sha256:<digest>` tokens below are **placeholders** — substitute
+that fits your runner. The `v0.2.1` and `@sha256:<digest>` tokens below are **placeholders** — substitute
 a published release tag and the digest that release reports (no release is cut yet; this pipeline is what
 produces them):
 
 **Prebuilt binary** (Linux x86-64, macOS x86-64, macOS arm64), checksum-verified before use:
 
 ```bash
-ver=v0.2.0; target=x86_64-unknown-linux-gnu          # your release tag + platform
+ver=v0.2.1; target=x86_64-unknown-linux-gnu          # your release tag + platform
 base="https://github.com/sondrateconsulting/jitgen/releases/download/${ver}"
 curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz"
 curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz.sha256"
@@ -176,7 +176,7 @@ tar -xzf "jitgen-${ver}-${target}.tar.gz" && ./jitgen --version
 package, so name the CLI crate explicitly:
 
 ```bash
-cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.2.0 jitgen-cli
+cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.2.1 jitgen-cli
 ```
 
 **Container image** — `ghcr.io/sondrateconsulting/jitgen`, with git and the first-class toolchains

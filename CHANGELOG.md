@@ -8,6 +8,8 @@ run state and report formats.
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-06-08
+
 ### Added
 - **Local Bazel `--disk_cache` for cross-worktree build reuse.** `.bazelrc` now `try-import`s a
   gitignored, per-machine `user.bazelrc` where each developer points `--disk_cache` at one absolute
@@ -73,6 +75,11 @@ run state and report formats.
   generated from jitgen's own command tree, so it always matches the installed version's flags. (DX review)
 
 ### Changed
+- **Git history rewritten ahead of the first public release; re-clone required.** Developer
+  code-review transcripts (`docs/reviews/`, 161 files) were purged from all history with
+  `git-filter-repo`, which rewrote every commit SHA. The earlier `v0.2.0` pre-release tag and its
+  release assets are deprecated — they reference dead SHAs — and `v0.2.1` is the first release on the
+  rewritten history. Anyone with an existing clone must re-clone (or hard-reset to the new `main`).
 - **Docs lead with `analyze`.** The README and user guide now open on `jitgen analyze` — the zero-setup,
   non-executing preview (no toolchains, keys, or sandbox) — framed honestly as a *plan* that proves diff
   parsing + target ranking, **not** generated tests; `jitgen doctor` is positioned as the
