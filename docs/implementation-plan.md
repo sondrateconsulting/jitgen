@@ -2,7 +2,7 @@
 
 A comprehensive, durable, **resumable** plan. Each foundational phase ends with: passing tests,
 updated [implementation-status.md](implementation-status.md), a completed Codex review protocol
-(artifacts under `docs/reviews/<phase>/`), and **one atomic commit** (Conventional Commits).
+(multi-round adversarial review; transcripts removed pre-public-release), and **one atomic commit** (Conventional Commits).
 
 ## Principles
 
@@ -96,13 +96,13 @@ explicit **simulated mid-run failure + resume** test; `docs/final-report.md`.
 ## Codex review protocol (per foundational phase)
 
 Codex is an **independent** reviewer invoked via the real `codex` CLI (`codex exec --sandbox
-read-only`). Artifacts saved under `docs/reviews/<phase>/round-<n>.md`. Severity P0–P3 ("P3 or above"
+read-only`). Review findings were recorded per round (transcripts removed pre-public-release). Severity P0–P3 ("P3 or above"
 = P0–P3) implemented before re-review; P4/nits recorded only.
 
 Sequence: **T1 → S1 → T2** (≥1 traditional after each security cycle); escalate **S2 → T → (S3)**
 only if risk remains; after the **final** security review run **≥2 more traditional** rounds. Caps:
 ≤7 traditional, ≤3 security per phase. F7 runs **security first**. If Codex is unavailable, log to
-`docs/reviews/availability.log`, treat as 0 findings, retry later — never block indefinitely.
+a local availability log, treat as 0 findings, retry later — never block indefinitely.
 
 Do not commit a phase until: tests/lints pass, the protocol is complete, and no unresolved P3+ remain
 (or are documented invalid with rationale).

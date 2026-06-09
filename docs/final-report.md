@@ -50,7 +50,7 @@ into trusted vs untrusted-repo tiers ([ADR-0010](decisions/0010-config-trust-and
 | **F10** | Hardening: supply-chain audits (cargo-audit + cargo-deny, `git2` advisory resolved), docs (user/adapter/troubleshooting/this report), Apache-2.0 LICENSE, packaging/version parity, trusted `--docker-image` plumbing for the container tier, **explicit mid-run-failure + resume e2e**, carry-over triage | _this commit_ |
 
 Each foundational phase ended green (`./scripts/check.sh`) with a completed independent **Codex review
-protocol** (artifacts under `docs/reviews/<phase>/`) and **0 unresolved P3+** findings.
+protocol** (multi-round adversarial review; transcripts removed pre-public-release) and **0 unresolved P3+** findings.
 
 ## Durability & resume (the headline F10 proof)
 

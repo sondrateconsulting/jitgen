@@ -5,6 +5,12 @@ continue from the first phase not marked `complete`. Never leave a dirty tree be
 
 Legend: ⬜ not started · 🟦 in_progress · ✅ complete
 
+> **Review transcripts removed pre-public-release.** Each phase passed a multi-round adversarial
+> `codex` review (traditional **T** + security **S** passes); every P3-or-above finding was resolved
+> before a phase was marked complete. The raw transcripts (formerly under `docs/reviews`) were purged
+> from the repository ahead of open-sourcing — the per-phase findings remain summarized inline below,
+> and round labels like `F7/round-2` name those now-removed records.
+
 | Phase | Description | Status | Commit | Review protocol |
 |-------|-------------|--------|--------|-----------------|
 | F0 | Research, architecture, plan, ADRs, security & resume docs | ✅ complete | `c9cd845` | T1·S1·T2·T3 ✅ |
@@ -49,27 +55,27 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   1×P4. All P3+ implemented: catch *assessment* contract (`WeakCatchAssessment`); end-to-end
   intent-aware **mutant** pipeline; **ADR-0009** (containerized first-class e2e); state-root + run
   index + atomic publish + overlay rebuild; `AdapterContext` SPI + split classification + owned
-  `AdapterId`; explicit `argv` generic command. Artifact: [reviews/F0/round-1.md](reviews/F0/round-1.md).
+  `AdapterId`; explicit `argv` generic command. Artifact: `F0/round-1.md`.
 - 2026-05-30: F0 Codex review **Round 2 (S1, security)** — **17 P3-or-above** findings (1×P0, 4×P1,
   9×P2, 3×P3). All implemented: **ADR-0010** (config trust tiers + fail-closed execution); rewrote
   [security.md](security.md) (normative, with a 10-item conformance suite); git OID-peeling + filter
   neutering (ADR-0006); compiled-in grammar allowlist (ADR-0007); trusted-only LLM egress (ADR-0008);
   `0700` state root + relative artifact IDs (ADR-0005); assessor injection resistance (ADR-0002);
   `openat`/`O_NOFOLLOW` materialization; per-format report escaping; preflight DoS budgets.
-  Artifact: [reviews/F0/round-2.md](reviews/F0/round-2.md).
+  Artifact: `F0/round-2.md`.
 - 2026-05-30: F0 Codex review **Round 3 (T2, traditional)** — 7 P3+ (1×P2, 6×P3) + 2×P4, all fixed
   (env authority removed from `TestCommand`; CLI trusted-options + `--strategy` + `analyze` contract +
-  catch/`--write` rule; digest-pinned images; loose-end cleanups). [reviews/F0/round-3.md](reviews/F0/round-3.md).
+  catch/`--write` rule; digest-pinned images; loose-end cleanups). `F0/round-3.md`.
 - 2026-05-30: F0 Codex review **Round 4 (T3, traditional sign-off)** — 1×P3 + 1×P4, fixed
   (build-status wording in plan/status/progress; `JITGEN_*` env vars declared trusted).
-  [reviews/F0/round-4.md](reviews/F0/round-4.md). **F0 review protocol complete; F0 done.**
+  `F0/round-4.md`. **F0 review protocol complete; F0 done.**
 - 2026-05-30: **F1 complete** — Cargo workspace + Bazel (Bzlmod, rules_rust 0.70.0) building; 12 crate
   skeletons (`#![forbid(unsafe_code)]`); `scripts/check.sh`; `jitgen --version` identical under Cargo
   & Bazel ("jitgen 0.1.0 (data-contract v1)"); 12/12 tests pass both build systems. bazelisk
   provisioned; Bazel 7.4.1 pinned; lockfiles committed. Codex review **T1** (3 P3+: check.sh bazel
   exit-code bug, version drift, lockfile ignored), **S1** (1 P3 + P4s; supply chain confirmed clean),
   **T2** (bazelisk-runner fallback), **T3** (redacted accidental third-party payloads from
-  transcripts). All P3+ resolved. Artifacts: [reviews/F1/](reviews/F1/). Recorded P4s for F10:
+  transcripts). All P3+ resolved. Artifacts: `F1/`. Recorded P4s for F10:
   explicit Bazel↔Cargo toolchain version pin; checksum-pinned bazelisk.
 - 2026-05-30: **F2 in progress** — landed the **core domain model** in `jitgen-core` (modules: ids,
   mode, change, target, context, candidate, execution, classify, mutant, error) — the serde data
@@ -87,7 +93,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   doctor`. Bazel `crate_universe` now builds rusqlite (bundled C) + serde/serde_yaml/sha2. Codex
   review **T1**(5)·**S1**(6)·**T2**(1)·**T3**(5)·**T4**(1)·**T5**(0, clean): **18 P3+ resolved**
   incl. the P1 doctor-execute-from-hostile-CWD. cargo ~76 tests + bazel 12 targets green;
-  clippy/fmt clean. Artifacts: [reviews/F2/](reviews/F2/).
+  clippy/fmt clean. Artifacts: `F2/`.
 - 2026-05-30: **F3 complete.** `jitgen-gitintake` (libgit2 via `git2`, vendored, no ssh/https): open
   arbitrary repo (`open_ext NO_SEARCH` + gitdir/commondir/objects/alternates boundary verification),
   peel base/head to immutable OIDs, tree-to-tree diff → filtered `ChangeSet` (vendor/secret excluded,
@@ -96,7 +102,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   pinned static (vendored zlib). Codex review **T1**(3)·**S1**(5)·**T2**(3)·**T3**(1)·**T4**(1)·**T5**
   (0, clean): **13 P3+ resolved** incl. P1-class hostile-repo vectors (.git-file/alternates/commondir
   boundary escapes, case-fold filter bypass, pre-sandbox DoS). cargo ~91 tests + bazel 12 targets
-  green. Artifacts: [reviews/F3/](reviews/F3/).
+  green. Artifacts: `F3/`.
 - 2026-05-30: **F4 complete.** `jitgen-adapters`: `LanguageAdapter` SPI + `AdapterContext`,
   `RepoSnapshot`, discovery/registry, tree-sitter symbol extraction (0.23 cohort: Rust/Python/Java/
   TS+TSX; iterative DFS, DoS-bounded, parse timeout, line-range fallback), and adapters for
@@ -105,7 +111,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   authority). Codex review **T1**(6)·**S1**(2)·**T2**(1)·**T3**(1)·**T4**(0, clean): **10 P3+
   resolved** incl. generic-id collision, untrusted-source/glob DoS (iterative walks + caps + parse
   timeout). cargo ~109 tests + bazel 12 targets green (4 grammars compile C via crate_universe).
-  Artifacts: [reviews/F4/](reviews/F4/).
+  Artifacts: `F4/`.
 - 2026-05-30: **F5 complete.** `jitgen-context` (layer 5) + `jitgen-llm` (layer 6). Context: secret
   **redaction** (`redact`: known token formats + URL creds + quoted/env/line-anchored config
   assignments, value-shape-gated to avoid corrupting code; size-bounded, fail-closed at the window
@@ -119,7 +125,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   **T6**·**T7** (review cap; 0 unresolved): **12 P3+ resolved** — most on the redaction FP/FN
   heuristic, converged to uppercase-env-unconditional + line-anchored value-shape gating with a
   documented residual ([security.md](security.md)). cargo ~152 tests + bazel 12 targets green; all
-  offline. Artifacts: [reviews/F5/](reviews/F5/).
+  offline. Artifacts: `F5/`.
 - 2026-05-30: **F6 complete.** `jitgen-materialize` (layer 7). Overlay-confined candidate
   materialization with **no `unsafe`** ([ADR-0011](decisions/0011-overlay-materialization.md)):
   lexical path validation + length/nesting caps, per-component symlink rejection, and a crash-atomic
@@ -130,7 +136,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   discovery). Codex review **T1**·**S1**·**T2**·**T3** (clean final; 0 unresolved): **7 P3+ resolved**
   — crash-atomicity, traversal-via-backslash, Java module-prefix/Surefire discovery, TS extension
   family, py/ts collision, temp-cleanup-deletes-content, non-regular dest, resource caps. cargo ~173
-  tests + bazel 12 targets green; all offline. Artifacts: [reviews/F6/](reviews/F6/).
+  tests + bazel 12 targets green; all offline. Artifacts: `F6/`.
 - 2026-05-31: **F7 in progress — Stage 1 (construction only; nothing is spawned).** `jitgen-sandbox`
   (layer 8): fail-closed backend **selection** (`select`/`os_candidates`; constrained-local never
   auto-selected), a hardcoded **env allowlist** (`build_env`: synthetic `HOME`/`TMPDIR`/`TERM`,
@@ -169,7 +175,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   `teardown` `/bin/kill` **cfg(unix)-gated**, empty-command guard, conformance `set_var` unsoundness
   removed, env managed-name case-insensitive. Documented residuals: bwrap/sandbox-exec **rlimits**
   (ulimit-preamble follow-up), `file-read*`/`mach-lookup` breadth. 61 unit + 4 live conformance;
-  `./scripts/check.sh` green. Artifact: [reviews/F7/round-1.md](reviews/F7/round-1.md).
+  `./scripts/check.sh` green. Artifact: `F7/round-1.md`.
 - 2026-05-31: **F7 review round 2 (formal Codex S2 security) — all 7 P3+ resolved.** The independent
   `codex exec --sandbox read-only` (gpt-5.5, xhigh) review of the whole crate found **1×P1, 2×P2, 4×P3
   + 1×P4** (two introduced by this session's items 2–3 — caught by the independent pass). Fixes:
@@ -185,7 +191,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   `name@sha256:<64hex>`. **(P4)** `build_plan`/`run`/`PlanInput`/`SandboxPlan`/`render_profile` are
   crate-private (external callers go through `Sandbox`). 76 unit + 6 live conformance (incl. Docker
   non-root `--user` + overlay write-confinement, vs `postgres@sha256:…`); `./scripts/check.sh` green
-  (cargo + bazel `--lockfile_mode=error`). No `unsafe`. Artifact: [reviews/F7/round-2.md](reviews/F7/round-2.md).
+  (cargo + bazel `--lockfile_mode=error`). No `unsafe`. Artifact: `F7/round-2.md`.
 - 2026-05-31: **F7 review round 3 (formal Codex T1 traditional) — all 6 P3+ resolved.** First
   traditional round after the security cycle: **1×P2, 5×P3 + 3×P4** (several on round-2's own new code).
   `collect` reports `truncated || !finished`; output-cap default lowered to the 256 KiB redaction
@@ -193,7 +199,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   rejects `..`/`.` and requires the literal parent to be a trusted bin dir; `is_uid_gid`/
   `current_uid_gid` reject root uid; Docker net-conformance asserts a `NET_DENIED` sentinel; per-test
   container instance; `validated_cwd` accepts `.`; `architecture.md`/ADR-0003 state per-backend rlimits.
-  Artifact: [reviews/F7/round-3.md](reviews/F7/round-3.md).
+  Artifact: `F7/round-3.md`.
 - 2026-05-31: **F7 COMPLETE** (`ba7c13c`) — review round 4 (formal Codex **T2** traditional, final
   sign-off): **2×P3 + 3×P4**, all fixed. `create_fresh_dir` (symlink-aware `symlink_metadata`; refuses
   a pre-planted `.jitgen-home`/`.jitgen-tmp` → `UnsafeSyntheticDir`); bounded `run_cleanup`
@@ -207,7 +213,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   limits; digest-pinned non-root containers (`--pull=never`); timeout with process-group/container
   teardown. 79 unit + 6 live conformance (sandbox-exec + Docker, on-host, verified `CONF_EXIT=0`);
   `./scripts/check.sh` `REAL_GATE_EXIT=0` (cargo + bazel `--lockfile_mode=error`);
-  `#![forbid(unsafe_code)]`. Artifacts: [reviews/F7/](reviews/F7/) (round-1..4). Residuals
+  `#![forbid(unsafe_code)]`. Artifacts: `F7/` (round-1..4). Residuals
   (`security.md`, `sbpl.rs`): macOS AS/NPROC limits + `setsid`-escapee output bound (container tier is
   the full fix); broad SBPL `file-read*`/`mach-lookup` (mitigated by no-network + redaction +
   synthetic HOME).
@@ -226,7 +232,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   assessor-injection invariant confirmed solid)·**T2**(clean sign-off): **7 P3+ resolved, 0 unresolved**.
   76 unit + 5 integration tests; `./scripts/check.sh` `REAL_GATE_EXIT=0` (cargo fmt/clippy `-D warnings`/
   test/release + bazel build+test `--lockfile_mode=error`); `#![forbid(unsafe_code)]`. Artifacts:
-  [reviews/F8/](reviews/F8/) (round-1..3).
+  `F8/` (round-1..3).
 - 2026-05-31: **F9 complete.** End-to-end CLI + exporters across three layers. **`jitgen-report`**
   (layer 10): the serde report **data contract** + exporters **patch** (default, harden) / **JSON** /
   **Markdown** / **JUnit** / **SARIF** / **human**, all routing untrusted strings through `escape`
@@ -247,7 +253,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   **T4**(clean): **15 P3+ resolved, 0 unresolved**; S1 confirmed renderer escaping solid, fixes were
   producer-side redaction + trusted-path-outside-repo + landable-artifact fidelity (validated == patch
   == --write). ~96 unit/integration tests across the three crates; `./scripts/check.sh`
-  `REAL_GATE_EXIT=0`; `#![forbid(unsafe_code)]`. Artifacts: [reviews/F9/](reviews/F9/) (round-1..5).
+  `REAL_GATE_EXIT=0`; `#![forbid(unsafe_code)]`. Artifacts: `F9/` (round-1..5).
 - 2026-06-01: **F10 COMPLETE — the FINAL phase; the jitgen build is DONE.** Hardening, audits, docs,
   packaging + the explicit mid-run-failure + resume e2e. **Supply chain:** resolved `RUSTSEC-2026-0008`
   by upgrading `git2`→`0.20.4` (Bazel `crate_universe` repinned), not suppressed; added
@@ -273,7 +279,7 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   **T3**(3 P3, authoritative-doc/closeout consistency)·**T4**(1 P3, last stale SPI pseudocode ref)·**T5**
   (clean sign-off): **15 P3+ resolved, 0 unresolved**. `./scripts/check.sh` `REAL_GATE_EXIT=0` (423 cargo
   tests + bazel `--lockfile_mode=error`); `#![forbid(unsafe_code)]`. Artifacts:
-  [reviews/F10/](reviews/F10/) (round-1..6).
+  `F10/` (round-1..6).
 - 2026-06-01: **F11 — real LLM providers wired (post-F10 feature).** A `/devex-review` found the docs
   advertised `--real-llm` while `make_provider` returned a deferred provider that errored `NotEnabled`
   for every non-mock kind; this implements them per
