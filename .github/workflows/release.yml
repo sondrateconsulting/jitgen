@@ -1,13 +1,20 @@
-# Release pipeline: build per-platform binaries + a container image, smoke-test each artifact, and
-# publish ONLY after the smoke test passes.
+# Release pipeline: build per-platform binaries + multi-arch container images, smoke-test each artifact,
+# and publish ONLY after the smoke test passes — then sign and attest an SBOM for the published images.
 #
-#   - on a `v*` tag push: build -> smoke -> publish (GitHub Release assets + a GHCR image).
-#   - on workflow_dispatch (any branch): build -> smoke only (every publish step is gated on a `v*`
-#     tag), so the pipeline can be dry-run without cutting a release.
+#   - on a `v*` tag push: build -> smoke -> publish (GitHub Release assets + signed multi-arch GHCR images).
+#   - on workflow_dispatch (any branch): build -> smoke only (every publish/sign step is gated on a `v*`
+#     tag), so the whole pipeline — including the arm64 leg — can be dry-run without cutting a release.
 #
 # Conventions (see docs/ci.md): every third-party action is pinned to a full commit SHA, permissions
 # are least-privilege per job, and no layer/dependency cache is used — a release build is cold by
 # design so a poisoned cache can never taint a published artifact (zizmor `cache-poisoning`).
+#
+# Images (GP3): two repos, both multi-arch (linux/amd64 + linux/arm64), built NATIVELY per arch (no
+# cross-compile / no QEMU) so the bits that ship are the bits that were smoked on that arch:
+#   - ghcr.io/sondrateconsulting/jitgen       — fat "container IS the sandbox" CI image (all toolchains)
+#   - ghcr.io/sondrateconsulting/jitgen-demo  — slim demo-only image (`jitgen demo`, sh substrate only)
+# Each arch image is built, smoked, and pushed by digest; `publish-images` assembles the manifest lists
+# from those exact digests, signs them keyless (cosign + OIDC), and attaches an SBOM attestation.
 name: release
 
 on:
@@ -23,10 +30,15 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false # never cancel a release mid-publish
 
+env:
+  # The two image repos, referenced by build-images and publish-images.
+  FAT_IMAGE: ghcr.io/sondrateconsulting/jitgen
+  SLIM_IMAGE: ghcr.io/sondrateconsulting/jitgen-demo
+
 jobs:
   # Native build per runner — no cross-compilation. The C-heavy deps (vendored libgit2, static zlib,
   # bundled rusqlite, tree-sitter grammars, ring) are fiddly to cross-compile, so each target builds on
-  # its own host. (linux/arm64 needs an arm runner and is a documented follow-up; see docs/ci.md.)
+  # its own host. (linux/arm64 binary needs an arm runner and is a documented follow-up; see docs/ci.md.)
   build-binaries:
     name: binary (${{ matrix.target }})
     strategy:
@@ -93,36 +105,75 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Build the "container IS the sandbox" image, smoke-test it, then (on a tag) push to GHCR.
-  build-image:
-    name: image (linux/amd64)
-    runs-on: ubuntu-latest
+  # Build BOTH images (fat runtime + slim demo) NATIVELY on each arch, smoke each, then (on a tag) push
+  # each per-arch image by digest. arm64 uses GitHub's hosted `ubuntu-24.04-arm` runner (available on
+  # private repos on all plans since 2026-01-29). The published per-arch digests are recorded as
+  # artifacts so publish-images assembles the manifest lists from the EXACT bits that passed smoke.
+  build-images:
+    name: image (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-24.04
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      packages: write # push to GHCR — only exercised on a v* tag
-    env:
-      IMAGE: ghcr.io/sondrateconsulting/jitgen
+      packages: write # push per-arch images to GHCR — only exercised on a v* tag
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Build image ONCE (loaded into the local daemon; not pushed)
-        run: docker build -t jitgen:smoke .
-      - name: Smoke test the image BEFORE publish
+
+      - name: Build the fat (runtime) image ONCE — loaded into the local daemon, not pushed
+        run: docker build --target runtime -t jitgen-fat:smoke .
+      - name: Smoke the fat image BEFORE publish
         run: |
           set -euo pipefail
-          docker run --rm jitgen:smoke --version
-          docker run --rm jitgen:smoke doctor
-          # The image's reason to exist is the bundled toolchains — assert each is present + runnable,
-          # so a toolchain that silently breaks (e.g. a future base-digest bump) fails the smoke, not CI.
-          docker run --rm --entrypoint sh jitgen:smoke -c '
+          docker run --rm jitgen-fat:smoke --version
+          docker run --rm jitgen-fat:smoke doctor
+          # The fat image's reason to exist is the bundled toolchains — assert each is present + runnable,
+          # so a toolchain that silently breaks (e.g. a future base-digest bump) fails smoke, not CI.
+          docker run --rm --entrypoint sh jitgen-fat:smoke -c '
             set -e
             git --version; cargo --version; rustc --version
             node --version; npm --version
             java -version; mvn --version
             python3 --version; pytest --version'
           # Build the analyze fixture inside the container (non-root), proving jitgen runs end to end.
-          docker run --rm -i --entrypoint bash jitgen:smoke -s jitgen < .github/scripts/smoke.sh
+          docker run --rm -i --entrypoint bash jitgen-fat:smoke -s jitgen < .github/scripts/smoke.sh
+
+      - name: Build the slim (demo) image ONCE — loaded into the local daemon, not pushed
+        run: docker build --target demo -t jitgen-demo:smoke .
+      - name: Smoke the slim image BEFORE publish
+        run: |
+          set -euo pipefail
+          # 1. The binary loads and prints its version + data-contract.
+          docker run --rm jitgen-demo:smoke --version | grep -q 'data-contract'
+          # 2. `docker run <slim>` (no args -> CMD demo) runs the offline real-catch demo to completion:
+          #    exit 0 AND the success line. This exercises the FULL constrained-local sandbox path inside
+          #    the slim image — the exact path the dash-exec P0 fix repaired on Debian/dash Linux.
+          out="$(docker run --rm jitgen-demo:smoke)"
+          echo "$out"
+          echo "$out" | grep -q '\[ok\] jitgen caught the seeded regression' \
+            || { echo "::error::slim demo did not report a catch"; exit 1; }
+          echo "$out" | grep -q 'StrongCatch' \
+            || { echo "::error::slim demo verdict was not StrongCatch"; exit 1; }
+          # 3. `--lang rust` is unsupported in the slim image (no cargo) and must fail FAST with the
+          #    documented, actionable pointer to the default demo — not a confusing deep failure.
+          set +e
+          rust_out="$(docker run --rm jitgen-demo:smoke demo --lang rust 2>&1)"
+          rust_rc=$?
+          set -e
+          echo "$rust_out"
+          [ "$rust_rc" -ne 0 ] \
+            || { echo "::error::slim demo --lang rust unexpectedly succeeded (no cargo in the slim image)"; exit 1; }
+          echo "$rust_out" | grep -q 'needs a local rust toolchain' \
+            || { echo "::error::slim demo --lang rust failure message was not the documented one"; exit 1; }
+
       - name: Log in to GHCR
         if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
@@ -130,26 +181,129 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish the SMOKED image to GHCR (the exact bits that passed smoke)
+
+      - name: Push the SMOKED per-arch images by digest (the exact bits that passed smoke)
         if: startsWith(github.ref, 'refs/tags/v')
         env:
+          ARCH: ${{ matrix.arch }}
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # Tag + push the SAME local image that was just smoke-tested — NOT a second build — so the
-          # published (and digest-pinned) image is provably the one that passed smoke.
-          docker tag jitgen:smoke "${IMAGE}:${REF}"
-          docker tag jitgen:smoke "${IMAGE}:latest"
-          docker push "${IMAGE}:${REF}"
-          docker push "${IMAGE}:latest"
-          digest="$(docker buildx imagetools inspect "${IMAGE}:${REF}" --format '{{.Manifest.Digest}}')"
-          echo "Published ${IMAGE}@${digest}  (pin THIS digest in CI)"
+          mkdir -p digests
+          # Tag + push the SAME local image that was just smoked — NOT a second build — then record the
+          # registry digest, so publish-images can assemble the manifest list from exact digests.
+          push_one() {
+            local kind="$1" image="$2" local_tag="$3" digest
+            docker tag "${local_tag}" "${image}:${REF}-${ARCH}"
+            docker push "${image}:${REF}-${ARCH}"
+            digest="$(docker buildx imagetools inspect "${image}:${REF}-${ARCH}" --format '{{.Manifest.Digest}}')"
+            echo "${digest}" > "digests/${kind}-${ARCH}.digest"
+            echo "pushed ${image}:${REF}-${ARCH} @ ${digest}"
+          }
+          push_one fat  "${FAT_IMAGE}"  jitgen-fat:smoke
+          push_one slim "${SLIM_IMAGE}" jitgen-demo:smoke
 
-  # Publish the GitHub Release. `needs:` both build jobs, so this runs only when every binary smoke
-  # passed AND the image was built+smoked+pushed — i.e. publish is always gated on the smoke tests.
+      - name: Upload per-arch image digests for the manifest assembler
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-digests-${{ matrix.arch }}
+          path: digests/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Assemble the multi-arch manifest lists from the exact per-arch digests that passed smoke, sign them
+  # keyless (cosign + GitHub OIDC, no long-lived key), and attach an SPDX SBOM attestation to each. Only
+  # runs on a v* tag (on workflow_dispatch this whole job is skipped — the dry-run is build + smoke).
+  publish-images:
+    name: sign + publish multi-arch images
+    needs: build-images
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # assemble + push manifest lists, push signatures + attestations
+      id-token: write # cosign keyless signing via the GitHub OIDC token
+    env:
+      REF: ${{ github.ref_name }}
+    steps:
+      - name: Download the per-arch image digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-digests-*
+          path: digests
+          merge-multiple: true
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      - name: Assemble + push the multi-arch manifest lists from the smoked per-arch digests
+        run: |
+          set -euo pipefail
+          fat_amd="$(cat digests/fat-amd64.digest)";  fat_arm="$(cat digests/fat-arm64.digest)"
+          slim_amd="$(cat digests/slim-amd64.digest)"; slim_arm="$(cat digests/slim-arm64.digest)"
+          # imagetools create references the children by DIGEST, so the published index is provably the
+          # exact per-arch bits that passed smoke (no tag races, no rebuild).
+          docker buildx imagetools create \
+            -t "${FAT_IMAGE}:${REF}" -t "${FAT_IMAGE}:latest" \
+            "${FAT_IMAGE}@${fat_amd}" "${FAT_IMAGE}@${fat_arm}"
+          docker buildx imagetools create \
+            -t "${SLIM_IMAGE}:${REF}" -t "${SLIM_IMAGE}:latest" \
+            "${SLIM_IMAGE}@${slim_amd}" "${SLIM_IMAGE}@${slim_arm}"
+          fat_digest="$(docker buildx imagetools inspect "${FAT_IMAGE}:${REF}" --format '{{.Manifest.Digest}}')"
+          slim_digest="$(docker buildx imagetools inspect "${SLIM_IMAGE}:${REF}" --format '{{.Manifest.Digest}}')"
+          echo "FAT_DIGEST=${fat_digest}"   >> "$GITHUB_ENV"
+          echo "SLIM_DIGEST=${slim_digest}" >> "$GITHUB_ENV"
+          echo "Published ${FAT_IMAGE}@${fat_digest}"
+          echo "Published ${SLIM_IMAGE}@${slim_digest}"
+
+      - name: Sign the manifest-list digests (cosign keyless, recursive over the arch children)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          # --recursive signs the index AND each per-arch child manifest, so `cosign verify` succeeds
+          # against the multi-arch tag and against a pinned per-arch digest alike.
+          cosign sign --recursive "${FAT_IMAGE}@${FAT_DIGEST}"
+          cosign sign --recursive "${SLIM_IMAGE}@${SLIM_DIGEST}"
+
+      - name: Generate SBOM — fat image
+        uses: anchore/sbom-action@55dc4ee22412511ee8c3142cbea40418e6cec693 # v0.17.8
+        with:
+          image: ${{ env.FAT_IMAGE }}@${{ env.FAT_DIGEST }}
+          format: spdx-json
+          output-file: sbom-fat.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Generate SBOM — slim image
+        uses: anchore/sbom-action@55dc4ee22412511ee8c3142cbea40418e6cec693 # v0.17.8
+        with:
+          image: ${{ env.SLIM_IMAGE }}@${{ env.SLIM_DIGEST }}
+          format: spdx-json
+          output-file: sbom-slim.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Attest the SBOMs to the manifest-list digests (cosign keyless)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          # The fat and slim images share an identical OS package set across arches (same Dockerfile, same
+          # digest-pinned base), so one SBOM per repo accurately inventories the published manifest.
+          cosign attest --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
+          cosign attest --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
+
+  # Publish the GitHub Release. `needs:` the binary builds AND the image publish, so this runs only when
+  # every binary smoke passed AND both multi-arch images were built, smoked, pushed, signed, and SBOM'd
+  # — i.e. the release is always gated on the full smoke + publish chain.
   release:
     name: publish release
-    needs: [build-binaries, build-image]
+    needs: [build-binaries, build-images, publish-images]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -160,6 +314,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          pattern: jitgen-*
           path: dist
           merge-multiple: true
       - name: Create GitHub Release with binaries + checksums
