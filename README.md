@@ -11,6 +11,30 @@ arXiv:2601.22832 — see [docs/research/paper-notes.md](docs/research/paper-note
 - **`catch`** — tests that **fail** on your change while **passing** on its parent (a *weak catch*),
   then assessed for whether they reveal a real bug (*strong catch*).
 
+## See it catch a real bug — one command, no install
+
+```bash
+docker run --rm ghcr.io/sondrateconsulting/jitgen-demo
+```
+
+That's the whole setup. The image builds a tiny seeded-bug repo and runs the **real** catch pipeline
+against it **offline — no API key, no network** — then prints the planted regression (a `+`→`-` operator
+swap), the test jitgen generated for it, the **real** sandbox runs on the good revision and the buggy one
+(one passes, one fails with an assertion), and the verdict: a **strong catch**. The image is multi-arch
+(runs native on Apple Silicon and x86) and cosign-signed (see
+[docs/ci.md](docs/ci.md#getting-jitgen-onto-the-runner) to verify the signature + SBOM).
+
+Already have jitgen installed (below)? `jitgen demo` does the same thing. Add `--keep` for the seeded
+repo plus copy-paste commands that reproduce the catch **by hand** (`git` + `/bin/sh`, no jitgen in the
+loop), `--format sarif` for the exact code-scanning artifact a CI gate would upload, or `--lang rust` to
+run the proof through a real `cargo` crate (opt-in; needs a local toolchain).
+
+**What it proves — and what it doesn't.** The demo replays a *recorded* LLM response, so it validates
+jitgen's whole pipeline end to end (diff parsing, sandboxed execution, catch classification, the
+flake-filter, the strong-catch assessment, and reporting) **offline** — but **not** LLM generation
+*quality*, which needs a real provider on your own code (see [docs/ci.md](docs/ci.md) and
+[docs/user-guide.md](docs/user-guide.md#from-the-demo-to-your-repo)).
+
 > **Status:** the phased build is **complete** (F0–F11). See
 > [docs/final-report.md](docs/final-report.md) for the full wrap-up,
 > [docs/implementation-status.md](docs/implementation-status.md) for the per-phase record, and
@@ -30,54 +54,37 @@ arXiv:2601.22832 — see [docs/research/paper-notes.md](docs/research/paper-note
 
 ## Install
 
-**Build from source (no release tag or registry login needed).** While the repository is **private**
-this is the reliable path — clone it (you need repo access) and build the release binary:
+**Container image (recommended — multi-arch, cosign-signed).** No toolchain to install: the image
+bundles jitgen + git + the first-class language toolchains, so it doubles as the CI sandbox ("the
+container IS the sandbox"). Try it by tag; **pin the digest in CI**:
 
 ```bash
-git clone https://github.com/sondrateconsulting/jitgen
-cd jitgen
-cargo build --release        # first build is several minutes: cold C-heavy deps (libgit2, tree-sitter)
-./target/release/jitgen --version    # jitgen 0.2.1 (data-contract v1)
-# Put it on your PATH (or use the full target/release/jitgen path) so you can run it from other repos:
-export PATH="$PWD/target/release:$PATH"
+docker run --rm ghcr.io/sondrateconsulting/jitgen:v0.2.1 --version    # jitgen 0.2.1 (data-contract v1)
 ```
 
-**Hosted artifacts (auth-gated until the repo is public).** Tagged releases publish per-platform
-binaries (with SHA-256 checksums) and a digest-pinned container image (`linux/amd64`; arm64 is a
-follow-up) — each smoke-tested (`--version` + `analyze` on a fixture) before publish. Until the repo is
-public these need a `docker login` / token; copy the real tag and the digest it reports from the
-[Releases page](https://github.com/sondrateconsulting/jitgen/releases) in place of the placeholders:
+**Prebuilt binary** (Linux x86-64, macOS arm64), checksum-verified before use:
 
 ```bash
-# <release-tag> / <digest>: from the Releases page (e.g. v0.2.1 and the sha256 it prints).
-cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag <release-tag> jitgen-cli
-docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
+ver=v0.2.1; target=x86_64-unknown-linux-gnu
+base="https://github.com/sondrateconsulting/jitgen/releases/download/${ver}"
+curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz"
+curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz.sha256"
+shasum -a 256 -c "jitgen-${ver}-${target}.tar.gz.sha256"   # must pass before you trust the binary
+tar -xzf "jitgen-${ver}-${target}.tar.gz" && ./jitgen --version
 ```
 
-Full recipes (checksum verification, the "container IS the sandbox" CI model) live in
-[docs/ci.md → Getting jitgen onto the runner](docs/ci.md#getting-jitgen-onto-the-runner).
-
-## See it catch a real bug — one command, no setup
-
-Before anything else, watch jitgen catch a real regression **offline, with no API key**:
+**`cargo install`** (compiles the pinned source; needs a Rust toolchain — name the CLI crate explicitly,
+the workspace has no root package):
 
 ```bash
-jitgen demo        # builds a tiny seeded-bug repo and runs the REAL catch pipeline against it
+cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.2.1 jitgen-cli
 ```
 
-It prints exactly what happened: the planted regression (a `+`→`-` operator swap), the test jitgen
-generated for it, the **real** sandbox runs on the good revision and the buggy one (one passes, one
-fails with an assertion), and the verdict — a **strong catch**. Add `--keep` to also get the seeded
-repo plus copy-paste commands that reproduce the catch **by hand** (just `git` and `/bin/sh`, no jitgen
-in the loop), or `--format sarif` to see the exact code-scanning artifact a CI gate would upload. Add
-`--lang rust` to run the same proof through a real `cargo` crate instead of `/bin/sh` (opt-in,
-best-effort; needs a local `cargo`/`rustup` toolchain).
+**Build from source:** `git clone` then `cargo build --release` → `target/release/jitgen` (the first
+build is several minutes: cold C-heavy deps — libgit2, tree-sitter).
 
-**What it proves — and what it doesn't.** The demo replays a *recorded* LLM response, so it validates
-jitgen's whole pipeline end to end (diff parsing, sandboxed execution, catch classification, the
-flake-filter, the strong-catch assessment, and reporting) **offline** — but **not** LLM generation
-*quality*, which needs a real provider on your own code (see [docs/ci.md](docs/ci.md) and
-[docs/user-guide.md](docs/user-guide.md#from-the-demo-to-your-repo)).
+Full recipes — **digest pinning, signature + SBOM verification**, and the "container IS the sandbox" CI
+model — live in [docs/ci.md → Getting jitgen onto the runner](docs/ci.md#getting-jitgen-onto-the-runner).
 
 ## Quickstart
 
