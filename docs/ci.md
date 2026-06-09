@@ -155,11 +155,12 @@ consumers; the **exit code** is the gate.
 ### Getting jitgen onto the runner
 
 A tagged release (`v*`) publishes, from [`.github/workflows/release.yml`](../.github/workflows/release.yml),
-**per-platform binaries with SHA-256 checksums** and a **digest-pinned container image** — each
-smoke-tested (`--version` + `analyze` on a fixture) *before* it is published. Choose the acquisition path
-that fits your runner. The `v0.2.1` and `@sha256:<digest>` tokens below are **placeholders** — substitute
-a published release tag and the digest that release reports (no release is cut yet; this pipeline is what
-produces them):
+**per-platform binaries with SHA-256 checksums** and **digest-pinned, cosign-signed multi-arch container
+images** — each artifact smoke-tested (`--version` + `analyze` on a fixture; the images also exercise their
+bundled toolchains / run the demo) *before* it is published. Choose the acquisition path that fits your
+runner. The `v0.2.1` and `@sha256:<digest>` tokens below are **placeholders** — substitute a published
+release tag and the digest that release reports (no release is cut yet; this pipeline is what produces
+them):
 
 **Prebuilt binary** (Linux x86-64, macOS x86-64, macOS arm64), checksum-verified before use:
 
@@ -179,14 +180,40 @@ package, so name the CLI crate explicitly:
 cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.2.1 jitgen-cli
 ```
 
-**Container image** — `ghcr.io/sondrateconsulting/jitgen`, with git and the first-class toolchains
-(Rust, Node, JDK+Maven, Python+pytest) baked in. **`linux/amd64` only today** (a `linux/arm64` image is a
-follow-up — it needs an arm runner; on arm64 runners build from the `Dockerfile` or use the OS-sandbox
-tier). Pin the **digest** the release reports, never a floating tag:
+**Container images** — both **multi-arch** (`linux/amd64` + `linux/arm64`, built natively per arch) and
+**cosign-signed with an SPDX SBOM attestation**:
+
+- `ghcr.io/sondrateconsulting/jitgen` — the fat CI image, with git and the first-class toolchains (Rust,
+  Node, JDK+Maven, Python+pytest) baked in. This is the "container IS the sandbox" image (below).
+- `ghcr.io/sondrateconsulting/jitgen-demo` — a slim, demo-only image: `docker run … jitgen-demo` runs
+  `jitgen demo` (the offline real-catch proof — no API key, no network). It carries only the binary and a
+  POSIX `/bin/sh`, so `jitgen demo --lang rust` (which needs `cargo`) is **unsupported there** and fails
+  fast with a pointer to the default demo — use the fat image or a local toolchain for the rust fixture.
+
+Pin the **digest** the release reports, never a floating tag:
 
 ```bash
 docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
 ```
+
+Verify the signature + SBOM before trusting an image (keyless — the signing identity is **this repo's
+release workflow, on a version tag**; works for either image, against the multi-arch digest or a per-arch
+digest). Pin the identity to the release workflow so a signature from any *other* workflow in the repo is
+not accepted:
+
+```bash
+id_re='^https://github\.com/sondrateconsulting/jitgen/\.github/workflows/release\.yml@refs/tags/v'
+cosign verify ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
+  --certificate-identity-regexp "$id_re" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+cosign verify-attestation --type spdxjson ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
+  --certificate-identity-regexp "$id_re" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Signatures and the SBOM attestation are applied immediately after the manifest is published, in the same
+release run; if you pull during that brief window, re-run `cosign verify` until it succeeds (a release
+whose signing step failed produces no GitHub Release).
 
 **Build from source** (always works, no release required): `cargo build --release` →
 `target/release/jitgen`. Pin to a tag/commit in a real workflow.
