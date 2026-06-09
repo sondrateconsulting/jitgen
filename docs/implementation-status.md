@@ -184,8 +184,8 @@ Legend: ⬜ not started · 🟦 in_progress · ✅ complete
   defeated isolation); `run()`/`detect()` use it (`UntrustedLauncher`). **(P2)** process-group swept
   **before** joining readers + bounded `collect` (`COLLECT_GRACE`) so a backgrounded/`setsid`
   pipe-holder can't hang `run()`. **(P2)** `redact_capped` drops an 8 KiB tail guard on truncation so
-  a cap-boundary-split secret can't leak. **(P3)** rlimit preamble uses `exec -- "$@"` (dash-program
-  shell-gate bypass). **(P3)** containers **require** an explicit non-root `--user` (`MissingContainerUser`/
+  a cap-boundary-split secret can't leak. **(P3)** rlimit preamble uses dash-portable `exec "$@"` (the
+  leading-dash shell-gate bypass is rejected at the `inner_argv` boundary, `OptionLikeProgram`). **(P3)** containers **require** an explicit non-root `--user` (`MissingContainerUser`/
   `InvalidRunAs`), never default to root; `id` is trusted-resolved. **(P3)** env denies `_URL`/`_URI`/
   `_PROXY`/`DSN`/`WEBHOOK`/`NETRC`/`KUBECONFIG`. **(P3)** `--pull=never` + strict
   `name@sha256:<64hex>`. **(P4)** `build_plan`/`run`/`PlanInput`/`SandboxPlan`/`render_profile` are

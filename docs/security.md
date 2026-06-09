@@ -257,8 +257,12 @@ These MUST exist and pass before the relevant phase is complete (built security-
   / `--cpus`) and firejail (`--rlimit-*`) enforce CPU/memory/process caps in-kernel. **bwrap** and
   macOS **`sandbox-exec`** (and the opt-in constrained-local tier) have no flag-level rlimit
   primitive, and a `setrlimit` pre-exec would require `unsafe` (forbidden crate-wide); on those tiers
-  jitgen applies a **`ulimit` shell preamble** (`sh -c 'ulimit -t …; ulimit -v …; exec -- "$@"'`)
-  that enforces **CPU-time and address-space** (address-space is unenforced on macOS). **Process-count
+  jitgen applies a **`ulimit` shell preamble** (`sh -c 'ulimit -t …; ulimit -v …; exec "$@"'`)
+  that enforces **CPU-time and address-space** (address-space is unenforced on macOS). The preamble
+  re-execs the untrusted argv via plain `exec "$@"` (no `--`: dash's `exec` has no `--` terminator, so
+  `exec -- "$@"` would try to run a file literally named `--`); the leading-dash defense the `--` once
+  provided — a program beginning with `-` parsed by a bash-family `exec` as an option — now lives at the
+  `inner_argv` boundary (`SandboxError::OptionLikeProgram`). **Process-count
   is intentionally omitted** (`ulimit -u` is per-UID, not per-process-tree): the container
   `--pids-limit` plus the wall-clock timeout are the fork-bomb controls, and the whole-process-group
   kill bounds escapees. Network egress, write-confinement, and the env allowlist are unaffected.
