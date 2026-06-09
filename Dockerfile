@@ -21,10 +21,35 @@ COPY crates ./crates
 # --locked: build exactly the committed Cargo.lock (reproducible). Only the CLI binary is needed.
 RUN cargo build --locked --release --bin jitgen -p jitgen-cli
 
+# ---- demo: slim, demo-only image for `jitgen demo` (offline real-catch, no toolchains) ----
+# The first-contact image. `docker run ghcr.io/sondrateconsulting/jitgen-demo` runs `jitgen demo`:
+# the offline proof that catch mode catches a real regression (recorded LLM, constrained-local
+# sandbox, no API key, no network). It needs only the jitgen binary + a POSIX /bin/sh — the demo
+# builds its two-commit fixture via vendored libgit2 IN-PROCESS (no `git` CLI) and runs the generated
+# test under /bin/sh. `jitgen demo --lang rust` is unsupported here (no cargo) and fails fast with a
+# pointer to the default demo: that is the documented slim-image limitation (docs/ci.md); the fat
+# `runtime` image below carries the toolchains. debian:bookworm-slim shares the builder's bookworm
+# glibc userland, so the dynamically-linked jitgen binary runs as-is. Digest-pinned per ADR-0009
+# (multi-arch manifest list — covers linux/amd64 + linux/arm64).
+FROM debian:bookworm-slim@sha256:0104b334637a5f19aa9c983a91b54c89887c0984081f2068983107a6f6c21eeb AS demo
+LABEL org.opencontainers.image.source="https://github.com/sondrateconsulting/jitgen" \
+      org.opencontainers.image.description="jitgen demo — offline, one-command proof that catch mode catches a real regression (no API key)." \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY --from=builder /build/target/release/jitgen /usr/local/bin/jitgen
+# Non-root by default (defense in depth — the demo writes only to per-run temp dirs under $HOME).
+RUN useradd --create-home --uid 1000 --user-group jitgen
+USER jitgen
+WORKDIR /home/jitgen
+# `docker run <demo-image>` → the demo, no args needed (the launch one-liner). Override with e.g.
+# `docker run <demo-image> --version` or `... analyze ...`.
+ENTRYPOINT ["jitgen"]
+CMD ["demo"]
+
 # ---- runtime: jitgen + git + the four first-class toolchains, non-root ----
 # Same rust base => cargo/rustc/gcc/git already on PATH and layer-shared with the builder; apt adds the
-# other three languages. The build intermediates in the builder's target/ are left behind.
-FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+# other three languages. The build intermediates in the builder's target/ are left behind. This is the
+# DEFAULT build target (last stage) — `docker build .` yields the fat "container IS the sandbox" image.
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS runtime
 
 LABEL org.opencontainers.image.source="https://github.com/sondrateconsulting/jitgen" \
       org.opencontainers.image.description="jitgen — Just-in-Time test generation; run it inside this container as the CI sandbox boundary." \
