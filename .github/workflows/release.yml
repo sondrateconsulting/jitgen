@@ -279,6 +279,12 @@ jobs:
             "${SLIM_IMAGE}@${slim_amd}" "${SLIM_IMAGE}@${slim_arm}"
           fat_digest="$(docker buildx imagetools inspect "${FAT_IMAGE}:${REF}" --format '{{.Manifest.Digest}}')"
           slim_digest="$(docker buildx imagetools inspect "${SLIM_IMAGE}:${REF}" --format '{{.Manifest.Digest}}')"
+          # Guard the assembled manifest-list digests with the same sha256: check the per-arch read uses
+          # above: set -e already aborts an inspect that errors outright, but sign + SBOM-attest must never
+          # target a malformed/half-read digest, so reject anything that is not a sha256: value before it
+          # reaches $GITHUB_ENV and the signing steps.
+          case "$fat_digest"  in sha256:*) ;; *) echo "::error::fat manifest-list digest is not a sha256 digest: '${fat_digest}'";  exit 1 ;; esac
+          case "$slim_digest" in sha256:*) ;; *) echo "::error::slim manifest-list digest is not a sha256 digest: '${slim_digest}'"; exit 1 ;; esac
           echo "FAT_DIGEST=${fat_digest}"   >> "$GITHUB_ENV"
           echo "SLIM_DIGEST=${slim_digest}" >> "$GITHUB_ENV"
           echo "Published ${FAT_IMAGE}@${fat_digest}"
