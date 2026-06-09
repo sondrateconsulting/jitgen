@@ -156,8 +156,13 @@ jobs:
           # 2. `docker run <slim>` (no args -> CMD demo) runs the offline real-catch demo to completion:
           #    exit 0 AND the success line. This exercises the FULL constrained-local sandbox path inside
           #    the slim image — the exact path the dash-exec P0 fix repaired on Debian/dash Linux.
+          set +e
           out="$(docker run --rm jitgen-demo:smoke)"
+          demo_rc=$?
+          set -e
           echo "$out"
+          [ "$demo_rc" -eq 0 ] \
+            || { echo "::error::slim demo exited ${demo_rc} (expected 0)"; exit 1; }
           echo "$out" | grep -q '\[ok\] jitgen caught the seeded regression' \
             || { echo "::error::slim demo did not report a catch"; exit 1; }
           echo "$out" | grep -q 'StrongCatch' \
@@ -310,10 +315,13 @@ jobs:
           COSIGN_YES: "true"
         run: |
           set -euo pipefail
-          # The fat and slim images share an identical OS package set across arches (same Dockerfile, same
-          # digest-pinned base), so one SBOM per repo accurately inventories the published manifest.
-          cosign attest --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
-          cosign attest --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
+          # --recursive attaches the attestation to the index AND each per-arch child, so
+          # `cosign verify-attestation` succeeds whether a consumer pins the multi-arch tag/index digest
+          # or a per-arch digest. The SBOM is scanned on the amd64 runner; the OS/package inventory is
+          # arch-identical (same Dockerfile + multi-arch base), so it represents both arches — only the
+          # per-arch jitgen binary hash is not separately attested.
+          cosign attest --recursive --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
+          cosign attest --recursive --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
 
   # Publish the GitHub Release. `needs:` the binary builds AND the image publish, so this runs only when
   # every binary smoke passed AND both multi-arch images were built, smoked, pushed, signed, and SBOM'd

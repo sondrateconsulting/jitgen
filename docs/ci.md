@@ -196,17 +196,24 @@ Pin the **digest** the release reports, never a floating tag:
 docker run --rm ghcr.io/sondrateconsulting/jitgen@sha256:<digest> --version
 ```
 
-Verify the signature + SBOM before trusting an image (keyless — the signing identity is this repo's
-release workflow; works for either image):
+Verify the signature + SBOM before trusting an image (keyless — the signing identity is **this repo's
+release workflow, on a version tag**; works for either image, against the multi-arch digest or a per-arch
+digest). Pin the identity to the release workflow so a signature from any *other* workflow in the repo is
+not accepted:
 
 ```bash
+id_re='^https://github\.com/sondrateconsulting/jitgen/\.github/workflows/release\.yml@refs/tags/v'
 cosign verify ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
-  --certificate-identity-regexp '^https://github.com/sondrateconsulting/jitgen/' \
+  --certificate-identity-regexp "$id_re" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 cosign verify-attestation --type spdxjson ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
-  --certificate-identity-regexp '^https://github.com/sondrateconsulting/jitgen/' \
+  --certificate-identity-regexp "$id_re" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+Signatures and the SBOM attestation are applied immediately after the manifest is published, in the same
+release run; if you pull during that brief window, re-run `cosign verify` until it succeeds (a release
+whose signing step failed produces no GitHub Release).
 
 **Build from source** (always works, no release required): `cargo build --release` →
 `target/release/jitgen`. Pin to a tag/commit in a real workflow.
