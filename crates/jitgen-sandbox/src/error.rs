@@ -73,6 +73,15 @@ pub enum SandboxError {
     #[error("empty command: no program to execute")]
     EmptyCommand,
 
+    /// A non-shell program begins with `-`. It would become argv[0] of the rlimit preamble's
+    /// `exec "$@"`, where a bash-family `exec` parses a leading-dash token as an option (the S2/F7 P3
+    /// shell-gate bypass). `exec` has no portable `--` terminator (dash rejects `exec --`), so the
+    /// leading-dash guard lives here at the boundary instead — no real program path starts with `-`.
+    /// Carries no payload: the offending program can be repo-controlled (`.jitgen.yaml` argv[0]), and
+    /// this layer's errors stay free of untrusted/secret-bearing content per the policy above.
+    #[error("program must not begin with '-' (would be parsed as an exec option)")]
+    OptionLikeProgram,
+
     /// A synthetic runtime dir (`.jitgen-home`/`.jitgen-tmp`) already existed in the overlay before
     /// the run — refused rather than followed/reused, since the overlay is attacker-controlled and a
     /// pre-planted symlink or seeded directory would subvert the inert `HOME`/`TMPDIR` guarantee.

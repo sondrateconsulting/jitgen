@@ -149,6 +149,14 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
         }
         Ok(vec!["/bin/sh".to_string(), "-c".to_string(), joined])
     } else {
+        // The program becomes argv[0] of the rlimit preamble's `exec "$@"`. A bash-family `exec`
+        // parses a leading-dash token as an option (the S2/F7 P3 shell-gate bypass); the preamble
+        // cannot use a `--` terminator because dash's `exec` has none (`exec --` tries to run a file
+        // literally named `--`), so reject an option-like program here at the boundary. No real
+        // program path starts with `-`. (The shell branch above is safe: its argv[0] is `/bin/sh`.)
+        if req.program.starts_with('-') {
+            return Err(SandboxError::OptionLikeProgram);
+        }
         let mut v = Vec::with_capacity(1 + req.args.len());
         v.push(req.program.clone());
         v.extend(req.args.iter().cloned());
@@ -160,11 +168,15 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
 /// the real command. Used only for tiers with no native rlimit mechanism (sandbox-exec, bwrap,
 /// constrained-local); firejail uses `--rlimit-*` and containers use cgroup flags.
 ///
-/// The untrusted argv is passed as positional parameters and re-exec'd via `exec -- "$@"`, so it is
+/// The untrusted argv is passed as positional parameters and re-exec'd via `exec "$@"`, so it is
 /// **never** parsed by the shell — this adds no command-injection surface (the shell script is a fixed
-/// jitgen-authored string). The `--` terminator is essential: without it, an argv whose program
-/// begins with `-` (e.g. `-c`) would be consumed by `exec` as an option, turning the wrapper into a
-/// shell-gate bypass (S2/F7 P3). What it enforces:
+/// jitgen-authored string). Plain `exec "$@"` (no `--`) is used because `/bin/sh` is **dash** on most
+/// Linux (Debian/Ubuntu, the jitgen images), and dash's `exec` has no `--` terminator: `exec -- "$@"`
+/// there tries to run a file literally named `--`, exiting 127 — so every sandboxed command silently
+/// failed on dash. The leading-dash defense the `--` once provided (an argv whose program begins with
+/// `-`, e.g. `-c`, being consumed by a bash-family `exec` as an option → S2/F7 P3 shell-gate bypass)
+/// now lives in `inner_argv`, which rejects an option-like non-shell program at the boundary. What it
+/// enforces:
 /// - **CPU time** (`ulimit -t`, seconds): unambiguous across `sh` implementations and verified to fire
 ///   (SIGXCPU) including under `sandbox-exec`. Bounds runaway compute.
 /// - **Address space** (`ulimit -v`, KiB): best-effort — enforced on Linux; macOS does not enforce
@@ -176,7 +188,7 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
 /// (see `docs/security.md`). The wall-clock timeout is the cross-tier backstop.
 fn with_rlimit_preamble(inner: Vec<String>, limits: &ResourceLimits) -> Vec<String> {
     let script = format!(
-        "ulimit -t {} 2>/dev/null || true; ulimit -v {} 2>/dev/null || true; exec -- \"$@\"",
+        "ulimit -t {} 2>/dev/null || true; ulimit -v {} 2>/dev/null || true; exec \"$@\"",
         limits.cpu_seconds,
         limits.address_space_bytes / 1024,
     );
@@ -626,17 +638,53 @@ mod tests {
     }
 
     #[test]
-    fn rlimit_preamble_uses_exec_dash_dash() {
-        // The `--` terminator must be present so a leading-dash program can't become an exec option
-        // (S2/F7 P3 shell-gate bypass).
+    fn rlimit_preamble_uses_portable_exec() {
+        // The preamble must use plain `exec "$@"` — dash's `exec` has no `--` terminator, so
+        // `exec -- "$@"` runs a file named `--` and exits 127 (every sandboxed command failed on
+        // dash-based Linux). The leading-dash defense moved to `inner_argv` (see the rejection test).
         let r = req();
         let plan =
             build_plan(input(Backend::ConstrainedLocal, &r, &ExecPolicy::default())).unwrap();
         assert!(
-            plan.args.iter().any(|a| a.contains("exec -- \"$@\"")),
-            "preamble must use `exec -- \"$@\"`: {:?}",
+            plan.args.iter().any(|a| a.contains("exec \"$@\"")),
+            "preamble must use portable `exec \"$@\"`: {:?}",
             plan.args
         );
+        assert!(
+            !plan.args.iter().any(|a| a.contains("exec -- ")),
+            "preamble must NOT use `exec -- ` (dash-incompatible): {:?}",
+            plan.args
+        );
+    }
+
+    #[test]
+    fn option_like_program_is_refused() {
+        // The leading-dash defense that the dropped `exec --` once provided: a non-shell program
+        // beginning with `-` would be parsed as an exec option by a bash-family shell (S2/F7 P3), so
+        // it is rejected at the boundary instead. The guard lives in `inner_argv` (before the backend
+        // dispatch), so it must fire for EVERY preamble-wrapped tier, not just constrained-local.
+        let r = SpawnRequest::argv("-c", ["evil".into()]);
+        for backend in [
+            Backend::ConstrainedLocal,
+            Backend::Bwrap,
+            Backend::SandboxExec,
+        ] {
+            assert!(
+                matches!(
+                    build_plan(input(backend, &r, &ExecPolicy::default())).unwrap_err(),
+                    SandboxError::OptionLikeProgram
+                ),
+                "leading-dash program must be refused for {backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_dash_argument_is_accepted() {
+        // The guard is argv[0]-only: a normal program with a `-`-leading ARGUMENT (e.g. `echo -n`,
+        // `cargo test --quiet`) must still build — only the program slot can become an exec option.
+        let r = SpawnRequest::argv("/bin/echo", ["-n".into(), "hi".into()]);
+        assert!(build_plan(input(Backend::ConstrainedLocal, &r, &ExecPolicy::default())).is_ok());
     }
 
     #[test]
