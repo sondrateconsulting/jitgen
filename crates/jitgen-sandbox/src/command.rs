@@ -661,13 +661,20 @@ mod tests {
     fn option_like_program_is_refused() {
         // The leading-dash defense that the dropped `exec --` once provided: a non-shell program
         // beginning with `-` would be parsed as an exec option by a bash-family shell (S2/F7 P3), so
-        // it is rejected at the boundary instead. The guard lives in `inner_argv` (before the backend
-        // dispatch), so it must fire for EVERY preamble-wrapped tier, not just constrained-local.
+        // it is rejected at the boundary instead. The guard lives in `inner_argv`, which runs *before*
+        // the backend dispatch (and before the container image/user checks), so it fires for EVERY
+        // backend — both the preamble-wrapped tiers where argv[0] would otherwise reach `exec "$@"`
+        // (constrained-local, bwrap, sandbox-exec) and the non-preamble tiers that never option-parse
+        // the inner argv (firejail, docker, podman — defense in depth). Enumerate all of them so a
+        // future per-backend code path can't silently drop the guard.
         let r = SpawnRequest::argv("-c", ["evil".into()]);
         for backend in [
-            Backend::ConstrainedLocal,
             Backend::Bwrap,
+            Backend::Firejail,
             Backend::SandboxExec,
+            Backend::Docker,
+            Backend::Podman,
+            Backend::ConstrainedLocal,
         ] {
             assert!(
                 matches!(
