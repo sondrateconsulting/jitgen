@@ -6,9 +6,6 @@ you explicitly opt in. Its threat model and the controls that enforce it are doc
 [docs/security.md](docs/security.md). We take vulnerabilities in those controls seriously and
 appreciate reports that help keep the boundary sound.
 
-> **Status: the repository is private (pre-public).** Reporting today is available to users with access
-> to the repository; the channel below stays the same once the project is public.
-
 ## Reporting a vulnerability
 
 **Please do not open a public issue for a security vulnerability.**
