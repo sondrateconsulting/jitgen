@@ -330,15 +330,16 @@ jobs:
           # arch-identical (same Dockerfile + multi-arch base), so it represents both arches — only the
           # per-arch jitgen binary hash is not separately attested.
           #
-          # --no-tlog-upload: the fat image's SBOM (all four toolchains) is multi-MB and exceeds the
-          # public Rekor transparency-log entry the `intoto` upload tries to write, so the upload times
-          # out. The attestation is still a real DSSE envelope signed by the ephemeral Fulcio cert and
-          # stored alongside the image in GHCR — bound to the digest and identity-verifiable — it is just
-          # not recorded in the public transparency log. The image SIGNATURES (above) DO go to the tlog
-          # (small entries), so normal `cosign verify` is unaffected; only `verify-attestation` needs
-          # --insecure-ignore-tlog (documented in docs/ci.md).
-          cosign attest --recursive --no-tlog-upload --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
-          cosign attest --recursive --no-tlog-upload --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
+          # --tlog-upload=false: the fat image's SBOM (all four toolchains) is multi-MB and exceeds the
+          # public Rekor transparency-log entry the DSSE/intoto upload tries to write, so the upload times
+          # out. (`cosign attest` uses --tlog-upload, NOT sign's --no-tlog-upload flag.) The attestation
+          # is still a real DSSE envelope signed by the ephemeral Fulcio cert and stored alongside the
+          # image in GHCR — bound to the digest and identity-verifiable — it is just not recorded in the
+          # public transparency log. The image SIGNATURES (above) DO go to the tlog (small entries), so
+          # normal `cosign verify` is unaffected; only `verify-attestation` needs --insecure-ignore-tlog
+          # (documented in docs/ci.md).
+          cosign attest --recursive --tlog-upload=false --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
+          cosign attest --recursive --tlog-upload=false --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
 
   # Publish the GitHub Release. `needs:` the binary builds AND the image publish, so this runs only when
   # every binary smoke passed AND both multi-arch images were built, smoked, pushed, signed, and SBOM'd
