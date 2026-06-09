@@ -381,8 +381,9 @@ untrusted code, so neither needs a sandbox.
 | **macOS** | `sandbox-exec` | Docker / Podman | `sandbox-exec` is **Apple-deprecated but still functional**, and remains macOS's default OS tier (see [security.md → Residual risks](security.md#residual-risks)). |
 | **Windows** *(and any other OS)* | **none** | Docker / Podman | **Container-only** — there is no native OS sandbox, so `run` needs a digest-pinned container or the "container IS the sandbox" model. |
 
-**Binaries vs. image.** Prebuilt binaries ship for **Linux x86-64** and **macOS x86-64 / arm64**; the
-published container image is **`linux/amd64`** today. On Windows, run jitgen through the container image
+**Binaries vs. image.** Prebuilt binaries ship for **Linux x86-64** and **macOS arm64** (Intel macOS:
+build from source or use the image); the published container images are **multi-arch (`linux/amd64` +
+`linux/arm64`)**. On Windows, run jitgen through the container image
 (e.g. Docker Desktop) or build from source — and because Windows has **no native OS sandbox**, that
 container is also what gives `run` its isolation. `jitgen doctor` reports the tier it would select on
 your host.

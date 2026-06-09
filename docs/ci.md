@@ -162,7 +162,8 @@ runner. The `v0.2.1` and `@sha256:<digest>` tokens below are **placeholders** �
 release tag and the digest that release reports (no release is cut yet; this pipeline is what produces
 them):
 
-**Prebuilt binary** (Linux x86-64, macOS x86-64, macOS arm64), checksum-verified before use:
+**Prebuilt binary** (Linux x86-64, macOS arm64), checksum-verified before use. *(Intel macOS —
+`x86_64-apple-darwin` — is not prebuilt; build from source or use the container image.)*
 
 ```bash
 ver=v0.2.1; target=x86_64-unknown-linux-gnu          # your release tag + platform
@@ -203,17 +204,25 @@ not accepted:
 
 ```bash
 id_re='^https://github\.com/sondrateconsulting/jitgen/\.github/workflows/release\.yml@refs/tags/v'
+
+# Image signature — recorded in the Sigstore transparency log; verified normally.
 cosign verify ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
   --certificate-identity-regexp "$id_re" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
-cosign verify-attestation --type spdxjson ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
+
+# SPDX SBOM attestation — bound to the image digest and stored in the registry, but NOT in the
+# transparency log (the fat image's SBOM is too large for a Rekor entry), so pass --insecure-ignore-tlog.
+# The Fulcio cert identity is still verified; only the public-tlog timestamp is skipped.
+cosign verify-attestation --type spdxjson --insecure-ignore-tlog \
+  ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
   --certificate-identity-regexp "$id_re" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-Signatures and the SBOM attestation are applied immediately after the manifest is published, in the same
-release run; if you pull during that brief window, re-run `cosign verify` until it succeeds (a release
-whose signing step failed produces no GitHub Release).
+The image **signature** is recorded in the public transparency log; the **SBOM attestation** is stored in
+the registry only (registry-backed, identity-verifiable, but not tlog-recorded — hence
+`--insecure-ignore-tlog`). Both are applied immediately after the manifest is published, in the same
+release run (a release whose signing step fails produces no GitHub Release).
 
 **Build from source** (always works, no release required): `cargo build --release` →
 `target/release/jitgen`. Pin to a tag/commit in a real workflow.
