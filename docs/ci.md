@@ -61,15 +61,17 @@ usage failure so a pipeline can tell "jitgen found a likely bug" apart from "jit
 | Code | Meaning | When |
 |------|---------|------|
 | **0** | Success | A successful `run`, `analyze`, `resume`, or `report`. Also a `--fail-on-catch` run that found nothing to gate, or one run with `--warn-only`. `doctor` when its prerequisites are met. |
-| **1** | Runtime error | jitgen could not complete: git intake, generation, sandbox, materialization, report rendering, or an I/O error; an unreadable/oversized/malformed `--baseline` file; or a **real provider selected (`--real-llm`) whose API-key env var is unset or empty**. Also `doctor` when a hard prerequisite (`git`) is missing. Every code-1 exit prints a one-line cause **and a fix hint** to stderr. |
+| **1** | Runtime error | jitgen could not complete: git intake, generation, sandbox, materialization, report rendering, or an I/O error; an unreadable/oversized/malformed `--baseline` file; or a **real provider selected (`--real-llm`) whose API-key env var is unset or empty**. Also `doctor` when a hard prerequisite (`git`) is missing, **or when a strict `doctor --require-sandbox` / `--require-real-llm` preflight requirement is unmet** ([Strict CI-readiness](#strict-ci-readiness---require-sandbox----require-real-llm)). Every code-1 exit prints a one-line cause **and a fix hint** to stderr. |
 | **2** | Usage error | Invalid command line: an unknown/missing flag or bad value (rejected by the argument parser), or `--write`/`--patch-out` combined with `--mode catch` (catch mode is report-only). |
 | **3** | Findings gate tripped | **Only** with `--fail-on-catch` (and not `--warn-only`): the run surfaced at least one **strong catch** whose `tp_probability` met `--fail-threshold` and that the `--baseline` did not suppress. The report/SARIF was already emitted. See [Findings gate](user-guide.md#findings-gate---fail-on-catch). |
 
 Notes:
 
-- **`doctor` is a 0/1 readiness probe**, not a gate: it exits `0` when `git` is available and `1`
-  otherwise (provider/sandbox status is *reported* but does not change the exit code — a runner with no
-  LLM provider still passes `doctor` and runs in mock mode). Use it as a preflight (below).
+- **`doctor` is a 0/1 readiness probe**, not a gate: by default it exits `0` when `git` is available and
+  `1` otherwise (provider/sandbox status is *reported* but does not change the exit code — a runner with
+  no LLM provider still passes `doctor` and runs in mock mode). The opt-in `--require-sandbox` /
+  `--require-real-llm` flags turn those facts into the exit code for a strict CI preflight (below). Use
+  it as a preflight (below).
 - **`--warn-only` never returns 3.** It surfaces gating findings on stderr and still exits `0`, so you
   can roll the gate out in "observe" mode before it blocks.
 - jitgen has no intentional panic path; a `101` (Rust panic) would indicate a bug or an underlying
@@ -118,6 +120,37 @@ jitgen doctor --format json   # machine-readable (assert sandbox_tier != "none",
 toolchains are expected to be covered by the containerized backend in CI ([ADR-0009](decisions/0009-hermetic-toolchains-ci.md)).
 With `--config <trusted file> --real-llm` it also reports which provider would be used and whether its
 API-key env var is set (never the value).
+
+#### Strict CI-readiness (`--require-sandbox` / `--require-real-llm`)
+
+By default `doctor` exits `0` as long as `git` is present, so "doctor passed" does **not** mean "this
+runner can gate PRs." The opt-in strict flags turn the facts CI actually depends on into the exit code,
+so a misconfigured runner fails at preflight instead of mid-run:
+
+```bash
+# Inside a jitgen container ("the container is the sandbox") — accept the constrained-local tier:
+jitgen doctor --require-sandbox --unsafe-local-execution
+# On a runner with an OS sandbox (e.g. bubblewrap) — no flag needed:
+jitgen doctor --require-sandbox
+# Verify a real provider is wired before a billed run:
+jitgen doctor --config "$CFG" --require-real-llm
+```
+
+- **`--require-sandbox`** exits non-zero unless an **isolating** tier (`os-sandbox`/`container`) is
+  detected. Because the constrained-local tier is **not** network-isolating (it relies on the
+  surrounding container — see [Security model](#security-model-for-ci)), `--require-sandbox` does **not**
+  pass on bare constrained-local: you must add **`--unsafe-local-execution`** to assert "this is a
+  throwaway, jitgen-owned container." When it passes that way, doctor prints a note that the pass rests
+  on the weak tier, not a real sandbox — so a strict preflight can never silently bless an unisolated
+  runner.
+- **`--require-real-llm`** exits non-zero unless a **real** (non-mock) provider with its API-key env var
+  set is configured (it implies `--real-llm` for the check). Use it before a billed real-provider run so
+  an unset key fails the preflight, not the run. It checks **key presence, not reachability**: a keyless
+  `local` provider passes once configured even if its endpoint is down, and a set key is not validated
+  against the API — so it catches an unwired provider, not an unhealthy one.
+
+Strict notes and failures print to **stderr**, so `--format json` on stdout stays clean for machine
+consumers; the **exit code** is the gate.
 
 ### Getting jitgen onto the runner
 

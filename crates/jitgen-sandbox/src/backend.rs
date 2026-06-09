@@ -252,4 +252,22 @@ mod tests {
         assert!(Backend::ConstrainedLocal.version_probe().is_none());
         assert!(Backend::Docker.version_probe().is_some());
     }
+
+    #[test]
+    fn os_candidates_is_a_subsequence_of_auto_preference() {
+        // `detect()` returns `os_candidates()` filtered with order preserved; `select(Auto)` walks
+        // `AUTO_PREFERENCE`. So the strongest *available* backend (what `detect().first()` yields)
+        // equals what `select(Auto)` picks ONLY IF `os_candidates()` lists backends in the same
+        // relative order as `AUTO_PREFERENCE`. `jitgen doctor --require-sandbox` (GP8) reports the
+        // tier of `detect().first()` and claims parity with what `jitgen run` auto-selects — lock the
+        // ordering invariant so a future reorder of either list can't silently desync them.
+        let cands = os_candidates();
+        let mut pref = AUTO_PREFERENCE.iter();
+        for c in &cands {
+            assert!(
+                pref.any(|p| p == c),
+                "{c:?} in os_candidates() is out of order vs AUTO_PREFERENCE {AUTO_PREFERENCE:?}"
+            );
+        }
+    }
 }

@@ -178,6 +178,19 @@ struct DoctorArgs {
     /// Report readiness for real LLM calls (off by default; TRUSTED).
     #[arg(long)]
     real_llm: bool,
+    /// Strict CI-readiness: exit non-zero unless an isolating sandbox tier (os-sandbox/container) is
+    /// available — or --unsafe-local-execution accepts the constrained-local tier. Use as a CI
+    /// preflight so a misconfigured runner fails before a run, not mid-run.
+    #[arg(long)]
+    require_sandbox: bool,
+    /// Strict CI-readiness: exit non-zero unless a real (non-mock) LLM provider with its API-key env
+    /// var set is configured. Implies --real-llm for this check.
+    #[arg(long)]
+    require_real_llm: bool,
+    /// Accept the constrained-local tier ("the container is the sandbox") so --require-sandbox passes
+    /// when no isolating tier is detected (TRUSTED). Doctor still flags it as the weak boundary it is.
+    #[arg(long)]
+    unsafe_local_execution: bool,
 }
 
 #[derive(Debug, Args)]
@@ -651,15 +664,13 @@ fn cmd_doctor(a: DoctorArgs) -> ExitCode {
     // Resolve the trusted provider config so doctor can report real-provider readiness. doctor has no
     // target repo; use the cwd for the "config must be outside" check (a trusted file should not live
     // in whatever directory you happen to run doctor from).
-    let flags = TrustedFlags {
-        config_file: a.config,
-        real_llm: flag(a.real_llm),
-        ..TrustedFlags::default()
-    };
-    let provider_desc = match resolve_trusted(&flags, std::path::Path::new("."), env_lookup) {
-        Ok(t) => jitgen_orchestrator::describe_provider(&t.provider),
+    let flags = doctor_trusted_flags(&a);
+    let resolved = match resolve_trusted(&flags, std::path::Path::new("."), env_lookup) {
+        Ok(t) => t,
         Err(e) => return fail(&format!("jitgen doctor: {e}")),
     };
+    let provider_desc = jitgen_orchestrator::describe_provider(&resolved.provider);
+    let real_llm_ready = jitgen_orchestrator::real_llm_ready(&resolved.provider);
     let state_root = jitgen_orchestrator::default_state_root();
     let report = jitgen_orchestrator::run_doctor(&state_root, &provider_desc);
     match a.format {
@@ -669,11 +680,48 @@ fn cmd_doctor(a: DoctorArgs) -> ExitCode {
         },
         AnalyzeFormat::Human => print!("{}", report.render_human()),
     }
-    if report.prerequisites_ok() {
+    // Strict CI-readiness (GP8): turn the requested `--require-*` facts into the exit code so a CI
+    // preflight fails before a run, not mid-run. The advisory notes/failures go to stderr so the
+    // (possibly JSON) report on stdout stays clean for machine consumers. Static strings (no untrusted
+    // input), so no terminal sanitization is needed.
+    let strict = report.strict_verdict(
+        &jitgen_orchestrator::StrictRequirements {
+            require_sandbox: a.require_sandbox,
+            require_real_llm: a.require_real_llm,
+            unsafe_local_execution: a.unsafe_local_execution,
+        },
+        real_llm_ready,
+    );
+    for note in &strict.notes {
+        eprintln!("jitgen doctor: note: {note}");
+    }
+    for failure in &strict.failures {
+        eprintln!("jitgen doctor: NOT READY: {failure}");
+    }
+    if doctor_ready(report.prerequisites_ok(), &strict) {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     }
+}
+
+/// Build the trusted resolver flags for `doctor`. `--require-real-llm` implies `--real-llm`:
+/// real-provider readiness can't be evaluated while the mock master switch is in force (the default
+/// offline mock would always read as "not ready"). Extracted as a pure seam so the implication is
+/// unit-testable without driving the full command.
+fn doctor_trusted_flags(a: &DoctorArgs) -> TrustedFlags {
+    TrustedFlags {
+        config_file: a.config.clone(),
+        real_llm: flag(a.real_llm || a.require_real_llm),
+        ..TrustedFlags::default()
+    }
+}
+
+/// doctor's exit decision: ready (exit `0`) only when the base prerequisites hold AND no strict
+/// `--require-*` requirement failed. Advisory `notes` never gate. Pure, so the exit-code matrix is
+/// unit-testable without capturing process stdout/stderr.
+fn doctor_ready(prerequisites_ok: bool, strict: &jitgen_orchestrator::StrictVerdict) -> bool {
+    prerequisites_ok && strict.failures.is_empty()
 }
 
 /// Print a shell completion script for `shell` to stdout. Pure presentation — no repo, no network, no
@@ -1075,6 +1123,82 @@ mod tests {
         assert!(Cli::try_parse_from(["jitgen", "frobnicate"]).is_err());
         // run still requires --base (--repo/--head now default).
         assert!(Cli::try_parse_from(["jitgen", "run"]).is_err());
+    }
+
+    /// Parse a `doctor` invocation into its args (panics if it isn't a doctor command).
+    fn parse_doctor(args: &[&str]) -> DoctorArgs {
+        match Cli::try_parse_from(args)
+            .expect("doctor args parse")
+            .command
+        {
+            Command::Doctor(a) => a,
+            _ => panic!("expected doctor"),
+        }
+    }
+
+    #[test]
+    fn doctor_parses_strict_flags_and_require_real_llm_implies_real_llm() {
+        // GP8: the strict CI-readiness flags must parse together...
+        let a = parse_doctor(&[
+            "jitgen",
+            "doctor",
+            "--require-sandbox",
+            "--require-real-llm",
+            "--unsafe-local-execution",
+        ]);
+        assert!(a.require_sandbox && a.require_real_llm && a.unsafe_local_execution);
+        assert!(!a.real_llm, "--real-llm was not passed explicitly");
+        // ...and --require-real-llm must turn real_llm ON for the resolver. Without this implication
+        // the readiness check runs against the offline mock master switch and ALWAYS reports
+        // not-ready, making --require-real-llm useless. This guards that wiring (review MEDIUM).
+        assert_eq!(
+            doctor_trusted_flags(&a).real_llm,
+            Some(true),
+            "--require-real-llm must imply --real-llm"
+        );
+    }
+
+    #[test]
+    fn doctor_trusted_flags_real_llm_implication_matrix() {
+        // Neither flag ⇒ leave real_llm unset so env/config can still decide.
+        assert_eq!(
+            doctor_trusted_flags(&parse_doctor(&["jitgen", "doctor"])).real_llm,
+            None
+        );
+        // Plain --real-llm ⇒ on.
+        assert_eq!(
+            doctor_trusted_flags(&parse_doctor(&["jitgen", "doctor", "--real-llm"])).real_llm,
+            Some(true)
+        );
+        // --require-real-llm alone ⇒ on (the implication).
+        assert_eq!(
+            doctor_trusted_flags(&parse_doctor(&["jitgen", "doctor", "--require-real-llm"]))
+                .real_llm,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn doctor_ready_gates_on_prereqs_and_strict_failures() {
+        use jitgen_orchestrator::StrictVerdict;
+        let clean = StrictVerdict::default();
+        let failed = StrictVerdict {
+            failures: vec!["--require-sandbox: no isolating tier".into()],
+            notes: vec![],
+        };
+        let notes_only = StrictVerdict {
+            failures: vec![],
+            notes: vec!["passed on constrained-local — not a real sandbox".into()],
+        };
+        // git present + nothing failed ⇒ ready (exit 0).
+        assert!(doctor_ready(true, &clean));
+        // git missing ⇒ not ready, regardless of strict state.
+        assert!(!doctor_ready(false, &clean));
+        // a strict failure ⇒ not ready even with git present (the GP8 gate).
+        assert!(!doctor_ready(true, &failed));
+        assert!(!doctor_ready(false, &failed));
+        // advisory notes alone never gate.
+        assert!(doctor_ready(true, &notes_only));
     }
 
     #[test]
