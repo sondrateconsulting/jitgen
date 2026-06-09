@@ -243,10 +243,27 @@ jobs:
         uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
 
       - name: Assemble + push the multi-arch manifest lists from the smoked per-arch digests
+        shell: bash
         run: |
           set -euo pipefail
-          fat_amd="$(cat digests/fat-amd64.digest)";  fat_arm="$(cat digests/fat-arm64.digest)"
-          slim_amd="$(cat digests/slim-amd64.digest)"; slim_arm="$(cat digests/slim-arm64.digest)"
+          # Read each per-arch digest by filename regardless of how the artifact download nested it, and
+          # fail loud if any is missing or not a sha256 digest. This job is tag-gated, so it is first
+          # exercised on the real release — a silent bad read must hard-fail here, never half-publish.
+          declare -A DG
+          for kind in fat slim; do
+            for arch in amd64 arm64; do
+              f="$(find digests -type f -name "${kind}-${arch}.digest" | head -1)"
+              [ -n "$f" ] || { echo "::error::digest file ${kind}-${arch}.digest not found among downloaded artifacts"; exit 1; }
+              v="$(tr -d '[:space:]' < "$f")"
+              case "$v" in
+                sha256:*) ;;
+                *) echo "::error::${kind}-${arch}.digest is not a sha256 digest: '${v}'"; exit 1 ;;
+              esac
+              DG["${kind}-${arch}"]="$v"
+            done
+          done
+          fat_amd="${DG[fat-amd64]}";  fat_arm="${DG[fat-arm64]}"
+          slim_amd="${DG[slim-amd64]}"; slim_arm="${DG[slim-arm64]}"
           # imagetools create references the children by DIGEST, so the published index is provably the
           # exact per-arch bits that passed smoke (no tag races, no rebuild).
           docker buildx imagetools create \
