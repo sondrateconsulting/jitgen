@@ -53,17 +53,18 @@ pub use user::current_uid_gid;
 ///
 /// The suite's out-of-sandbox control probe must apply EXACTLY production's trusted-launcher
 /// discipline (resolve `docker` via [`resolve_trusted`](test_support::resolve_trusted) over
-/// [`TRUSTED_BIN_DIRS`](test_support::TRUSTED_BIN_DIRS), never the inherited `PATH`) and EXACTLY
-/// production's non-root `--user` gate ([`is_uid_gid`](test_support::is_uid_gid)). Re-exporting
-/// the production items — instead of the test keeping mirror copies — makes drift impossible by
-/// construction.
+/// [`TRUSTED_BIN_DIRS`](test_support::TRUSTED_BIN_DIRS), never the inherited `PATH`), EXACTLY
+/// production's non-root `--user` gate ([`is_uid_gid`](test_support::is_uid_gid)), and EXACTLY
+/// production's digest-pin gate ([`is_digest_pinned`](test_support::is_digest_pinned)).
+/// Re-exporting the production items — instead of the test keeping mirror copies — makes drift
+/// impossible by construction.
 ///
 /// NOT a stable API (hence `#[doc(hidden)]`). Only pure, read-only helpers belong here: nothing
 /// that can construct or execute a sandbox plan, so the fail-closed boundary above (S2/F7 P4) is
 /// unaffected.
 #[doc(hidden)]
 pub mod test_support {
-    pub use crate::command::is_uid_gid;
+    pub use crate::command::{is_digest_pinned, is_uid_gid};
     pub use crate::which::{resolve_trusted, TRUSTED_BIN_DIRS};
 }
 

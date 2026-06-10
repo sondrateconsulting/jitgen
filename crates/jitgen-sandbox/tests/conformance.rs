@@ -25,7 +25,9 @@ use jitgen_core::{ExecOutcome, ExecutionResult, SandboxBackend};
 // `JITGEN_TEST_DOCKER_UID_GID` override must satisfy exactly the gate `plan_container` applies
 // (`is_uid_gid`). Using the production items directly — instead of test-local mirror copies —
 // makes drift impossible by construction.
-use jitgen_sandbox::test_support::{is_uid_gid, resolve_trusted, TRUSTED_BIN_DIRS};
+use jitgen_sandbox::test_support::{
+    is_digest_pinned, is_uid_gid, resolve_trusted, TRUSTED_BIN_DIRS,
+};
 use jitgen_sandbox::{current_uid_gid, Backend, ExecPolicy, RunRequest, Sandbox, SpawnRequest};
 use std::path::{Path, PathBuf};
 
@@ -255,12 +257,53 @@ enum ControlProbe<'a> {
 /// enough that a wedged docker daemon cannot hang the gate (`Command::output` has no timeout).
 const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// `Command::output()` with [`CONTROL_DEADLINE`]: on overrun the child is killed and the gate
-/// panics loudly — a control must never be able to hang an `#[ignore]`d gate indefinitely.
+/// Grace for the pipe readers to hit EOF once the control process is gone (exited or killed).
+/// In every legitimate flow the pipes close with the process — the probe script sends its tools'
+/// output to `/dev/null` and the docker CLI holds its own pipes — and draining the leftover pipe
+/// buffer is instant. Only a pathological descendant that inherited the pipes can keep them open
+/// past the process's death, and that must read as a loud control failure, never a hang.
+const READER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Poll a reader thread until it finishes or `until` passes; join it when finished. `None` means
+/// the reader is still blocked on an open pipe (see [`READER_GRACE`]) — the caller panics and
+/// drops (detaches) the handle rather than joining into a hang.
+fn try_join_reader(
+    handle: std::thread::JoinHandle<(Vec<u8>, std::io::Result<()>)>,
+    until: std::time::Instant,
+) -> Option<(Vec<u8>, std::io::Result<()>)> {
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Some(handle.join().expect("control pipe reader panicked"))
+}
+
+/// Render one reader's outcome for a panic message: the bytes it captured (kept even when partial
+/// and even alongside a read error — each reader is reported independently), or the fact that it
+/// is still blocked on the pipe.
+fn describe_reader(r: &Option<(Vec<u8>, std::io::Result<()>)>) -> String {
+    match r {
+        None => "<reader still blocked on the open pipe>".to_string(),
+        Some((bytes, Ok(()))) => format!("{:?}", String::from_utf8_lossy(bytes)),
+        Some((bytes, Err(e))) => {
+            format!("{:?} (read error: {e})", String::from_utf8_lossy(bytes))
+        }
+    }
+}
+
+/// `Command::output()` with an END-TO-END bound: [`CONTROL_DEADLINE`] caps the child's lifetime
+/// and [`READER_GRACE`] caps the pipe drain after the child is gone — on either overrun the
+/// child is killed (when still alive) and the gate panics loudly with whatever partial output
+/// the readers captured. A control must never be able to hang an `#[ignore]`d gate indefinitely;
+/// plain `Command::output()` can (it blocks until pipe EOF, which a pipe-inheriting descendant
+/// of an exited child can withhold forever).
 ///
-/// Pipe read errors are control failures in their own right: they are reported as such instead of
-/// being swallowed, where the resulting empty output would misread downstream as "no egress / no
-/// probe tool" and send whoever runs the gate chasing the wrong cause.
+/// Pipe read errors are control failures in their own right: they are reported as such, naming
+/// the pipe, instead of being swallowed — swallowed, the resulting empty output would misread
+/// downstream as "no egress / no probe tool" and send whoever runs the gate chasing the wrong
+/// cause.
 fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::process::Output {
     use std::process::Stdio;
     let mut child = cmd
@@ -270,7 +313,7 @@ fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::pro
         .spawn()
         .expect("control probe failed to spawn");
     // Drain both pipes on reader threads so a chatty child can never block on a full pipe and
-    // defeat the deadline below; the threads see EOF once the child exits (or is killed). Each
+    // defeat the deadline below; the threads see EOF once the pipes' write ends close. Each
     // returns (bytes read so far, read result) — the bytes survive even when the read errors.
     fn drain(
         mut pipe: impl std::io::Read + Send + 'static,
@@ -290,42 +333,47 @@ fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::pro
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                // The child is dead and reaped, so its pipe ends are closed: give the readers a
-                // short grace to hit EOF, then join them — surfacing whatever the child managed
-                // to say (the difference between "docker never answered" and "docker printed
-                // half an error, then wedged" is what makes this diagnosable) and leaving no
-                // reader thread running past the panic. The fallback exists only for a
-                // pathological grandchild that inherited the pipes and outlived the kill: panic
-                // without the partial output rather than trade a loud panic for a hang.
-                let grace = std::time::Instant::now() + std::time::Duration::from_secs(2);
-                while (!out_thread.is_finished() || !err_thread.is_finished())
-                    && std::time::Instant::now() < grace
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                let (out_partial, err_partial) =
-                    if out_thread.is_finished() && err_thread.is_finished() {
-                        let (o, _) = out_thread.join().expect("control stdout reader");
-                        let (e, _) = err_thread.join().expect("control stderr reader");
-                        (o, e)
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
+                // The child is dead and reaped: join each reader INDEPENDENTLY within
+                // [`READER_GRACE`] so the panic carries every byte that is retrievable — the
+                // difference between "docker never answered" and "docker printed half an error,
+                // then wedged" is what makes this diagnosable — without trading the loud panic
+                // for a hang if a pipe-inheriting descendant survived the kill (that reader is
+                // reported as blocked instead).
+                let until = std::time::Instant::now() + READER_GRACE;
+                let out = try_join_reader(out_thread, until);
+                let err = try_join_reader(err_thread, until);
                 panic!(
                     "{what}: CONTROL probe did not finish within {}s and was killed (stdout so \
-                     far {:?}, stderr so far {:?}); a wedged docker daemon or a black-holing \
+                     far {}, stderr so far {}); a wedged docker daemon or a black-holing \
                      network can cause this. This is a control failure, NOT a sandbox-isolation \
                      failure — fix the environment and rerun",
                     CONTROL_DEADLINE.as_secs(),
-                    String::from_utf8_lossy(&out_partial),
-                    String::from_utf8_lossy(&err_partial),
+                    describe_reader(&out),
+                    describe_reader(&err),
                 );
             }
             None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     };
-    let (stdout, out_res) = out_thread.join().expect("control stdout reader");
-    let (stderr, err_res) = err_thread.join().expect("control stderr reader");
+    // The child exited on its own, but `read_to_end` reaches EOF only when the pipes' write ends
+    // close — which a pipe-inheriting descendant can hold open past the child's exit. Bound these
+    // joins too ([`READER_GRACE`]), making the wrapper's bound end-to-end; an overrun here is a
+    // control failure, reported with whatever WAS captured.
+    let until = std::time::Instant::now() + READER_GRACE;
+    let ((stdout, out_res), (stderr, err_res)) = match (
+        try_join_reader(out_thread, until),
+        try_join_reader(err_thread, until),
+    ) {
+        (Some(out), Some(err)) => (out, err),
+        (out, err) => panic!(
+            "{what}: CONTROL probe pipes still open {}s after the control process exited (a \
+             descendant inherited them; stdout {}, stderr {}). This is a control failure, NOT a \
+             sandbox-isolation failure — fix the environment and rerun",
+            READER_GRACE.as_secs(),
+            describe_reader(&out),
+            describe_reader(&err),
+        ),
+    };
     for (pipe, res) in [("stdout", out_res), ("stderr", err_res)] {
         if let Err(e) = res {
             panic!(
@@ -432,11 +480,12 @@ fn assert_network_denied(
     );
 }
 
-/// Resolve a digest-pinned image from the env, or skip. Enforces `@sha256:` so the test never pulls
-/// or runs a floating tag (matches the production `FloatingImageTag` guard).
+/// Resolve a digest-pinned image from the env, or skip. Validated with the PRODUCTION
+/// `is_digest_pinned` gate itself (via `test_support`) — `name@sha256:<64 lowercase hex>` — so
+/// the suite never pulls or runs anything `plan_container` would reject as floating.
 fn docker_test_image() -> Option<String> {
     match std::env::var("JITGEN_TEST_DOCKER_IMAGE") {
-        Ok(v) if v.contains("@sha256:") => Some(v),
+        Ok(v) if is_digest_pinned(&v) => Some(v),
         Ok(v) if !v.is_empty() => {
             eprintln!("SKIP docker test: JITGEN_TEST_DOCKER_IMAGE={v:?} is not digest-pinned");
             None

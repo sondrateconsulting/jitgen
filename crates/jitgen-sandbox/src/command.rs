@@ -103,7 +103,10 @@ fn validate_instance(s: &str) -> Result<()> {
 
 /// Whether `image` is `name@sha256:<64 lowercase hex>` — a fully digest-pinned reference. A floating
 /// tag (`name:latest`) or a short/uppercase digest is rejected (ADR-0009; S2/F7 P3).
-fn is_digest_pinned(image: &str) -> bool {
+///
+/// `pub` only for the hidden `crate::test_support` re-export (the conformance suite gates its
+/// `JITGEN_TEST_DOCKER_IMAGE` env with this exact check); the module itself stays private.
+pub fn is_digest_pinned(image: &str) -> bool {
     match image.split_once("@sha256:") {
         Some((name, digest)) => {
             !name.is_empty()
