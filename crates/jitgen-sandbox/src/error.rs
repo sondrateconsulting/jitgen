@@ -136,4 +136,18 @@ mod tests {
         let msg = SandboxError::BackendUnavailable("docker").to_string();
         assert!(msg.contains("docker"));
     }
+
+    #[test]
+    fn netns_opt_in_message_names_backend_remedy_and_limit() {
+        let msg = SandboxError::NetnsRequiresUnsafeLocal.to_string();
+        assert!(msg.contains("netns-helper"), "must name the backend: {msg}");
+        assert!(
+            msg.contains("--unsafe-local-execution"),
+            "must name the remedy flag: {msg}"
+        );
+        assert!(
+            msg.contains("does NOT confine the filesystem"),
+            "must state the limitation that makes the opt-in required: {msg}"
+        );
+    }
 }
