@@ -5,10 +5,15 @@
 # .github/zizmor.yml, auto-discovered). zizmor also flags template injection, excessive permissions,
 # cache poisoning, dangerous triggers, and known-vulnerable actions.
 #
-# `advanced-security: false` because this repo is PRIVATE without GitHub Advanced Security: the default
-# (SARIF upload to code scanning) would fail here AND always exit 0. With it off, the action runs zizmor
-# in fail-on-findings mode, so an unpinned or unsafe action blocks the job, and findings surface as inline
-# annotations. When the repo goes public (and code scanning is available), flip to `advanced-security: true`.
+# `advanced-security: true`: the repo is PUBLIC, so GitHub code scanning is available for free. zizmor
+# uploads its findings as SARIF (Security tab + inline PR annotations) and — by the action's design —
+# exits 0 even on findings (Advanced Security fails a run only on internal errors). The blocking gate
+# therefore lives in code-scanning MERGE PROTECTION (a repository ruleset that requires the `zizmor`
+# tool to be alert-free before merge), NOT in this job's exit code. Verify it with:
+#   gh api repos/sondrateconsulting/jitgen/rulesets --jq '.[]|select(.name=="zizmor pin enforcement")'
+# Caveat: code-scanning protection blocks a PR only when a finding lands on a line the PR changes — which
+# is exactly the primary threat here, a PR that adds or edits an unpinned `uses:`. The pin-enforcement
+# policy itself is in .github/zizmor.yml (auto-discovered).
 name: security
 
 on:
@@ -19,7 +24,6 @@ on:
 
 permissions:
   contents: read
-  actions: read # zizmor's online audits resolve actions via the API (needed for a private repo)
 
 concurrency:
   group: security-${{ github.ref }}
@@ -29,6 +33,10 @@ jobs:
   zizmor:
     name: zizmor (workflow audit + pin enforcement)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # zizmor's online audits resolve actions via the GitHub API
+      security-events: write # upload the zizmor SARIF to code scanning (advanced-security: true)
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -36,8 +44,9 @@ jobs:
       - uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
         with:
           version: 1.25.2 # pin the zizmor CLI (the action defaults to "latest")
-          advanced-security: false # private repo w/o GHAS: fail the job on findings instead of uploading SARIF
-          annotations: true # surface findings as inline GitHub annotations
+          # Upload SARIF to code scanning (which surfaces findings inline on the PR + in the Security
+          # tab). `annotations` is mutually exclusive with this, so it is left at its default (off).
+          advanced-security: true # public repo: upload SARIF to code scanning (the ruleset is the gate)
 
   # GP1 history-hygiene guard. The going-public history rewrite (GP1b) purged docs/reviews/** from all
   # history; this job keeps it purged and blocks any secret re-introduction. The gitleaks binary is
