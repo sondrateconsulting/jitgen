@@ -8,6 +8,7 @@
 //! cargo test -p jitgen-sandbox --test conformance -- --ignored --test-threads=1
 //! # Docker gates also need a digest-pinned local image (we never pull during a test):
 //! JITGEN_TEST_DOCKER_IMAGE=name@sha256:... cargo test -p jitgen-sandbox --test conformance -- --ignored
+//! # bwrap/firejail gates need a Linux host with the launcher installed (they skip elsewhere).
 //! ```
 //!
 //! Only the crate's public API is used (these run as a separate integration binary).
@@ -79,6 +80,57 @@ fn sandbox_exec() -> Sandbox {
         ..ExecPolicy::default()
     };
     Sandbox::new(&[Backend::SandboxExec], policy).expect("sandbox-exec selectable")
+}
+
+/// Build a Linux OS-sandbox-backed `Sandbox` (bwrap/firejail), or skip when the launcher is not
+/// detected on this host (these backends exist on Linux only, so the gates skip on macOS/CI hosts
+/// without them rather than fail).
+fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
+    if !jitgen_sandbox::detect().contains(&backend) {
+        eprintln!(
+            "SKIP {0} test: {0} not available on this host",
+            backend.id()
+        );
+        return None;
+    }
+    let requested = match backend {
+        Backend::Bwrap => SandboxBackend::Bwrap,
+        Backend::Firejail => SandboxBackend::Firejail,
+        other => unreachable!("not a Linux OS-sandbox backend: {other:?}"),
+    };
+    let policy = ExecPolicy {
+        backend: requested,
+        ..ExecPolicy::default()
+    };
+    Some(Sandbox::new(&[backend], policy).unwrap())
+}
+
+/// Gate-1 probe shared by the bwrap, firejail, and Docker network-denial gates (the sandbox-exec
+/// gate uses its own python3 probe). Picks a connect tool that actually EXISTS in the sandboxed
+/// environment, then attempts an outbound TCP connect. Distinguishes "denied" from "no probe tool"
+/// so a toolless environment can't masquerade as a passing network-denial test (T1/F7 P3). Emits a
+/// sentinel word; callers assert on it (not on exit).
+const NET_PROBE_SCRIPT: &str = "\
+    if command -v nc >/dev/null 2>&1; then \
+        nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+    elif command -v bash >/dev/null 2>&1; then \
+        bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+    else echo NO_PROBE_TOOL; fi";
+
+/// Run [`NET_PROBE_SCRIPT`] under `sb` and assert egress is denied; fail loudly when the sandboxed
+/// environment offers no probe tool — an unverifiable gate must not read as a passing one.
+fn assert_network_denied(sb: &Sandbox, fx: &Fixture, run_as: Option<&str>, what: &str) {
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), NET_PROBE_SCRIPT.into()]);
+    let res = exec_as(sb, &cmd, fx, run_as);
+    assert!(
+        !res.stdout.contains("NO_PROBE_TOOL"),
+        "{what}: no nc/bash probe tool in the sandboxed environment, so network denial cannot \
+         be verified; rerun with an image/host that provides nc or bash"
+    );
+    assert!(
+        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+        "{what}: network must be denied (expected NET_DENIED); got {res:?}"
+    );
 }
 
 /// Resolve a digest-pinned image from the env, or skip. Enforces `@sha256:` so the test never pulls
@@ -237,24 +289,45 @@ fn docker_denies_network() {
         return;
     };
     let fx = Fixture::new("docker-net");
-    // Probe network denial robustly: pick a tool that actually EXISTS in the image, then attempt a
-    // connect. Distinguish "denied" from "no probe tool" so a toolless image can't masquerade as a
-    // passing network-denial test (T1/F7 P3). Emit a sentinel word and assert on it (not on exit).
-    let script = "\
-        if command -v nc >/dev/null 2>&1; then \
-            nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-        elif command -v bash >/dev/null 2>&1; then \
-            bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-        else echo NO_PROBE_TOOL; fi";
-    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script.into()]);
-    let res = exec_as(&sb, &cmd, &fx, Some(&uid_gid));
-    if res.stdout.contains("NO_PROBE_TOOL") {
-        eprintln!("SKIP docker_denies_network: image has no nc/bash probe tool");
+    assert_network_denied(&sb, &fx, Some(&uid_gid), "docker_denies_network");
+}
+
+/// Gate 1 — network denial under bubblewrap (Linux). `--unshare-all` puts the command in a fresh
+/// network namespace with no usable interfaces, so an outbound connect must fail. Skips when
+/// `bwrap` is absent (e.g. macOS).
+#[test]
+#[ignore = "live bwrap; needs a Linux host with bubblewrap installed"]
+fn bwrap_denies_network() {
+    let Some(sb) = linux_os_sandbox(Backend::Bwrap) else {
         return;
-    }
-    assert!(
-        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
-        "Docker network must be denied (expected NET_DENIED); got {res:?}"
+    };
+    assert_network_denied(
+        &sb,
+        &Fixture::new("bwrap-net"),
+        None,
+        "bwrap_denies_network",
+    );
+}
+
+/// Gate 1 — network denial under firejail (Linux). `--net=none` gives the command an empty
+/// network namespace, so an outbound connect must fail. Skips when `firejail` is absent
+/// (e.g. macOS).
+///
+/// Run this on a real Linux host, not inside a container: when firejail detects an existing
+/// sandbox it warns and runs the command **without any sandboxing** (observed with 0.9.74) — in
+/// that environment this gate fails with `NET_OK`, which is the truthful answer ("firejail is not
+/// an isolating backend here"), not a test bug.
+#[test]
+#[ignore = "live firejail; needs a Linux host with firejail installed"]
+fn firejail_denies_network() {
+    let Some(sb) = linux_os_sandbox(Backend::Firejail) else {
+        return;
+    };
+    assert_network_denied(
+        &sb,
+        &Fixture::new("firejail-net"),
+        None,
+        "firejail_denies_network",
     );
 }
 
