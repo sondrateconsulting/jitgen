@@ -27,13 +27,22 @@ const VENDOR_SEGMENTS: &[&str] = &[
 ];
 
 /// Exact file names that may carry secrets.
-const SECRET_NAMES: &[&str] = &[".npmrc", ".pypirc", ".netrc"];
+const SECRET_NAMES: &[&str] = &[".npmrc", ".pypirc", ".netrc", ".git-credentials"];
 
 /// File-name prefixes that may carry secrets (covers `id_rsa`, `id_rsa.old`, `credentials.json`, …).
 const SECRET_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_dsa", "id_ecdsa", "credentials"];
 
 /// File-name suffixes that may carry secrets/keys.
-const SECRET_SUFFIXES: &[&str] = &[".pem", ".key", ".p12", ".pfx", ".keystore"];
+const SECRET_SUFFIXES: &[&str] = &[
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".keystore",
+    ".jks",
+    ".ppk",
+    ".gpg",
+];
 
 /// Whether `path` (repo-relative, forward-slash) should be ignored for test generation.
 pub fn is_ignored(path: &str) -> bool {
@@ -95,8 +104,16 @@ mod tests {
         assert!(is_ignored("auth/credentials.json"));
         assert!(is_ignored("home/.cargo/credentials.toml"));
         assert!(is_ignored("home/.aws/credentials"));
+        // git's plaintext credential store (`https://user:token@host` lines).
+        assert!(is_ignored(".git-credentials"));
+        assert!(is_ignored("home/.git-credentials"));
+        // Key-store/key-file suffixes.
+        assert!(is_ignored("ci/release.jks"));
+        assert!(is_ignored("deploy/server.ppk"));
+        assert!(is_ignored("secrets/api-token.gpg"));
         assert!(!is_ignored("src/environment.ts"));
         assert!(!is_ignored("src/credential_helper.rs")); // not a credential store
+        assert!(!is_ignored("docs/git-credentials.md")); // name, not the store itself
     }
 
     #[test]
@@ -106,5 +123,6 @@ mod tests {
         assert!(is_ignored(".ENV"));
         assert!(is_ignored("keys/Server.PEM"));
         assert!(is_ignored("deploy/ID_RSA.old"));
+        assert!(is_ignored("home/.GIT-CREDENTIALS"));
     }
 }
