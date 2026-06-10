@@ -129,6 +129,30 @@ mod tests {
         assert!(resolve_trusted("/bin/./sh").is_none());
         assert!(resolve_trusted("/bin//sh").is_none());
         assert!(resolve_trusted("/bin/sh/").is_none());
+        // `//bin` has parent `/bin` (a trusted dir), so the raw-string check is the SOLE gate here.
+        assert!(resolve_trusted("//bin/sh").is_none());
+    }
+
+    /// Direct test of the raw-string predicate. The `resolve_trusted` assertions above can pass
+    /// for filesystem reasons unrelated to the predicate (e.g. `/bin/sh/` fails `metadata` with
+    /// ENOTDIR on macOS; `/usr/bin/./sh` needs usr-merge Linux to be observable at all), so this
+    /// pins the predicate's behavior on every platform with no filesystem involved.
+    #[test]
+    fn raw_segment_check_rejects_curdir_and_empty_segments() {
+        assert!(has_no_curdir_or_empty_segments("/bin/sh"));
+        assert!(has_no_curdir_or_empty_segments("/usr/local/bin/docker"));
+        // `..` segments pass HERE by design — rejecting them is `has_only_normal_components`' job
+        // (Component::ParentDir is NOT normalized away); the two checks are complementary.
+        assert!(has_no_curdir_or_empty_segments("/usr/bin/../sh"));
+
+        assert!(!has_no_curdir_or_empty_segments("/bin/./sh")); // interior `.`
+        assert!(!has_no_curdir_or_empty_segments("/./bin/sh")); // `.` right after root
+        assert!(!has_no_curdir_or_empty_segments("/bin/sh/.")); // trailing `.` segment
+        assert!(!has_no_curdir_or_empty_segments("/bin//sh")); // interior empty segment
+        assert!(!has_no_curdir_or_empty_segments("//bin/sh")); // empty segment right after root
+        assert!(!has_no_curdir_or_empty_segments("/bin/sh/")); // trailing empty segment
+        assert!(!has_no_curdir_or_empty_segments("/")); // bare root: one trailing empty segment
+        assert!(!has_no_curdir_or_empty_segments("/.")); // root + curdir
     }
 
     #[cfg(unix)]
