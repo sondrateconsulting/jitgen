@@ -26,8 +26,15 @@ const VENDOR_SEGMENTS: &[&str] = &[
     "bazel-testlogs",
 ];
 
-/// Exact file names that may carry secrets.
-const SECRET_NAMES: &[&str] = &[".npmrc", ".pypirc", ".netrc", ".git-credentials"];
+/// Exact file names that may carry secrets (`_netrc` is git-for-Windows' `.netrc`).
+const SECRET_NAMES: &[&str] = &[
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "_netrc",
+    ".git-credentials",
+    ".pgpass",
+];
 
 /// File-name prefixes that may carry secrets (covers `id_rsa`, `id_rsa.old`, `credentials.json`, …).
 const SECRET_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_dsa", "id_ecdsa", "credentials"];
@@ -107,6 +114,9 @@ mod tests {
         // git's plaintext credential store (`https://user:token@host` lines).
         assert!(is_ignored(".git-credentials"));
         assert!(is_ignored("home/.git-credentials"));
+        // Same-class plaintext stores: Windows .netrc, PostgreSQL password file.
+        assert!(is_ignored("home/_netrc"));
+        assert!(is_ignored("home/.pgpass"));
         // Key-store/key-file suffixes.
         assert!(is_ignored("ci/release.jks"));
         assert!(is_ignored("deploy/server.ppk"));
