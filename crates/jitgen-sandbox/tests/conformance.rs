@@ -8,6 +8,8 @@
 //! cargo test -p jitgen-sandbox --test conformance -- --ignored --test-threads=1
 //! # Docker gates also need a digest-pinned local image (we never pull during a test):
 //! JITGEN_TEST_DOCKER_IMAGE=name@sha256:... cargo test -p jitgen-sandbox --test conformance -- --ignored
+//! # Running as root (CI)? Also set JITGEN_TEST_DOCKER_UID_GID=<nonroot uid:gid> (e.g. 1000:1000):
+//! # once the image is configured, the docker gates fail loudly rather than skip without it.
 //! # bwrap/firejail gates need a Linux host with the launcher installed (they skip elsewhere).
 //! ```
 //!
@@ -572,8 +574,15 @@ fn test_uid_gid(what: &str) -> String {
 
 #[test]
 fn resolve_test_uid_gid_prefers_the_live_probe() {
-    // Once the live probe answers, the override is irrelevant — even an invalid one.
+    // Once the live probe answers, the override is irrelevant — valid or invalid. The valid-override
+    // case is the load-bearing one: an implementation that consulted the override first would
+    // return Ok("1000:1000") there, not fall through to an Err the other asserts already catch.
     let live = Some("501:20".to_string());
+    assert_eq!(
+        resolve_test_uid_gid(live.clone(), Some("1000:1000")),
+        Ok("501:20".to_string()),
+        "live probe must win even over a valid override"
+    );
     assert_eq!(
         resolve_test_uid_gid(live.clone(), Some("0:0")),
         Ok("501:20".to_string())
@@ -591,8 +600,13 @@ fn resolve_test_uid_gid_accepts_a_valid_override_when_root() {
 
 #[test]
 fn resolve_test_uid_gid_absent_override_says_set_it() {
+    // The contract is absent ≠ invalid (don't pin incidental wording): the absent-var message must
+    // NOT be the set-but-invalid one, and must tell the operator how to fix it.
     let err = resolve_test_uid_gid(None, None).unwrap_err();
-    assert!(err.contains("not set"), "absent-var message: {err}");
+    assert!(
+        !err.contains("set but invalid"),
+        "absent-var must not reuse the invalid-var message: {err}"
+    );
     assert!(
         err.contains("JITGEN_TEST_DOCKER_UID_GID="),
         "message must show how to fix: {err}"
