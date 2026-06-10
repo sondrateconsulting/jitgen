@@ -64,8 +64,10 @@ Test commands and build scripts are attacker-controlled.
   the env allowlist below + the ephemeral container, not by a guarantee the key never meets it (see
   [docs/ci.md](ci.md#security-model-for-ci)). The published image is **digest-pinned** like every
   toolchain image (threat #8); see [docs/ci.md](ci.md).
-- No network by default on the **isolating** backends (OS-sandbox/container: enforced + **conformance-
-  tested per backend**; a backend that can't prove network denial is treated as unavailable). The
+- No network by default on the **isolating** backends — cut wholesale per backend (bwrap
+  `--unshare-all`, firejail `--net=none`, `sandbox-exec` SBPL `(deny network*)`, containers
+  `--network=none`), with **live conformance tests probing outbound-connect denial** on
+  `sandbox-exec`, bwrap, firejail, and Docker (Podman shares the Docker invocation plan). The
   opt-in **constrained-local** tier does **not** itself cut the network — it relies on the surrounding
   ephemeral container (above). cwd pinned to overlay; resource limits **per backend** (containers via
   cgroup flags `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/constrained-
@@ -171,7 +173,8 @@ exfiltrate env".
 ## Secure defaults (summary)
 
 Fail-closed execution (isolating sandbox required); non-destructive (patch unless `--write`); no
-network in sandbox (conformance-tested); jitgen-owned env allowlist + synthetic HOME; argv-only;
+network in sandbox (live per-backend conformance tests); jitgen-owned env allowlist + synthetic
+HOME; argv-only;
 `shell`/provider/real-LLM/state-root are **trusted-config only**; keys from a trusted-named env var;
 redaction + caps everywhere; blob-based intake with git filters disabled; immutable OIDs; private
 `0700` state dir; preflight resource budgets; per-format report escaping.
@@ -203,8 +206,11 @@ their dependency versions from the pinned `Cargo.lock`, audited separately by `.
 
 These MUST exist and pass before the relevant phase is complete (built security-review-first at F7):
 
-1. **Sandbox network denial** — per backend (bwrap/firejail/`sandbox-exec`/Docker/Podman): DNS,
-   TCP/loopback, IPv6, unix-socket egress all blocked; **fail closed** if a backend cannot prove it.
+1. **Sandbox network denial** — the network is cut wholesale per backend (bwrap `--unshare-all`,
+   firejail `--net=none`, `sandbox-exec` SBPL `(deny network*)`, containers `--network=none`); live
+   `#[ignore]`d conformance tests (`crates/jitgen-sandbox/tests/conformance.rs`) probe
+   outbound-connect denial on `sandbox-exec`, bwrap, firejail, and Docker (Podman shares the Docker
+   invocation plan). Execution **fails closed** when no isolating backend is available.
 2. **No write outside overlay** — symlinked `tests/ -> ~/.ssh`, ancestor-swap races, `..`/absolute
    paths all rejected; `O_NOFOLLOW`/`O_EXCL`/`fstat` enforced.
 3. **Env allowlist** — token/socket/credential vars absent; synthetic HOME; trusted additions only.
