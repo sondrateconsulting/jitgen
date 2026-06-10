@@ -66,7 +66,12 @@ fn probe_backend(backend: Backend) -> Option<ProbeOutcome> {
     // env-independent, so it runs env-cleared — probe hygiene matching the run path's
     // `env_clear()` (no ambient secrets handed to a child we merely spawn for an exit code).
     let inherit_env = backend.tier() == crate::backend::Tier::Container;
-    Some(probe(&abs.to_string_lossy(), args, inherit_env, PROBE_TIMEOUT))
+    Some(probe(
+        &abs.to_string_lossy(),
+        args,
+        inherit_env,
+        PROBE_TIMEOUT,
+    ))
 }
 
 /// Whether `backend` would run a command **without sandboxing while exiting 0** right now — i.e. it
