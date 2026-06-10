@@ -21,6 +21,15 @@ pub enum SandboxError {
     #[error("requested sandbox backend {0:?} is not available on this host")]
     BackendUnavailable(&'static str),
 
+    /// The netns helper was requested without the unsafe-local opt-in. It adds a kernel network
+    /// cut but does **not** confine the filesystem, so it requires the same explicit acceptance as
+    /// the constrained-local tier ([ADR-0013]).
+    #[error(
+        "sandbox backend \"netns-helper\" denies network but does NOT confine the filesystem; \
+         it requires the explicit --unsafe-local-execution opt-in"
+    )]
+    NetnsRequiresUnsafeLocal,
+
     /// A `shell: true` command was supplied but the trusted config did not permit a shell. Refused
     /// rather than silently downgraded (security §5).
     #[error("shell command requires trusted shell_allowed=true; refusing")]
@@ -126,5 +135,19 @@ mod tests {
     fn backend_unavailable_names_the_backend() {
         let msg = SandboxError::BackendUnavailable("docker").to_string();
         assert!(msg.contains("docker"));
+    }
+
+    #[test]
+    fn netns_opt_in_message_names_backend_remedy_and_limit() {
+        let msg = SandboxError::NetnsRequiresUnsafeLocal.to_string();
+        assert!(msg.contains("netns-helper"), "must name the backend: {msg}");
+        assert!(
+            msg.contains("--unsafe-local-execution"),
+            "must name the remedy flag: {msg}"
+        );
+        assert!(
+            msg.contains("does NOT confine the filesystem"),
+            "must state the limitation that makes the opt-in required: {msg}"
+        );
     }
 }

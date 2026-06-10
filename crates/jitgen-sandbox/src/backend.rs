@@ -17,6 +17,11 @@ pub enum Tier {
     OsSandbox,
     /// Container isolation (Docker/Podman).
     Container,
+    /// The constrained-local tier hardened with a kernel-enforced **network** cut (Linux
+    /// user+net namespaces via the `unshare` helper). NOT an isolating sandbox — filesystem and
+    /// process visibility are still unconfined — so it is opt-in only, exactly like
+    /// [`Tier::ConstrainedLocal`] ([ADR-0013]).
+    NetnsLocal,
     /// No kernel-enforced isolation — best-effort, opt-in only.
     ConstrainedLocal,
 }
@@ -34,6 +39,9 @@ pub enum Backend {
     Docker,
     /// Podman container.
     Podman,
+    /// Linux netns helper: constrained-local plus a kernel network cut via util-linux `unshare`
+    /// (opt-in only, like the local tier — it does not confine the filesystem; [ADR-0013]).
+    NetnsHelper,
     /// No-isolation local tier (opt-in only).
     ConstrainedLocal,
 }
@@ -57,6 +65,7 @@ impl Backend {
             Backend::SandboxExec => "sandbox-exec",
             Backend::Docker => "docker",
             Backend::Podman => "podman",
+            Backend::NetnsHelper => "netns-helper",
             Backend::ConstrainedLocal => "constrained-local",
         }
     }
@@ -66,6 +75,7 @@ impl Backend {
         match self {
             Backend::Bwrap | Backend::Firejail | Backend::SandboxExec => Tier::OsSandbox,
             Backend::Docker | Backend::Podman => Tier::Container,
+            Backend::NetnsHelper => Tier::NetnsLocal,
             Backend::ConstrainedLocal => Tier::ConstrainedLocal,
         }
     }
@@ -84,6 +94,22 @@ impl Backend {
             )),
             Backend::Docker => Some(("docker", &["version"])),
             Backend::Podman => Some(("podman", &["version"])),
+            // FUNCTIONAL probe, not a version check: the `unshare` binary being present says nothing
+            // about whether this kernel/runtime permits unprivileged user namespaces (containers'
+            // seccomp profiles and hardened kernels commonly block them). Creating the actual
+            // user+net namespace pair and exec'ing a no-op proves the helper works end to end.
+            Backend::NetnsHelper => Some((
+                "unshare",
+                &[
+                    "--user",
+                    "--map-root-user",
+                    "--net",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "true",
+                ],
+            )),
             Backend::ConstrainedLocal => None,
         }
     }
@@ -119,16 +145,25 @@ fn explicit(backend: SandboxBackend) -> Option<Backend> {
         SandboxBackend::SandboxExec => Some(Backend::SandboxExec),
         SandboxBackend::Docker => Some(Backend::Docker),
         SandboxBackend::Podman => Some(Backend::Podman),
-        SandboxBackend::Auto | SandboxBackend::Local => None,
+        // `NetnsHelper` is handled by its own `select` arm (it needs the unsafe-local opt-in, which
+        // the generic explicit-backend arm does not check).
+        SandboxBackend::Auto | SandboxBackend::Local | SandboxBackend::NetnsHelper => None,
     }
 }
 
 /// Choose a backend from the detected-available set, fail-closed.
 ///
 /// - `Auto`: the strongest available isolating backend; if none, the local tier **only** when the
-///   operator opted in, else [`SandboxError::NoIsolationAvailable`].
-/// - `Local`: the constrained-local tier **only** when opted in, else refuse.
-/// - A specific backend: it must be in `available`, else [`SandboxError::BackendUnavailable`].
+///   operator opted in, else [`SandboxError::NoIsolationAvailable`]. An opted-in local fallback is
+///   **upgraded** to the netns helper when it is available: same opt-in, strictly more isolation
+///   (a kernel network cut on top of the identical constrained-local confinement; [ADR-0013]).
+/// - `Local`: the constrained-local tier **only** when opted in, else refuse. Explicit `local` is
+///   never upgraded — the operator named the exact tier.
+/// - `NetnsHelper`: requires the same unsafe-local opt-in (it does not confine the filesystem),
+///   plus a passing functional probe, else [`SandboxError::NetnsRequiresUnsafeLocal`] /
+///   [`SandboxError::BackendUnavailable`].
+/// - A specific isolating backend: it must be in `available`, else
+///   [`SandboxError::BackendUnavailable`].
 pub fn select(available: &[Backend], policy: &ExecPolicy) -> Result<Backend> {
     match policy.backend {
         SandboxBackend::Auto => {
@@ -138,7 +173,11 @@ pub fn select(available: &[Backend], policy: &ExecPolicy) -> Result<Backend> {
                 }
             }
             if policy.allow_unsafe_local {
-                Ok(Backend::ConstrainedLocal)
+                if available.contains(&Backend::NetnsHelper) {
+                    Ok(Backend::NetnsHelper)
+                } else {
+                    Ok(Backend::ConstrainedLocal)
+                }
             } else {
                 Err(SandboxError::NoIsolationAvailable)
             }
@@ -148,6 +187,15 @@ pub fn select(available: &[Backend], policy: &ExecPolicy) -> Result<Backend> {
                 Ok(Backend::ConstrainedLocal)
             } else {
                 Err(SandboxError::NoIsolationAvailable)
+            }
+        }
+        SandboxBackend::NetnsHelper => {
+            if !policy.allow_unsafe_local {
+                Err(SandboxError::NetnsRequiresUnsafeLocal)
+            } else if available.contains(&Backend::NetnsHelper) {
+                Ok(Backend::NetnsHelper)
+            } else {
+                Err(SandboxError::BackendUnavailable(Backend::NetnsHelper.id()))
             }
         }
         // A specific isolating backend. `explicit` returns `None` only for `Auto`/`Local` (handled
@@ -242,7 +290,82 @@ mod tests {
         let c = os_candidates();
         assert!(!c.is_empty());
         assert!(c.contains(&Backend::Docker));
-        assert!(c.iter().all(|b| b.tier() != Tier::ConstrainedLocal));
+        // Candidates are full isolating sandboxes only: never the local tier, and never the netns
+        // helper (which is probed separately and only reachable behind the unsafe-local opt-in).
+        assert!(c
+            .iter()
+            .all(|b| !matches!(b.tier(), Tier::ConstrainedLocal | Tier::NetnsLocal)));
+    }
+
+    #[test]
+    fn netns_helper_requires_opt_in_even_when_available() {
+        // Explicitly requested but no opt-in: refused with the dedicated error (it has no
+        // filesystem confinement, exactly like the local tier).
+        assert!(matches!(
+            select(
+                &[Backend::NetnsHelper],
+                &policy(SandboxBackend::NetnsHelper, false)
+            ),
+            Err(SandboxError::NetnsRequiresUnsafeLocal)
+        ));
+        // Opted in + available: selected.
+        assert_eq!(
+            select(
+                &[Backend::NetnsHelper],
+                &policy(SandboxBackend::NetnsHelper, true)
+            )
+            .unwrap(),
+            Backend::NetnsHelper
+        );
+        // Opted in but the functional probe failed (not in `available`): unavailable, NOT a silent
+        // downgrade to constrained-local — the operator asked for the network cut by name.
+        assert!(matches!(
+            select(&[], &policy(SandboxBackend::NetnsHelper, true)),
+            Err(SandboxError::BackendUnavailable("netns-helper"))
+        ));
+    }
+
+    #[test]
+    fn auto_unsafe_local_upgrades_to_netns_helper_when_available() {
+        // The opted-in local fallback is upgraded to the netns helper: same opt-in, strictly more
+        // isolation. Without the helper it stays constrained-local; without the opt-in it refuses.
+        assert_eq!(
+            select(&[Backend::NetnsHelper], &policy(SandboxBackend::Auto, true)).unwrap(),
+            Backend::NetnsHelper
+        );
+        assert_eq!(
+            select(&[], &policy(SandboxBackend::Auto, true)).unwrap(),
+            Backend::ConstrainedLocal
+        );
+        assert!(matches!(
+            select(
+                &[Backend::NetnsHelper],
+                &policy(SandboxBackend::Auto, false)
+            ),
+            Err(SandboxError::NoIsolationAvailable)
+        ));
+        // A real isolating tier still beats the netns helper under Auto, even opted-in.
+        assert_eq!(
+            select(
+                &[Backend::Docker, Backend::NetnsHelper],
+                &policy(SandboxBackend::Auto, true)
+            )
+            .unwrap(),
+            Backend::Docker
+        );
+    }
+
+    #[test]
+    fn explicit_local_is_never_upgraded_to_netns() {
+        // `--sandbox local` names the exact tier; the upgrade applies only to Auto.
+        assert_eq!(
+            select(
+                &[Backend::NetnsHelper],
+                &policy(SandboxBackend::Local, true)
+            )
+            .unwrap(),
+            Backend::ConstrainedLocal
+        );
     }
 
     #[test]

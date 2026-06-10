@@ -267,7 +267,7 @@ error (exit 1) with a one-line fix hint; see [troubleshooting.md](troubleshootin
 ```text
 --state-dir <path>        Durable run-state root (else JITGEN_STATE_DIR / XDG). MUST be outside the repo.
 --config <file>           Trusted user/system config file. MUST be outside the repo.
---sandbox <backend>       auto|bwrap|firejail|sandbox-exec|docker|podman|local
+--sandbox <backend>       auto|bwrap|firejail|sandbox-exec|docker|podman|netns-helper|local
 --docker-image <REF>      Digest-pinned image (name@sha256:…) for the Docker/Podman tier (or JITGEN_DOCKER_IMAGE).
 --unsafe-local-execution  Permit the no-isolation local tier (loud, recorded; trusted hosts only).
 --shell-allowed           Permit `shell: true` test commands (high-risk; trusted only).
@@ -365,9 +365,21 @@ container tier needs a digest-pinned image supplied via `--docker-image`/`JITGEN
 (`name@sha256:…`); without one, container execution fails closed (no floating tag is ever pulled). If
 no tier is available, execution is **refused** — unless a trusted operator passes
 `--unsafe-local-execution` to opt into the no-isolation constrained-local tier (never auto-selected).
-The sandbox enforces no-network, an env allowlist with synthetic `HOME`, overlay-confined writes,
-timeouts, output caps, and per-backend resource limits. See
-[ADR-0003](decisions/0003-sandbox-strategy.md).
+On Linux hosts that permit unprivileged user namespaces, an opted-in run is **auto-upgraded to the
+`netns-helper` tier**: the same constrained-local model, but the command is wrapped with util-linux
+`unshare` (user+net namespaces), so network access beyond the namespace — including the host's
+loopback services — is kernel-denied even though filesystem confinement still relies on the
+surrounding container (a test may re-enable the namespace-private loopback to talk to itself,
+which reaches nothing outside; pathname AF_UNIX sockets are not blocked). `--sandbox netns-helper`
+requests it by name (still requires the opt-in; fails closed when the kernel blocks user
+namespaces), and `--sandbox local` pins plain constrained-local with no upgrade — use it if your
+tests need loopback networking, or refuse to run as the namespace's apparent-root uid. Every tier
+enforces an env allowlist with synthetic `HOME`, timeouts, output caps, and per-backend resource
+limits; **no-network and overlay-confined writes are isolating-tier guarantees** — on the opt-in
+tiers, netns-helper restores the network cut (IP families) but write confinement still comes from
+the surrounding container, and plain constrained-local enforces neither. See
+[ADR-0003](decisions/0003-sandbox-strategy.md) and
+[ADR-0013](decisions/0013-netns-helper-backend.md).
 
 ## Platform support
 
