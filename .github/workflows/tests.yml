@@ -1,0 +1,51 @@
+# Linux test lane: `cargo test --workspace` on ubuntu-latest. Until this lane existed, NO workflow
+# ran cargo tests at all (security.yml = zizmor + gitleaks, release.yml = build + smoke,
+# jitgen-advisory.yml = the self-dogfood advisory), so the suite was effectively macOS-local-only.
+# That blind spot hid two Linux-only bugs:
+#   1. the dash-exec rlimit preamble (`exec -- "$@"`): dash — /bin/sh on Debian/Ubuntu — rejects
+#      `exec --`, so every sandboxed command exited 127 on dash Linux while macOS/bash worked
+#      (fixed in PR #1), and
+#   2. `resolve_trusted("/usr/bin/./sh")`: the test assertion passed VACUOUSLY on macOS (which has
+#      no /usr/bin/sh) and only bites on usr-merge Linux, where the normalized path resolves
+#      (fixed in PR #16).
+#
+# Scope: the DEFAULT `cargo test --workspace` set. Sandbox/e2e tests that need a real backend,
+# network, or docker are #[ignore]d or environment-gated (ADR-0009) and stay skipped here.
+#
+# Fork-safe by construction: no secrets, no Environment — tests run against the offline mock
+# provider by default (real-LLM paths are env-gated), so the lane behaves identically for fork PRs.
+#
+# Conventions (docs/ci.md / .github/zizmor.yml): every action pinned to a full commit SHA,
+# least-privilege permissions, per-job timeout. No dependency cache, matching the repo's
+# cold-by-design CI stance (zizmor `cache-poisoning`) — this is a correctness lane; cold-build
+# minutes are an acceptable price for an unpoisonable one.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test-linux:
+    name: cargo test (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # cold debug build of the C-heavy deps (vendored libgit2, ring, tree-sitter) dominates
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: cargo test --workspace (offline mock provider, no key)
+        # rust-toolchain.toml pins 1.95.0; the runner's rustup installs it on first use (same as
+        # release.yml). --locked: a drifted Cargo.lock fails loud instead of silently re-resolving.
+        run: cargo test --workspace --locked
