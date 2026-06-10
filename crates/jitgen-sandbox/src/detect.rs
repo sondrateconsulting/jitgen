@@ -11,7 +11,6 @@
 //! [ADR-0003], `docs/security.md` threat #1).
 
 use crate::backend::{os_candidates, Backend};
-use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -19,7 +18,7 @@ use std::time::{Duration, Instant};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on captured probe stderr. The signals we scan for are a single warning/error line (tens of
 /// bytes); this bounds memory against a pathologically chatty probe without truncating the marker.
-const PROBE_STDERR_CAP: u64 = 16 * 1024;
+const PROBE_STDERR_CAP: usize = 16 * 1024;
 
 /// Detect the isolating backends usable on this host, in preference order.
 pub fn detect() -> Vec<Backend> {
@@ -76,15 +75,16 @@ fn probe_backend(backend: Backend) -> Option<ProbeOutcome> {
 /// command runs (closing the detect→run window). Short-circuits to `false` with no spawn when the
 /// launcher can't be trusted-resolved (the real run would then fail to spawn anyway).
 pub(crate) fn backend_silently_degrades(backend: Backend) -> bool {
-    if !backend.has_silent_degradation_mode() {
-        return false;
-    }
-    match probe_backend(backend) {
-        Some(outcome) => {
-            outcome.success && backend.stderr_shows_silent_degradation(&outcome.stderr)
-        }
-        None => false,
-    }
+    backend.has_silent_degradation_mode()
+        && probe_backend(backend).is_some_and(|o| outcome_shows_silent_degradation(backend, &o))
+}
+
+/// Pure: does this probe outcome show the backend silently degraded — i.e. it **ran** (exit 0) yet its
+/// stderr carries the degradation marker? Split out so the PRE-execution refusal decision is unit-
+/// tested with injected outcomes, without a live containerized firejail. (Mirror of
+/// [`probe_is_available`], which is `success && !marker`.)
+fn outcome_shows_silent_degradation(backend: Backend, outcome: &ProbeOutcome) -> bool {
+    outcome.success && backend.stderr_shows_silent_degradation(&outcome.stderr)
 }
 
 /// The outcome of running a backend's availability probe: whether it exited 0 within the timeout, and
@@ -110,14 +110,16 @@ fn probe_is_available(backend: Backend, outcome: &ProbeOutcome) -> bool {
 /// vars — see the call site in [`probe_backend`]). A spawn failure, nonzero exit, or timeout all
 /// yield `success: false`.
 ///
-/// The child runs in its **own process group**; on timeout the whole group is killed (not just the
-/// direct child), so a launcher that forked a descendant holding the stderr pipe can't keep the
-/// post-reap read blocked past the timeout. stderr is read after the child is reaped — safe because
-/// every shipped probe argv (`/bin/true` under a launcher, `docker version`) emits at most a short
-/// line, and a chatty probe that filled the pipe would block, hit the timeout, and be group-killed
-/// before the read drains the buffered bytes. The read is bounded by [`PROBE_STDERR_CAP`] and uses
-/// `read_to_end` + lossy UTF-8 so a mid-stream read error or invalid UTF-8 keeps the bytes already
-/// read (the degradation marker is the first line) rather than discarding the whole signal.
+/// **No-hang guarantee.** The child runs in its **own process group**, and stderr is drained
+/// **off-thread** into a bounded buffer (`crate::run::spawn_capture`) rather than read after the wait.
+/// On every exit path the whole group is swept (`kill_process_group`) **before** collecting, so a
+/// launcher that forked a descendant holding the stderr pipe — including the quiet success-path case
+/// where the direct child exits 0 but a backgrounded helper keeps the fd open — has its pipe closed
+/// and the read finishes promptly. A descendant that *escaped* the group (`setsid`) is bounded by
+/// `collect`'s `COLLECT_GRACE`: it snapshots the captured-so-far bytes (the degradation marker is the
+/// first line, captured early) and moves on rather than blocking. Concurrent draining also means a
+/// chatty probe can never deadlock on a full pipe. Captured bytes are bounded by [`PROBE_STDERR_CAP`]
+/// and decoded lossily so invalid UTF-8 never erases the signal. (Mirrors `crate::run`'s executor.)
 fn probe(program: &str, args: &[&str], inherit_env: bool, timeout: Duration) -> ProbeOutcome {
     let mut cmd = Command::new(program);
     if !inherit_env {
@@ -138,18 +140,19 @@ fn probe(program: &str, args: &[&str], inherit_env: bool, timeout: Duration) -> 
         }
     };
     let pid = child.id();
-    let err_pipe = child.stderr.take();
+    // Drain stderr concurrently so a full pipe can't block the child and a quiet pipe-holder can't
+    // block us; bounded by PROBE_STDERR_CAP.
+    let err_cap = child
+        .stderr
+        .take()
+        .map(|p| crate::run::spawn_capture(p, PROBE_STDERR_CAP));
     let deadline = Instant::now() + timeout;
     let success = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Kill the whole group, not just the direct child, so a descendant holding the
-                    // stderr pipe can't hang the read below; then reap.
-                    crate::run::kill_process_group(pid);
                     let _ = child.kill();
-                    let _ = child.wait();
                     break false;
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -157,10 +160,12 @@ fn probe(program: &str, args: &[&str], inherit_env: bool, timeout: Duration) -> 
             Err(_) => break false,
         }
     };
-    let mut bytes = Vec::new();
-    if let Some(mut pipe) = err_pipe {
-        let _ = pipe.by_ref().take(PROBE_STDERR_CAP).read_to_end(&mut bytes);
-    }
+    // Sweep the whole group BEFORE collecting, on EVERY path (success or timeout), so a surviving
+    // in-group descendant holding the stderr pipe is killed and the bounded collect returns promptly
+    // rather than waiting out COLLECT_GRACE. Harmless if the group is already gone.
+    crate::run::kill_process_group(pid);
+    let _ = child.wait();
+    let (bytes, _truncated) = crate::run::collect(err_cap);
     ProbeOutcome {
         success,
         stderr: String::from_utf8_lossy(&bytes).into_owned(),
@@ -228,11 +233,62 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn probe_does_not_hang_when_a_descendant_holds_stderr_after_exit() {
+        // Regression for the success-path deadlock: the probe leader exits 0 immediately but leaves a
+        // backgrounded child IN THE SAME PROCESS GROUP holding the stderr pipe open. The off-thread
+        // collect + unconditional group sweep must return promptly, NOT block on the lingering fd (the
+        // old post-reap `read_to_end` blocked until the `sleep` ended). The early stderr is captured.
+        let start = Instant::now();
+        let out = probe(
+            "/bin/sh",
+            &["-c", "echo hi >&2; (sleep 600 &) ; exit 0"],
+            PROBE_TIMEOUT,
+        );
+        assert!(out.success, "leader exited 0: {out:?}");
+        assert!(out.stderr.contains("hi"), "early stderr captured: {out:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "probe hung on a descendant holding stderr ({:?})",
+            start.elapsed()
+        );
+    }
+
     fn outcome(success: bool, stderr: &str) -> ProbeOutcome {
         ProbeOutcome {
             success,
             stderr: stderr.to_string(),
         }
+    }
+
+    #[test]
+    fn outcome_shows_silent_degradation_decides_the_pre_execution_refusal() {
+        // The PRE-execution guard (`Sandbox::run` → `backend_silently_degrades`) refuses iff the probe
+        // RAN (exit 0) and its stderr carries the marker. Exercised purely with injected outcomes so
+        // the positive "firejail degraded → refuse" decision is covered without a live firejail.
+        let warning = "an existing sandbox was detected ... without any additional sandboxing";
+        // Ran + marker → degraded (refuse before executing the untrusted command).
+        assert!(outcome_shows_silent_degradation(
+            Backend::Firejail,
+            &outcome(true, warning)
+        ));
+        // Ran + clean → not degraded (genuinely sandboxing).
+        assert!(!outcome_shows_silent_degradation(
+            Backend::Firejail,
+            &outcome(true, "Child process initialized")
+        ));
+        // Did not run (nonzero/failed probe) → not "silently degraded" (that path is a loud failure,
+        // handled by the launcher refusing to spawn or `select` excluding it).
+        assert!(!outcome_shows_silent_degradation(
+            Backend::Firejail,
+            &outcome(false, warning)
+        ));
+        // A backend with no degradation mode never counts as degraded, whatever its stderr.
+        assert!(!outcome_shows_silent_degradation(
+            Backend::Docker,
+            &outcome(true, warning)
+        ));
     }
 
     #[test]

@@ -121,7 +121,14 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     // matched on the raw (pre-redaction) bytes, so nothing untrusted or secret leaks. (security threat #1)
     {
         let stderr_lossy = String::from_utf8_lossy(&stderr_raw);
-        let launcher_first_line = stderr_lossy.lines().next().unwrap_or("");
+        // First NON-EMPTY line: firejail emits its warning as its first output (before the child is
+        // exec'd), so a leading blank/CRLF must not hide it, while the untrusted inner command's output
+        // still lands on later lines and can't forge a refusal.
+        let launcher_first_line = stderr_lossy
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
         if plan
             .backend
             .stderr_shows_silent_degradation(launcher_first_line)
@@ -229,8 +236,9 @@ fn redact_capped(bytes: &[u8], truncated: bool) -> String {
 
 /// A streaming capture: a reader thread appends into a shared buffer (bounded by `cap`) while the
 /// main thread can snapshot it at any time — so an escaped descendant holding the pipe cannot
-/// prevent us from returning what was captured.
-struct Capture {
+/// prevent us from returning what was captured. Shared with [`crate::detect`]'s probe so it gets the
+/// same no-hang guarantee (a quiet pipe-holder cannot block a bounded read).
+pub(crate) struct Capture {
     buf: Arc<Mutex<Vec<u8>>>,
     truncated: Arc<AtomicBool>,
     handle: thread::JoinHandle<()>,
@@ -253,7 +261,7 @@ struct Capture {
 /// call) — or register a global allocator that *unwinds* instead of aborting on allocation failure —
 /// re-check this: keep the lock scope panic-free so recovery stays a safety net, not a load-bearing
 /// path.
-fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture {
+pub(crate) fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let truncated = Arc::new(AtomicBool::new(false));
     let buf_w = Arc::clone(&buf);
@@ -317,7 +325,7 @@ fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture
 /// finished when we gave up — an unfinished reader means the captured bytes are an arbitrary
 /// mid-stream prefix, which is exactly the "truncated" contract: it flags the result and makes the
 /// caller apply the redaction tail-guard to that boundary (T1/F7 P2).
-fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
+pub(crate) fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
     let Some(cap) = cap else {
         return (Vec::new(), false);
     };
