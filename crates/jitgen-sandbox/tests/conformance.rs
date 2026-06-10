@@ -9,7 +9,8 @@
 //! # Docker gates also need a digest-pinned local image (we never pull during a test):
 //! JITGEN_TEST_DOCKER_IMAGE=name@sha256:... cargo test -p jitgen-sandbox --test conformance -- --ignored
 //! # Running as root (CI)? Also set JITGEN_TEST_DOCKER_UID_GID=<nonroot uid:gid> (e.g. 1000:1000):
-//! # once the image is configured, the docker gates fail loudly rather than skip without it.
+//! # once the image is configured, the docker gates fail loudly (rather than skip) if
+//! # JITGEN_TEST_DOCKER_UID_GID is missing or invalid — skipping would read as a pass.
 //! # bwrap/firejail gates need a Linux host with the launcher installed (they skip elsewhere).
 //! ```
 //!
@@ -558,7 +559,12 @@ fn resolve_test_uid_gid(
 /// `assert_network_denied` loud-failure standard). The genuinely-honest skips (daemon absent,
 /// image not configured) stay in those two helpers.
 fn test_uid_gid(what: &str) -> String {
-    let override_var = std::env::var("JITGEN_TEST_DOCKER_UID_GID").ok();
+    // `var()` would collapse a set-but-non-UTF-8 value into "absent" (`VarError::NotUnicode` →
+    // `Err`), panicking with the misleading "is not set" message while the variable IS set.
+    // `var_os` + lossy keeps it on the set-but-invalid path: U+FFFD can never satisfy
+    // `is_uid_gid`, so the value is quoted and rejected, not erased.
+    let override_var =
+        std::env::var_os("JITGEN_TEST_DOCKER_UID_GID").map(|v| v.to_string_lossy().into_owned());
     resolve_test_uid_gid(current_uid_gid(), override_var.as_deref()).unwrap_or_else(|why| {
         panic!(
             "{what}: {why}. The docker gates are opted in (JITGEN_TEST_DOCKER_IMAGE set, daemon \
@@ -600,12 +606,18 @@ fn resolve_test_uid_gid_accepts_a_valid_override_when_root() {
 
 #[test]
 fn resolve_test_uid_gid_absent_override_says_set_it() {
-    // The contract is absent ≠ invalid (don't pin incidental wording): the absent-var message must
-    // NOT be the set-but-invalid one, and must tell the operator how to fix it.
+    // The contract is absent ≠ invalid, pinned from both directions: the absent-var message must
+    // NOT be the set-but-invalid one AND must carry its own discriminating marker ("not set" —
+    // `JITGEN_TEST_DOCKER_UID_GID=` alone appears in BOTH messages, so it can't discriminate),
+    // and it must tell the operator how to fix it. Wording beyond those markers is not pinned.
     let err = resolve_test_uid_gid(None, None).unwrap_err();
     assert!(
         !err.contains("set but invalid"),
         "absent-var must not reuse the invalid-var message: {err}"
+    );
+    assert!(
+        err.contains("not set"),
+        "absent-var message must say the variable is unset: {err}"
     );
     assert!(
         err.contains("JITGEN_TEST_DOCKER_UID_GID="),
