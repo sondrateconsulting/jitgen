@@ -367,9 +367,10 @@ no tier is available, execution is **refused** — unless a trusted operator pas
 `--unsafe-local-execution` to opt into the no-isolation constrained-local tier (never auto-selected).
 On Linux hosts that permit unprivileged user namespaces, an opted-in run is **auto-upgraded to the
 `netns-helper` tier**: the same constrained-local model, but the command is wrapped with util-linux
-`unshare` (user+net namespaces), so network access — including loopback — is kernel-denied even
-though filesystem confinement still relies on the surrounding container (the cut covers the
-IP-family sockets only; pathname AF_UNIX sockets are not blocked). `--sandbox netns-helper`
+`unshare` (user+net namespaces), so network access beyond the namespace — including the host's
+loopback services — is kernel-denied even though filesystem confinement still relies on the
+surrounding container (a test may re-enable the namespace-private loopback to talk to itself,
+which reaches nothing outside; pathname AF_UNIX sockets are not blocked). `--sandbox netns-helper`
 requests it by name (still requires the opt-in; fails closed when the kernel blocks user
 namespaces), and `--sandbox local` pins plain constrained-local with no upgrade — use it if your
 tests need loopback networking, or refuse to run as the namespace's apparent-root uid. Every tier

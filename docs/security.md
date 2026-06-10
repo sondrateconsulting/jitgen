@@ -74,9 +74,11 @@ Test commands and build scripts are attacker-controlled.
   `sandbox-exec`, bwrap, firejail, and Docker (Podman shares the Docker invocation plan). The
   opt-in **constrained-local** tier does **not** itself cut the network — it relies on the surrounding
   ephemeral container (above) — but where unprivileged user namespaces work, the opted-in run is
-  auto-upgraded to the **netns-local** tier (the `unshare` helper: DNS/TCP/UDP/IPv6/loopback all
-  kernel-denied, conformance-tested — IP-family sockets only, **not** a unix-socket boundary:
-  pathname AF_UNIX sockets cross network namespaces; [ADR-0013](decisions/0013-netns-helper-backend.md)). cwd pinned
+  auto-upgraded to the **netns-local** tier (the `unshare` helper: all connectivity beyond the
+  namespace — DNS/TCP/UDP/IPv6 and the host's loopback services — kernel-denied,
+  conformance-tested; a test may re-up its namespace-private loopback to talk to itself, which
+  reaches nothing outside, and it is **not** a unix-socket boundary: pathname AF_UNIX sockets
+  cross network namespaces; [ADR-0013](decisions/0013-netns-helper-backend.md)). cwd pinned
   to overlay; resource limits **per backend** (containers via cgroup flags
   `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/netns-local/constrained-
   local via a `ulimit` preamble applying CPU-time + address-space only — process-count is omitted by

@@ -12,9 +12,10 @@ run state and report formats.
 - **`netns-helper` sandbox backend — a kernel-enforced network cut for the unsafe-local path
   (GP15, [ADR-0013](docs/decisions/0013-netns-helper-backend.md)).** A new Linux-only tier that wraps
   the test command with util-linux `unshare --user --map-root-user --net` (a helper *process* — no
-  `unsafe` code), so DNS/TCP/UDP/IPv6/loopback all fail in-kernel even inside an ordinary CI job
-  container (IP-family sockets only: pathname AF_UNIX sockets are filesystem objects and are not
-  cut). It is **not** an isolating sandbox (filesystem confinement still comes from the
+  `unsafe` code), so connectivity to everything outside the namespace — DNS/TCP/UDP/IPv6 and the
+  host's loopback services — fails in-kernel even inside an ordinary CI job container (scope: a
+  test can re-up its namespace-private loopback and talk to itself, which reaches nothing outside;
+  pathname AF_UNIX sockets are filesystem objects and are not cut). It is **not** an isolating sandbox (filesystem confinement still comes from the
   surrounding container), so it can never satisfy the fail-closed gate: it requires the same
   `--unsafe-local-execution` opt-in as constrained-local. Under `--sandbox auto` an opted-in run is
   **auto-upgraded** from constrained-local to the helper when a functional probe (real user+net

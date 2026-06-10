@@ -26,8 +26,12 @@ model, with the inner command wrapped by util-linux **`unshare --user --map-root
 - The new **user namespace** (invoking uid mapped to root *inside* it) is what makes the network
   namespace creatable without privileges; the apparent-root uid grants nothing outside the
   namespace — host file access is still checked against the real uid.
-- The new **network namespace**'s only interface is a DOWN loopback: DNS, TCP, UDP, IPv6, and even
-  `127.0.0.1` connections fail in-kernel. Scope: the cut covers the IP socket families only —
+- The new **network namespace** has no path to anything outside it: DNS, TCP, UDP, IPv6, and the
+  host's loopback services are all unreachable in-kernel (the parent's `127.0.0.1` listeners do not
+  exist here; the only interface is a DOWN namespace-private loopback). Precisely: the mapped root
+  holds CAP_NET_ADMIN *inside* its own namespace, so a test can bring that private loopback up and
+  talk to itself — this reaches nothing outside, and attaching an interface to the parent would
+  require CAP_NET_ADMIN in the parent namespace. The cut covers the IP socket families only —
   pathname AF_UNIX sockets are filesystem objects and cross network namespaces freely (the Linux
   abstract socket namespace happens to be netns-scoped, but jitgen does not rely on that); a
   general unix-socket boundary still requires a fully isolating backend.
@@ -77,7 +81,7 @@ because the helper nests fine inside build sandboxes there.
   workflow change** (they already pass `--unsafe-local-execution`); `jitgen doctor` reports whether
   the helper is usable and `--require-sandbox`'s pass-note records the upgrade.
 - Test commands that legitimately need loopback networking (local fixture servers) will fail under
-  this tier; that matches the conformance baseline for isolating backends ("loopback denied").
+  this tier (unless the test itself re-ups the namespace-private `lo` first); that matches the conformance baseline for isolating backends ("loopback denied").
   Operators who need loopback must use a tier that owns its network policy (container) or explicit
   `--sandbox local` (which is never upgraded).
 - Inside the user namespace the command sees uid 0; rare test harnesses that refuse to run as

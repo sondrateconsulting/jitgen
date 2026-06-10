@@ -425,8 +425,12 @@ fn plan_netns_helper(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> San
     // Constrained-local hardened with a kernel network cut ([ADR-0013]). The launcher is util-linux
     // `unshare` (resolved from a trusted system dir at spawn, like every launcher): a new **user**
     // namespace (mapping the invoking uid to root inside it — what makes the net namespace creatable
-    // without privileges) plus a new **network** namespace whose only interface is a DOWN loopback,
-    // so DNS, TCP/UDP, IPv6, and even 127.0.0.1 connections all fail in-kernel. The apparent-root
+    // without privileges) plus a new **network** namespace with no path to the outside: every
+    // external destination — DNS, TCP/UDP, IPv6, the host's loopback services — is unreachable
+    // in-kernel. (The mapped root holds CAP_NET_ADMIN only *inside* its own namespace: a test can
+    // re-up the namespace-private loopback and talk to itself, which reaches nothing outside;
+    // attaching an interface to the parent would need CAP_NET_ADMIN in the parent namespace.)
+    // The apparent-root
     // uid grants nothing outside the namespace: host file access is still checked against the real
     // uid. Everything else matches the constrained-local tier — env allowlist, overlay cwd, rlimit
     // preamble (applied by `build_plan`), fresh process group for teardown. Filesystem confinement
