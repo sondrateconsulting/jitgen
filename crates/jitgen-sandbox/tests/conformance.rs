@@ -110,16 +110,85 @@ fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
 /// environment, then attempts an outbound TCP connect. Distinguishes "denied" from "no probe tool"
 /// so a toolless environment can't masquerade as a passing network-denial test (T1/F7 P3). Emits a
 /// sentinel word; callers assert on it (not on exit).
+///
+/// `nc -z` (connect, report, close — no data phase) is the exact semantic wanted: without it, some
+/// netcat variants exit nonzero AFTER a successful connect (e.g. `-w` idle-timeout once stdin hits
+/// EOF), which would print `NET_DENIED` while egress actually worked — a false pass on a security
+/// gate. `-z` is supported by openbsd nc, ncat, and busybox nc; variants lacking it (or a bash
+/// without `/dev/tcp`) exit nonzero unconditionally, which the control probe in
+/// [`assert_network_denied`] converts into a loud failure instead of a false pass.
+///
+/// The bash fallback needs `timeout`: `/dev/tcp` has no connect timeout of its own, so on a
+/// packet-DROPPING (not rejecting) host a control run would otherwise block the test process
+/// indefinitely. bash-without-timeout reads as `NO_PROBE_TOOL` (fail loud, not hang).
 const NET_PROBE_SCRIPT: &str = "\
     if command -v nc >/dev/null 2>&1; then \
-        nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-    elif command -v bash >/dev/null 2>&1; then \
-        bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        nc -z -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+    elif command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then \
+        timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
     else echo NO_PROBE_TOOL; fi";
+
+/// Where [`assert_network_denied`] runs its control probe — the same [`NET_PROBE_SCRIPT`],
+/// OUTSIDE the sandbox, in the same userland the sandboxed probe will see.
+enum ControlProbe<'a> {
+    /// Directly on the host: bwrap/firejail sandbox the host's own filesystem, so the host
+    /// baselines the same nc/bash the sandboxed probe picks.
+    Host,
+    /// Inside the same digest-pinned image with Docker's default (unrestricted) networking and
+    /// the same non-root `--user`: the container userland's nc/bash, not the host's, is what the
+    /// sandboxed probe runs. `--pull=never` keeps the suite's never-pull-during-a-test rule.
+    Docker { image: &'a str, user: &'a str },
+}
+
+/// Run [`NET_PROBE_SCRIPT`] outside the sandbox per `control` and return its raw output.
+fn run_control_probe(control: &ControlProbe) -> std::process::Output {
+    let mut cmd = match control {
+        ControlProbe::Host => {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.args(["-c", NET_PROBE_SCRIPT]);
+            c
+        }
+        ControlProbe::Docker { image, user } => {
+            let mut c = std::process::Command::new("docker");
+            c.args(["run", "--rm", "--pull=never", "--user", user, image]);
+            c.args(["/bin/sh", "-c", NET_PROBE_SCRIPT]);
+            c
+        }
+    };
+    cmd.output().expect("control probe failed to spawn")
+}
 
 /// Run [`NET_PROBE_SCRIPT`] under `sb` and assert egress is denied; fail loudly when the sandboxed
 /// environment offers no probe tool — an unverifiable gate must not read as a passing one.
-fn assert_network_denied(sb: &Sandbox, fx: &Fixture, run_as: Option<&str>, what: &str) {
+///
+/// A control run of the same probe OUTSIDE the sandbox must report `NET_OK` first: the pass
+/// signal below is "the probe printed `NET_DENIED`", which a broken probe tool (an nc without
+/// `-z`, a bash without `/dev/tcp`) or an egress-less host would also print, silently passing the
+/// gate while isolation is unverified — or broken. The control validates the connect/exit
+/// semantics of whatever tool variant is actually present, so a control failure means THIS
+/// environment cannot run the gate truthfully; it is NOT a sandbox-isolation failure.
+fn assert_network_denied(
+    sb: &Sandbox,
+    fx: &Fixture,
+    run_as: Option<&str>,
+    what: &str,
+    control: &ControlProbe,
+) {
+    let out = run_control_probe(control);
+    let control_stdout = String::from_utf8_lossy(&out.stdout);
+    // Exact-line match: the control's stdout is raw `Command::output()` bytes (docker noise, image
+    // entrypoints), so a substring `contains` could coincide; the probe emits the sentinel alone
+    // on its own line.
+    assert!(
+        control_stdout.lines().any(|l| l.trim() == "NET_OK"),
+        "{what}: CONTROL probe outside the sandbox did not report NET_OK (stdout {control_stdout:?}, \
+         stderr {:?}). The host/image has no egress, offers no nc/bash probe tool, or its nc lacks \
+         -z support (openbsd nc, ncat, and busybox nc all have it); without a passing control an \
+         in-sandbox NET_DENIED is meaningless. This is a control failure, NOT a sandbox-isolation \
+         failure — fix egress/tooling and rerun",
+        String::from_utf8_lossy(&out.stderr),
+    );
+
     let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), NET_PROBE_SCRIPT.into()]);
     let res = exec_as(sb, &cmd, fx, run_as);
     assert!(
@@ -163,6 +232,20 @@ fn docker_sandbox(image: String) -> Option<Sandbox> {
     Some(Sandbox::new(&[Backend::Docker], policy).unwrap())
 }
 
+/// Mirror of the production `is_uid_gid` gate (`command.rs`): both fields all-digit and
+/// non-empty, uid non-root (at least one non-`0` digit). Keeps the override — and therefore the
+/// control probe's `--user` — identical to what `plan_container` will accept for the sandboxed
+/// run (e.g. `1000:users` or `00:500` must not run the control under a user the real run rejects).
+fn is_nonroot_uid_gid(v: &str) -> bool {
+    match v.split_once(':') {
+        Some((uid, gid)) => {
+            let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+            digits(uid) && digits(gid) && uid.bytes().any(|b| b != b'0')
+        }
+        None => false,
+    }
+}
+
 /// The non-root `uid:gid` to run containers as: `current_uid_gid()` for a normal user, or the
 /// `JITGEN_TEST_DOCKER_UID_GID` override for a root CI context (where `current_uid_gid()` returns
 /// `None` by design). `None` means "no non-root user available" → the caller skips loudly rather than
@@ -172,7 +255,7 @@ fn test_uid_gid() -> Option<String> {
         return Some(u);
     }
     match std::env::var("JITGEN_TEST_DOCKER_UID_GID") {
-        Ok(v) if v.contains(':') && !v.starts_with("0:") && v != "0" => Some(v),
+        Ok(v) if is_nonroot_uid_gid(&v) => Some(v),
         _ => {
             eprintln!(
                 "SKIP docker test: running as root and no JITGEN_TEST_DOCKER_UID_GID=<nonroot uid:gid>"
@@ -186,24 +269,32 @@ fn test_uid_gid() -> Option<String> {
 #[test]
 #[ignore = "live sandbox; run with --ignored on the host"]
 fn sandbox_exec_denies_network() {
-    if Path::new("/usr/bin/python3").exists() {
-        let cmd = SpawnRequest::argv(
-            "/usr/bin/python3",
-            [
-                "-c".into(),
-                "import socket; socket.setdefaulttimeout(3); socket.create_connection(('1.1.1.1',53))"
-                    .into(),
-            ],
-        );
-        let res = exec(&sandbox_exec(), &cmd, &Fixture::new("net"));
-        assert_ne!(
-            res.outcome,
-            ExecOutcome::Passed,
-            "network MUST be denied under sandbox-exec; got {res:?}"
-        );
-    } else {
-        eprintln!("SKIP sandbox_exec_denies_network: /usr/bin/python3 absent");
+    // Skipping is honest only when the backend itself is absent (non-macOS host). Once
+    // sandbox-exec IS available, a missing probe tool must fail loudly — an unverifiable gate
+    // must not read as a passing one (parity with `assert_network_denied`'s NO_PROBE_TOOL guard).
+    if !jitgen_sandbox::detect().contains(&Backend::SandboxExec) {
+        eprintln!("SKIP sandbox_exec_denies_network: sandbox-exec not available on this host");
+        return;
     }
+    assert!(
+        Path::new("/usr/bin/python3").exists(),
+        "sandbox_exec_denies_network: /usr/bin/python3 absent, so network denial cannot be \
+         verified on this sandbox-exec host; install the Xcode Command Line Tools and rerun"
+    );
+    let cmd = SpawnRequest::argv(
+        "/usr/bin/python3",
+        [
+            "-c".into(),
+            "import socket; socket.setdefaulttimeout(3); socket.create_connection(('1.1.1.1',53))"
+                .into(),
+        ],
+    );
+    let res = exec(&sandbox_exec(), &cmd, &Fixture::new("net"));
+    assert_ne!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "network MUST be denied under sandbox-exec; got {res:?}"
+    );
 }
 
 /// Gate 2 — no write outside the overlay; writes inside it succeed.
@@ -281,7 +372,7 @@ fn docker_denies_network() {
     let Some(image) = docker_test_image() else {
         return;
     };
-    let Some(sb) = docker_sandbox(image) else {
+    let Some(sb) = docker_sandbox(image.clone()) else {
         return;
     };
     // Containers require an explicit non-root --user (fail-closed); supply it or skip loudly.
@@ -289,7 +380,16 @@ fn docker_denies_network() {
         return;
     };
     let fx = Fixture::new("docker-net");
-    assert_network_denied(&sb, &fx, Some(&uid_gid), "docker_denies_network");
+    assert_network_denied(
+        &sb,
+        &fx,
+        Some(&uid_gid),
+        "docker_denies_network",
+        &ControlProbe::Docker {
+            image: &image,
+            user: &uid_gid,
+        },
+    );
 }
 
 /// Gate 1 — network denial under bubblewrap (Linux). `--unshare-all` puts the command in a fresh
@@ -306,6 +406,7 @@ fn bwrap_denies_network() {
         &Fixture::new("bwrap-net"),
         None,
         "bwrap_denies_network",
+        &ControlProbe::Host,
     );
 }
 
@@ -328,6 +429,7 @@ fn firejail_denies_network() {
         &Fixture::new("firejail-net"),
         None,
         "firejail_denies_network",
+        &ControlProbe::Host,
     );
 }
 
