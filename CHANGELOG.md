@@ -13,7 +13,8 @@ run state and report formats.
   (GP15, [ADR-0013](docs/decisions/0013-netns-helper-backend.md)).** A new Linux-only tier that wraps
   the test command with util-linux `unshare --user --map-root-user --net` (a helper *process* — no
   `unsafe` code), so DNS/TCP/UDP/IPv6/loopback all fail in-kernel even inside an ordinary CI job
-  container. It is **not** an isolating sandbox (filesystem confinement still comes from the
+  container (IP-family sockets only: pathname AF_UNIX sockets are filesystem objects and are not
+  cut). It is **not** an isolating sandbox (filesystem confinement still comes from the
   surrounding container), so it can never satisfy the fail-closed gate: it requires the same
   `--unsafe-local-execution` opt-in as constrained-local. Under `--sandbox auto` an opted-in run is
   **auto-upgraded** from constrained-local to the helper when a functional probe (real user+net

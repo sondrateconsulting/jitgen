@@ -27,7 +27,10 @@ model, with the inner command wrapped by util-linux **`unshare --user --map-root
   namespace creatable without privileges; the apparent-root uid grants nothing outside the
   namespace — host file access is still checked against the real uid.
 - The new **network namespace**'s only interface is a DOWN loopback: DNS, TCP, UDP, IPv6, and even
-  `127.0.0.1` connections fail in-kernel.
+  `127.0.0.1` connections fail in-kernel. Scope: the cut covers the IP socket families only —
+  pathname AF_UNIX sockets are filesystem objects and cross network namespaces freely (the Linux
+  abstract socket namespace happens to be netns-scoped, but jitgen does not rely on that); a
+  general unix-socket boundary still requires a fully isolating backend.
 - Everything else is identical to constrained-local: trusted-dir launcher resolution, env allowlist
   with synthetic `HOME`, overlay cwd, the `ulimit` preamble, process-group teardown, output caps.
 
