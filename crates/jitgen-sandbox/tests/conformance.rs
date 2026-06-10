@@ -360,28 +360,31 @@ fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::pro
     // joins too ([`READER_GRACE`]), making the wrapper's bound end-to-end; an overrun here is a
     // control failure, reported with whatever WAS captured.
     let until = std::time::Instant::now() + READER_GRACE;
-    let ((stdout, out_res), (stderr, err_res)) = match (
-        try_join_reader(out_thread, until),
-        try_join_reader(err_thread, until),
-    ) {
-        (Some(out), Some(err)) => (out, err),
-        (out, err) => panic!(
+    let out = try_join_reader(out_thread, until);
+    let err = try_join_reader(err_thread, until);
+    if out.is_none() || err.is_none() {
+        panic!(
             "{what}: CONTROL probe pipes still open {}s after the control process exited (a \
              descendant inherited them; stdout {}, stderr {}). This is a control failure, NOT a \
              sandbox-isolation failure — fix the environment and rerun",
             READER_GRACE.as_secs(),
             describe_reader(&out),
             describe_reader(&err),
-        ),
-    };
-    for (pipe, res) in [("stdout", out_res), ("stderr", err_res)] {
-        if let Err(e) = res {
-            panic!(
-                "{what}: CONTROL probe {pipe} pipe read failed ({e}); its output cannot be \
-                 trusted. This is a control failure, NOT a sandbox-isolation failure — rerun"
-            );
-        }
+        );
     }
+    // A read error makes the control's output untrustworthy: panic with BOTH streams rendered —
+    // the bytes a failing reader captured before the error survive (see `describe_reader`, which
+    // marks the erroring pipe inline) instead of being dropped with the panic.
+    if matches!(&out, Some((_, Err(_)))) || matches!(&err, Some((_, Err(_)))) {
+        panic!(
+            "{what}: CONTROL probe pipe read failed; its output cannot be trusted (stdout {}, \
+             stderr {}). This is a control failure, NOT a sandbox-isolation failure — rerun",
+            describe_reader(&out),
+            describe_reader(&err),
+        );
+    }
+    let (stdout, _) = out.expect("stdout reader joined and checked above");
+    let (stderr, _) = err.expect("stderr reader joined and checked above");
     std::process::Output {
         status,
         stdout,
