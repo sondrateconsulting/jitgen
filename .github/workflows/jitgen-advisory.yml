@@ -69,9 +69,9 @@ jobs:
       contents: read
       packages: read # pull the private GHCR image (anonymous once the repo/image go public)
     container:
-      # "The container IS the sandbox" — pinned to the v0.2.1 release digest, never a floating tag.
+      # "The container IS the sandbox" — pinned to the v0.2.2 release digest, never a floating tag.
       # Refresh with: docker buildx imagetools inspect ghcr.io/sondrateconsulting/jitgen:vX.Y.Z --format '{{.Manifest.Digest}}'
-      image: ghcr.io/sondrateconsulting/jitgen@sha256:a9374451b709b62dbcf04be09a0e05dc60f476327bb5b20f5b652e6603bfd2b6
+      image: ghcr.io/sondrateconsulting/jitgen@sha256:54bc47d609cc0e1eaaadf4182a46a6a4ff74f887653476554fbaa23336ef2dce
       credentials: # required only while the package is PRIVATE; harmless once it is public
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -156,7 +156,7 @@ jobs:
       contents: read
       packages: read # pull the private GHCR image (anonymous once the repo/image go public)
     container:
-      image: ghcr.io/sondrateconsulting/jitgen@sha256:a9374451b709b62dbcf04be09a0e05dc60f476327bb5b20f5b652e6603bfd2b6
+      image: ghcr.io/sondrateconsulting/jitgen@sha256:54bc47d609cc0e1eaaadf4182a46a6a4ff74f887653476554fbaa23336ef2dce
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
