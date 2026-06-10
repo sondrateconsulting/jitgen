@@ -71,9 +71,10 @@ fn probe_backend(backend: Backend) -> Option<ProbeOutcome> {
 
 /// Whether `backend` would run a command **without sandboxing while exiting 0** right now — i.e. it
 /// has a silent-degradation mode (firejail) AND a fresh functional probe shows it degrading. Used by
-/// [`crate::run`] as a PRE-execution guard so a degrading firejail is refused before any untrusted
-/// command runs (closing the detect→run window). Short-circuits to `false` with no spawn when the
-/// launcher can't be trusted-resolved (the real run would then fail to spawn anyway).
+/// `Sandbox::run` ([`crate::sandbox`]) as a PRE-execution guard so a degrading firejail is refused
+/// before any untrusted command runs (closing the detect→run window). Short-circuits to `false`
+/// with no spawn when the launcher can't be trusted-resolved (the real run would then fail to
+/// spawn anyway).
 pub(crate) fn backend_silently_degrades(backend: Backend) -> bool {
     backend.has_silent_degradation_mode()
         && probe_backend(backend).is_some_and(|o| outcome_shows_silent_degradation(backend, &o))

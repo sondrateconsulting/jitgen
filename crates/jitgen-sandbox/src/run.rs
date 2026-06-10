@@ -58,7 +58,8 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     // Resolve the launcher from a trusted system dir (never inherited PATH) before spawning. (The
     // PRE-execution re-probe that refuses a degrading firejail before any command runs lives at the
     // `Sandbox::run` layer — all production runs go through it; this low-level executor keeps the
-    // post-execution stderr backstop below as the second layer.)
+    // post-execution stderr backstop below as the third layer, after detect-time selection and
+    // that pre-execution re-probe.)
     let program = resolve_trusted(&plan.program)
         .ok_or_else(|| SandboxError::UntrustedLauncher(plan.program.clone()))?;
 
@@ -104,7 +105,7 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     let (stdout_raw, out_trunc) = collect(out_cap);
     let (stderr_raw, err_trunc) = collect(err_cap);
 
-    // Second-layer backstop for a silently-degrading launcher, checked BEFORE we trust the exit status
+    // Third-layer backstop for a silently-degrading launcher, checked BEFORE we trust the exit status
     // (so it fires even on the rare path where `wait_with_timeout` itself errored). The PRIMARY guards
     // are earlier and *prevent* the unsandboxed run: detection at `Sandbox` construction never selects
     // a degrading firejail, and the pre-execution re-probe above refuses one before the command is
@@ -887,6 +888,26 @@ mod tests {
             assert!(
                 matches!(err, SandboxError::SandboxDegraded("firejail")),
                 "a degraded firejail run must be refused, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn firejail_degradation_warning_with_nonzero_exit_is_still_refused() {
+            // The backstop is checked BEFORE the exit status is trusted (`wait_result?`), so a
+            // degraded firejail that ALSO exited nonzero is refused as SandboxDegraded — not
+            // misclassified as an ordinary Failed result. Pins the check-before-status ordering:
+            // moving the marker scan after the status is consumed would regress this to Failed.
+            let warning = "Warning: an existing sandbox was detected. cargo will run without any \
+                           additional sandboxing features";
+            let script = format!("echo '{warning}' >&2; exit 7");
+            let err = run(
+                &sh_plan_backend(Backend::Firejail, &script),
+                &ExecPolicy::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SandboxError::SandboxDegraded("firejail")),
+                "a degraded firejail must be refused even on nonzero exit, got {err:?}"
             );
         }
 

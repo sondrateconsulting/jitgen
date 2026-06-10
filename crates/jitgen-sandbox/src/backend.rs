@@ -145,7 +145,14 @@ impl Backend {
     fn silent_degradation_markers(self) -> Option<&'static [&'static str]> {
         match self {
             Backend::Firejail => Some(SILENT_DEGRADATION_MARKERS_FIREJAIL),
-            _ => None,
+            // `None` here is a security claim ("this backend cannot silently fail open"), so the
+            // arms are enumerated without a wildcard: adding a backend is a compile error until its
+            // degradation behavior is decided explicitly.
+            Backend::Bwrap
+            | Backend::SandboxExec
+            | Backend::Docker
+            | Backend::Podman
+            | Backend::ConstrainedLocal => None,
         }
     }
 
