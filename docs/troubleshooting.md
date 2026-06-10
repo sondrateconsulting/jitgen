@@ -23,9 +23,14 @@ rlimits) when it detects it is already inside a sandbox/container, warning only 
 treats that as a fail-open and refuses it:
 
 - **Cause:** you are running jitgen on a **containerized Linux host** with firejail installed (and
-  `bubblewrap` absent or unable to create namespaces). The detect-time probe sees firejail degrade and
-  marks it **unavailable**; if a degraded firejail is somehow reached at run time, the run is refused
-  with `SandboxError::SandboxDegraded`.
+  `bubblewrap` absent or unable to create namespaces). The detect-time probe **observes** firejail
+  degrade — a trusted sentinel script inside `firejail --net=none` reaches a live loopback listener
+  jitgen bound outside the sandbox, which a real network cut makes impossible — and marks it
+  **unavailable**, independent of how the warning is worded; if a degraded firejail is somehow
+  reached at run time, the run is refused with `SandboxError::SandboxDegraded`.
+- **Cause (firejail works, still not detected):** the behavioral probe needs a connect tool inside
+  the firejail sandbox — `nc` or `bash`. On a host that has neither, isolation cannot be verified and
+  firejail is reported unavailable (fail-closed). Install either tool, or use another tier.
 - **Fix (preferred):** use the **container as the sandbox** — run jitgen inside the published
   digest-pinned image and pass `--unsafe-local-execution` (no nested firejail; the container is the
   boundary), or run on a host where `bubblewrap` can create namespaces. See [ci.md](ci.md) and

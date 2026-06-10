@@ -870,9 +870,10 @@ fn bwrap_denies_network() {
 /// (e.g. macOS).
 ///
 /// Run this on a real Linux host, not inside a container: when firejail detects an existing
-/// sandbox it warns and runs the command **without any sandboxing** (observed with 0.9.74) — in
-/// that environment this gate fails with `NET_OK`, which is the truthful answer ("firejail is not
-/// an isolating backend here"), not a test bug.
+/// sandbox it warns and runs the command **without any sandboxing** (observed with 0.9.74). In
+/// that environment the behavioral detect probe observes the passthrough (`NET_OK` against a live
+/// parent listener) and excludes firejail, so this gate **skips as "not available"** — the
+/// truthful answer ("firejail is not an isolating backend here"), not a test bug.
 #[test]
 #[ignore = "live firejail; needs a Linux host with firejail installed"]
 fn firejail_denies_network() {
@@ -887,6 +888,62 @@ fn firejail_denies_network() {
         &ControlProbe::Host,
         PROBE_EGRESS_HOST,
         PROBE_EGRESS_PORT,
+    );
+}
+
+/// Gate 1b (firejail) — loopback denial against a **live parent-namespace listener**: the exact
+/// property the detect-time behavioral probe now requires, end to end through the production run
+/// plan. The parent binds a real listener on 127.0.0.1 and proves it reachable; the same connect
+/// from inside `firejail --net=none` must fail (`NET_DENIED`) — while a degraded passthrough
+/// firejail would connect (`NET_OK`) and fail the gate. (A bare closed-port probe proves nothing:
+/// it prints `NET_DENIED` via ECONNREFUSED even with no sandbox at all.) This is the live
+/// counterpart of `detect()`'s loopback-listener sentinel probe.
+#[test]
+#[ignore = "live firejail; needs a Linux host with firejail installed"]
+fn firejail_denies_loopback() {
+    let Some(sb) = linux_os_sandbox(Backend::Firejail) else {
+        return;
+    };
+
+    // Execution half first (same sandbox), so a wrapper that executes nothing fails here with a
+    // clear diagnosis instead of a confusing "must deny loopback" message on empty output.
+    let fx = Fixture::new("firejail-lo-exec");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "printf hi".into()]);
+    let res = exec(&sb, &cmd, &fx);
+    assert_eq!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "a plain command must still execute under firejail: {res:?}"
+    );
+    assert_eq!(res.stdout, "hi");
+
+    // A live parent-namespace listener; an unaccepted connection still completes the TCP
+    // handshake via the backlog, so no accept loop is needed.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("listener addr").port();
+    // Sanity half: the parent namespace CAN reach it, so a NET_DENIED below proves the namespace
+    // boundary, not a dead listener.
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .expect("parent namespace must reach its own loopback listener");
+
+    let script = format!(
+        "if command -v nc >/dev/null 2>&1; then \
+            nc -w 3 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        elif command -v bash >/dev/null 2>&1; then \
+            bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        else echo NO_PROBE_TOOL; fi"
+    );
+    let fx = Fixture::new("firejail-lo");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script]);
+    let res = exec(&sb, &cmd, &fx);
+    assert!(
+        !res.stdout.contains("NO_PROBE_TOOL"),
+        "firejail_denies_loopback: no nc/bash probe tool in the sandboxed environment, so loopback \
+         denial cannot be verified; rerun with a host that provides nc or bash"
+    );
+    assert!(
+        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+        "firejail must deny loopback to a live parent-namespace listener; got {res:?}"
     );
 }
 

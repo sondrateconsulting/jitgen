@@ -104,13 +104,15 @@ impl Sandbox {
     ) -> Result<ExecutionResult> {
         // PRE-EXECUTION guard for a silently-degrading launcher (firejail). firejail runs the command
         // with NO sandboxing (exit 0, warning on stderr) when it detects it is already inside a
-        // sandbox/container. Re-probe its isolation RIGHT NOW, before building/spawning anything, so a
-        // degrading firejail is refused **without ever executing** the untrusted command — closing the
-        // window between detection (at construction) and this run, and covering an explicitly-selected
-        // backend. Detection already excludes such a firejail from `Auto`; the post-execution stderr
-        // backstop in `crate::run` is the third layer. Only a degradation-capable backend pays for the
-        // probe, and it short-circuits with no spawn when the launcher can't be trusted-resolved.
-        // (security threat #1, fail-closed.)
+        // sandbox/container. Re-probe its isolation RIGHT NOW, before building/spawning anything —
+        // behaviorally: a trusted sentinel script must not reach a live parent-namespace listener
+        // from inside the network cut (wording-independent; the stderr marker stays as
+        // defense-in-depth) — so a degrading firejail is refused **without ever executing** the
+        // untrusted command, closing the window between detection (at construction) and this run,
+        // and covering an explicitly-selected backend. Detection already excludes such a firejail
+        // from `Auto`; the post-execution stderr backstop in `crate::run` is the third layer. Only a
+        // degradation-capable backend pays for the probe, and it short-circuits with no spawn when
+        // the launcher can't be trusted-resolved. (security threat #1, fail-closed.)
         if self.backend.has_silent_degradation_mode() && backend_silently_degrades(self.backend) {
             return Err(SandboxError::SandboxDegraded(self.backend.id()));
         }

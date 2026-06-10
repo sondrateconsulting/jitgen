@@ -92,20 +92,28 @@ Test commands and build scripts are attacker-controlled.
   `an existing sandbox was detected … will run without any additional sandboxing features` to stderr
   and then runs the command **completely unsandboxed, exiting 0** (`--net=none`/`--read-only=/`/rlimits
   all silently dropped). A `firejail --version` succeeds there, so jitgen defends in **three layers**:
-  (1) **detect-time** — `detect()` marks an OS-sandbox backend available only if a probe that *actually
-  sandboxes* succeeds (`firejail --net=none -- /bin/true`, no `--quiet`); a degradation warning on that
-  probe's stderr means **unavailable**, so AUTO never selects a degrading firejail and falls through to
-  the next tier or refuses. (2) **pre-execution** — immediately before running the untrusted command,
-  `Sandbox::run` re-probes a degradation-capable backend and **refuses (`SandboxError::SandboxDegraded`)
-  without ever spawning the command** if it would degrade now, closing the detect→run window and
-  covering an explicitly-selected backend. (3) **post-execution backstop** — the executor also refuses
-  if the launcher's *first* stderr line carries the warning (the firejail plan omits `--quiet` so it is
-  visible; the stderr capture is floored so a small `output_cap_bytes` can't truncate the marker). Layer
-  3 cannot un-run an already-degraded command, but it guarantees such a run is **refused, never reported
-  as a clean pass** (fail-closed). **bwrap** does not fail open — it fails *loudly* (`No permissions to
-  create new namespace`, nonzero exit, command not run) — but its probe was upgraded to a real
-  namespacing check for the same reason (skip it where it cannot isolate instead of erroring on every
-  run). See `crates/jitgen-sandbox/src/{backend,detect,run,sandbox}.rs` and Residual risks.
+  (1) **detect-time, behavioral** — `detect()` marks a degradation-capable backend available only on
+  **positive, observed proof of the network cut**: jitgen binds a live loopback listener in its own
+  namespace, proves it reachable, then runs a trusted sentinel script *inside* `firejail --net=none`
+  (no `--quiet`) that must FAIL to reach that listener (`NET_DENIED`). A degraded passthrough runs in
+  the parent namespace, reaches the listener (`NET_OK`), and is excluded **however firejail words its
+  warning** — and "could not verify" (no connect tool in the sandbox, listener setup failure) is also
+  unavailable, fail-closed. The stderr warning match is kept as defense-in-depth. So AUTO never
+  selects a degrading firejail and falls through to the next tier or refuses. (2) **pre-execution** —
+  immediately before running the untrusted command, `Sandbox::run` re-runs the same behavioral probe
+  and **refuses (`SandboxError::SandboxDegraded`) without ever spawning the command** on positive
+  evidence of a passthrough (an observed `NET_OK`, or the warning marker), closing the detect→run
+  window and covering an explicitly-selected backend; the probe runs only trusted jitgen-built code,
+  so its sentinels cannot be forged by the repo. (3) **post-execution backstop** — the executor also
+  refuses if the launcher's captured stderr carries the warning anywhere (the firejail plan omits
+  `--quiet` so it is visible; the capture is floored so a small `output_cap_bytes` can't truncate the
+  marker, and the scan is position-independent so launcher banner lines before the warning can't
+  bypass it). Layer 3 cannot un-run an already-degraded command, but for the known warning text it
+  guarantees such a run is **refused, never reported as a clean pass** (fail-closed). **bwrap** does
+  not fail open — it fails *loudly* (`No permissions to create new namespace`, nonzero exit, command
+  not run) — but its probe was upgraded to a real namespacing check for the same reason (skip it
+  where it cannot isolate instead of erroring on every run). See
+  `crates/jitgen-sandbox/src/{backend,detect,run,sandbox}.rs` and Residual risks.
 - **Environment is a jitgen-owned hardcoded allowlist**, NOT inherited: a **synthetic `HOME`**, no
   `GITHUB_TOKEN`/`AWS_*`/`SSH_AUTH_SOCK`/`*_TOKEN`/`*_API_KEY`/npm·pip·cargo creds; deny-patterns
   applied even to trusted additions. argv-only execution; shell only via trusted `shell: true`.
@@ -313,35 +321,47 @@ These MUST exist and pass before the relevant phase is complete (built security-
   Relatedly, the OS-sandbox tiers allow broad `file-read*` (so toolchains load), so a sandboxed
   process can read host files its uid permits; the primary mitigation is no-network + output redaction
   + synthetic `HOME` (see `sbpl.rs`).
-- **firejail silent-degradation detection is a behavioral + stderr heuristic.** firejail 0.9.x runs a
-  command **unsandboxed and exits 0** when it detects an existing sandbox/container, announcing it only
-  via a stderr warning. jitgen defends in three layers (threat #1): a detect-time real-sandboxing probe
-  (`firejail --net=none -- /bin/true`) excludes a degrading firejail from selection; a **pre-execution**
-  re-probe in `Sandbox::run` refuses **before the untrusted command is ever spawned**; and a
-  post-execution backstop refuses any run whose launcher **first non-empty stderr line** carries the
-  warning (the stderr capture is floored so a small `output_cap_bytes` cannot truncate the marker).
-  Three residuals remain — **all fail-closed** (a refusal, never a clean pass of an unsandboxed run).
-  (a) **Inherent post-hoc window:** if firejail degraded only for the real command in the tiny window
-  after the pre-execution probe passed, that one command has already run unsandboxed before layer 3
-  refuses it — layer 3 prevents *misreporting* (fail-closed result), not that single execution.
-  (b) **String fragility:** distinguishing "sandboxed" from "degraded passthrough" relies on the warning
-  **string**, which is **version/locale-fragile** — a future firejail that reworded the message *and*
-  still exited 0 while degrading could slip past the string match (the behavioral probe-success check
-  still runs, but it cannot tell a real sandbox from a passthrough without the string). (c) **Merged
-  stderr / forgeable layer-3 marker:** layer 3 scans the *combined* launcher+child stderr (one pipe),
-  which can't be split by stream. On a firejail configured *banner-quiet* (e.g. `quiet-by-default` in
-  firejail.config), a repo's own test could print the marker as the first line and **force** a
-  `SandboxDegraded` refusal of its own run — a self-inflicted, *visible* denial, never an escape. We
-  keep layer 3 anyway because failing closed here is strictly safer than dropping it (which would widen
-  residual (a) into a fail-open micro-window); the un-forgeable guard is the pre-execution probe, which
-  runs `/bin/true` with no untrusted output. Mitigations for (b): two independent substrings of the
-  message are matched (case-insensitive), and the text has been stable across firejail 0.9.x. All three
-  residuals are narrow because the realistic deployment is the **container tier** (the jitgen image ships no firejail) and
-  bwrap is preferred above firejail in AUTO order; firejail is the fallback OS-sandbox on bare-metal
-  Linux hosts that lack bwrap, where it does **not** degrade. If you must run on firejail inside another
-  sandbox, prefer the container tier or `--unsafe-local-execution` with a jitgen-owned ephemeral
-  container (threat #1). bwrap has **no** analogous fail-open mode — it
-  fails loudly (nonzero exit) when it cannot create a namespace — so it needs no stderr backstop.
+- **firejail silent-degradation detection: behavioral at layers 1–2, a stderr heuristic at layer 3.**
+  firejail 0.9.x runs a command **unsandboxed and exits 0** when it detects an existing
+  sandbox/container, announcing it only via a stderr warning. jitgen defends in three layers
+  (threat #1): the detect-time probe requires the trusted sentinel script inside `firejail
+  --net=none` to **positively observe** that a live parent-namespace loopback listener is unreachable
+  (`NET_DENIED`) — a passthrough reaches it (`NET_OK`) and is excluded **independent of the warning's
+  wording**, and an unverifiable probe (no connect tool in the sandbox, listener setup failure) is
+  also unavailable, fail-closed; a **pre-execution** behavioral re-probe in `Sandbox::run` refuses
+  **before the untrusted command is ever spawned** on an observed `NET_OK` or the warning marker; and
+  a post-execution backstop refuses any run whose captured launcher stderr carries the warning
+  anywhere (the capture is floored so a small `output_cap_bytes` cannot truncate the marker; the scan
+  is position-independent so a banner line before the warning cannot bypass it). Three residuals
+  remain. (a) **Inherent post-hoc window:** if firejail degraded only for the real command in the
+  tiny window after the pre-execution probe passed, that one command has already run unsandboxed
+  before layer 3 refuses it — layer 3 prevents *misreporting* (fail-closed result), not that single
+  execution. (b) **Layer-3 string fragility (now confined to the race in (a)):** the post-execution
+  backstop still matches the warning **string**, which is **version/locale-fragile**. Layers 1–2 are
+  wording-independent, so a reworded degrading firejail is excluded at detect time and refused
+  pre-execution; only inside the (a) race window — degradation beginning *between* the pre-execution
+  probe and the real command — would a **reworded** firejail's unsandboxed run be misreported as a
+  clean pass. The pre-fix posture was strictly worse: rewording alone defeated every layer, no race
+  needed. With the stock wording, all three layers hold and a degraded run is always a refusal,
+  never a clean pass. (c) **Merged stderr / forgeable layer-3 marker:** layer 3 scans the *combined*
+  launcher+child stderr (one pipe), which can't be split by stream, so a repo's own test can print
+  the marker anywhere in its output and **force** a `SandboxDegraded` refusal of its own run — a
+  self-inflicted, *visible* denial, never an escape. (Scanning the whole capture widened this from
+  the old "first line under a banner-quiet firejail" to "anywhere"; we accept that because the
+  first-line scope traded it for a real fail-open — any launcher banner line before the warning
+  bypassed the backstop.) We keep layer 3 because failing closed here is strictly safer than
+  dropping it (which would widen residual (a) into a fail-open micro-window for the stock wording
+  too); the un-forgeable guards are layers 1–2, whose probe runs only trusted jitgen-built code with
+  no untrusted output. Mitigations for (b): two independent substrings of the message are matched
+  (case-insensitive), and the text has been stable across firejail 0.9.x. A side effect of demanding
+  positive proof at layer 1: on a host whose firejail sandbox offers **no connect tool** (`nc` or
+  `bash`), firejail is reported unavailable — an availability downgrade, never a security loss. All
+  residuals are narrow because the realistic deployment is the **container tier** (the jitgen image
+  ships no firejail) and bwrap is preferred above firejail in AUTO order; firejail is the fallback
+  OS-sandbox on bare-metal Linux hosts that lack bwrap, where it does **not** degrade. If you must
+  run on firejail inside another sandbox, prefer the container tier or `--unsafe-local-execution`
+  with a jitgen-owned ephemeral container (threat #1). bwrap has **no** analogous fail-open mode —
+  it fails loudly (nonzero exit) when it cannot create a namespace — so it needs no stderr backstop.
 - **Run-time wrapper failure is a signal-integrity, not a confinement, hazard (netns + preamble
   tiers).** A backend's availability is probed at *selection* time, but a launcher can fail at *run*
   time after a passing probe — most realistically the **netns helper**'s `unshare` when unprivileged
