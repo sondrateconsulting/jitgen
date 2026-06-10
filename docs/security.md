@@ -267,8 +267,8 @@ These MUST exist and pass before the relevant phase is complete (built security-
   Real-LLM mode is opt-in and off by default.
 - **Sandbox resource limits (F7) are backend-dependent.** Docker/Podman (`--memory` / `--pids-limit`
   / `--cpus`) and firejail (`--rlimit-*`) enforce CPU/memory/process caps in-kernel. **bwrap** and
-  macOS **`sandbox-exec`** (and the opt-in constrained-local tier) have no flag-level rlimit
-  primitive, and a `setrlimit` pre-exec would require `unsafe` (forbidden crate-wide); on those tiers
+  macOS **`sandbox-exec`** (and the opt-in netns-helper and constrained-local tiers) have no
+  flag-level rlimit primitive, and a `setrlimit` pre-exec would require `unsafe` (forbidden crate-wide); on those tiers
   jitgen applies a **`ulimit` shell preamble** (`sh -c 'ulimit -t …; ulimit -v …; exec "$@"'`)
   that enforces **CPU-time and address-space** (address-space is unenforced on macOS). The preamble
   re-execs the untrusted argv via plain `exec "$@"` (no `--`: dash's `exec` has no `--` terminator, so

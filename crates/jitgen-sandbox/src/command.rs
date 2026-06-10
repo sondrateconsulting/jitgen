@@ -166,7 +166,7 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
 
 /// Wrap an inner argv in a `/bin/sh` preamble that applies **best-effort** rlimits and then `exec`s
 /// the real command. Used only for tiers with no native rlimit mechanism (sandbox-exec, bwrap,
-/// constrained-local); firejail uses `--rlimit-*` and containers use cgroup flags.
+/// netns-helper, constrained-local); firejail uses `--rlimit-*` and containers use cgroup flags.
 ///
 /// The untrusted argv is passed as positional parameters and re-exec'd via `exec "$@"`, so it is
 /// **never** parsed by the shell — this adds no command-injection surface (the shell script is a fixed
@@ -695,9 +695,9 @@ mod tests {
         // it is rejected at the boundary instead. The guard lives in `inner_argv`, which runs *before*
         // the backend dispatch (and before the container image/user checks), so it fires for EVERY
         // backend — both the preamble-wrapped tiers where argv[0] would otherwise reach `exec "$@"`
-        // (constrained-local, bwrap, sandbox-exec) and the non-preamble tiers that never option-parse
-        // the inner argv (firejail, docker, podman — defense in depth). Enumerate all of them so a
-        // future per-backend code path can't silently drop the guard.
+        // (constrained-local, netns-helper, bwrap, sandbox-exec) and the non-preamble tiers that
+        // never option-parse the inner argv (firejail, docker, podman — defense in depth).
+        // Enumerate all of them so a future per-backend code path can't silently drop the guard.
         let r = SpawnRequest::argv("-c", ["evil".into()]);
         for backend in [
             Backend::Bwrap,

@@ -475,8 +475,11 @@ fn netns_helper_denies_network_and_still_executes() {
 }
 
 /// Gate 1b (netns-helper) — loopback is denied too: the fresh network namespace's only interface
-/// is a DOWN loopback, so even 127.0.0.1 connections fail (matching the security baseline's
-/// "DNS/TCP/loopback/IPv6/unix socket all denied" conformance language for isolating backends).
+/// is a DOWN loopback, so even 127.0.0.1 connections fail in-kernel. Scope: this tier denies the
+/// IP socket families; it is **NOT** a general unix-socket boundary — pathname AF_UNIX sockets
+/// are filesystem objects and cross network namespaces freely (abstract-namespace AF_UNIX sockets
+/// happen to be netns-scoped, but jitgen does not rely on that). The "unix socket denied" part of
+/// the security baseline applies to the fully isolating backends only.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "live netns; run with --ignored on a Linux host"]

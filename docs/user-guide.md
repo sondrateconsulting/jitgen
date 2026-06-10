@@ -267,7 +267,7 @@ error (exit 1) with a one-line fix hint; see [troubleshooting.md](troubleshootin
 ```text
 --state-dir <path>        Durable run-state root (else JITGEN_STATE_DIR / XDG). MUST be outside the repo.
 --config <file>           Trusted user/system config file. MUST be outside the repo.
---sandbox <backend>       auto|bwrap|firejail|sandbox-exec|docker|podman|local
+--sandbox <backend>       auto|bwrap|firejail|sandbox-exec|docker|podman|netns-helper|local
 --docker-image <REF>      Digest-pinned image (name@sha256:…) for the Docker/Podman tier (or JITGEN_DOCKER_IMAGE).
 --unsafe-local-execution  Permit the no-isolation local tier (loud, recorded; trusted hosts only).
 --shell-allowed           Permit `shell: true` test commands (high-risk; trusted only).

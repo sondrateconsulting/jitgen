@@ -144,9 +144,11 @@ model; full `openat`/`O_NOFOLLOW` dirfd traversal is the F7 hardening.
 Runs the adapter's `test_command` under a **fail-closed** sandbox: untrusted execution **requires** an
 OS sandbox (bubblewrap/firejail on Linux; `sandbox-exec` on macOS) or container (Docker/Podman); if
 none is available, execution is **refused** unless the trusted user passes `--unsafe-local-execution`
-(loud, recorded; on Linux kernels permitting unprivileged user namespaces the opted-in run is
-auto-upgraded to the **netns-helper** tier — a kernel network cut via the util-linux `unshare`
-helper process, [ADR-0013](decisions/0013-netns-helper-backend.md)). **No network by default**
+(loud, recorded; on Linux kernels permitting unprivileged user namespaces the opted-in
+`--sandbox auto` run — auto is the default — is auto-upgraded to the **netns-helper** tier — a
+kernel network cut via the util-linux `unshare` helper process; explicit `--sandbox local` pins
+the constrained-local tier and is **never** upgraded,
+[ADR-0013](decisions/0013-netns-helper-backend.md)). **No network by default**
 (live conformance tests per backend; Podman shares the Docker invocation plan); **hardcoded env
 allowlist** with synthetic `HOME` (no inherited tokens/creds); cwd pinned to the overlay; mandatory
 timeouts, output caps, and **per-backend** resource limits (containers via cgroup flags
@@ -305,7 +307,7 @@ jitgen doctor
 # Global / TRUSTED options (CLI or user config file outside the repo only; never repo .jitgen.yaml):
   --state-dir <path>            # state root (else JITGEN_STATE_DIR / XDG)
   --config <file>               # trusted user/system config
-  --sandbox <auto|bwrap|firejail|sandbox-exec|docker|podman|local>
+  --sandbox <auto|bwrap|firejail|sandbox-exec|docker|podman|netns-helper|local>
   --unsafe-local-execution      # REQUIRED to use the no-isolation local tier (loud, recorded)
 ```
 
