@@ -59,13 +59,13 @@ bundles jitgen + git + the first-class language toolchains, so it doubles as the
 container IS the sandbox"). Try it by tag; **pin the digest in CI**:
 
 ```bash
-docker run --rm ghcr.io/sondrateconsulting/jitgen:v0.2.1 --version    # jitgen 0.2.1 (data-contract v1)
+docker run --rm ghcr.io/sondrateconsulting/jitgen:v0.2.2 --version    # jitgen 0.2.2 (data-contract v1)
 ```
 
 **Prebuilt binary** (Linux x86-64, macOS arm64), checksum-verified before use:
 
 ```bash
-ver=v0.2.1; target=x86_64-unknown-linux-gnu
+ver=v0.2.2; target=x86_64-unknown-linux-gnu
 base="https://github.com/sondrateconsulting/jitgen/releases/download/${ver}"
 curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz"
 curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz.sha256"
@@ -77,7 +77,7 @@ tar -xzf "jitgen-${ver}-${target}.tar.gz" && ./jitgen --version
 the workspace has no root package):
 
 ```bash
-cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.2.1 jitgen-cli
+cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.2.2 jitgen-cli
 ```
 
 **Build from source:** `git clone` then `cargo build --release` → `target/release/jitgen` (the first
@@ -154,7 +154,7 @@ cargo test  --workspace          # offline; uses the deterministic mock LLM (no 
 # Bazel (canonical build) produces the identical binary + version string:
 bazel build //...
 bazel test  //...
-bazel run //:jitgen -- --version   # jitgen 0.2.1 (data-contract v1) — same under Cargo
+bazel run //:jitgen -- --version   # jitgen 0.2.2 (data-contract v1) — same under Cargo
 ```
 
 All tests run **offline** with a deterministic mock LLM provider. Real providers — Anthropic,

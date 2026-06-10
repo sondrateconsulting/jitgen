@@ -3,7 +3,7 @@ maintained in parallel for dev ergonomics (ADR-0001)."""
 
 module(
     name = "jitgen",
-    version = "0.2.1",
+    version = "0.2.2",
 )
 
 # Rust rules. F1 crates are std-only, so no external crate registry (crate_universe) is needed yet;

@@ -9,7 +9,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 # Single source of the Bazel-side crate version. Keep in sync with [workspace.package].version in
 # Cargo.toml (a version-parity check is added in F10 hardening).
-JITGEN_VERSION = "0.2.1"
+JITGEN_VERSION = "0.2.2"
 
 # Remote test-result caching policy (FAIL-CLOSED). Bazel can cache a test's pass/fail keyed on its
 # inputs, but a test that reads host state (git config, $HOME, TZ, locale, network, /tmp, ...) can

@@ -8,6 +8,20 @@ run state and report formats.
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-06-09
+
+### Changed
+- **The SPDX SBOM attestation is now independently verifiable after the signing certificate expires.**
+  `release.yml`'s `cosign attest` step now requests an RFC3161 timestamp from the Sigstore public-good
+  timestamp authority (`--timestamp-server-url https://timestamp.sigstore.dev/api/v1/timestamp`) in
+  addition to `--tlog-upload=false`. Previously the attestation carried only the short-lived Fulcio
+  certificate with no trusted timestamp, so once that certificate expired (~10 min after the release)
+  `cosign verify-attestation --insecure-ignore-tlog` failed with *"expected a signed timestamp to verify
+  an expired certificate"* — the SBOM was attached but not verifiable. The RFC3161 timestamp is tiny
+  (unlike the multi-MB SBOM that overflows a Rekor tlog entry), and its TSA certificate ships in cosign's
+  default trusted root, so verification needs no extra flags. The image signatures were always tlog-backed
+  and unaffected. `docs/ci.md` updated accordingly. (No code change; release-pipeline + docs only.)
+
 ## [0.2.1] — 2026-06-08
 
 ### Added
