@@ -294,8 +294,13 @@ fn plan_bwrap(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPla
 fn plan_firejail(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPlan {
     let overlay = input.overlay_root.to_string_lossy().into_owned();
     let l = &input.policy.limits;
+    // NOTE: deliberately **no `--quiet`**. firejail silently degrades to a no-sandbox passthrough
+    // (runs the command unconfined, exits 0) when it detects it is already inside a sandbox/container,
+    // announcing it only via a stderr warning — and `--quiet` suppresses that warning. Keeping it
+    // visible lets the run-time backstop in `crate::run` catch a degraded launcher
+    // (`SandboxError::SandboxDegraded`) instead of reporting an unsandboxed run as a clean pass. The
+    // detect-time functional probe is the primary guard; this is defense in depth. (security threat #1)
     let mut args = vec![
-        "--quiet".into(),
         "--net=none".into(),
         "--read-only=/".into(),
         format!("--read-write={overlay}"),
@@ -811,6 +816,16 @@ mod tests {
         assert_eq!(plan.program, "firejail");
         assert!(plan.args.contains(&"--net=none".to_string()));
         assert!(plan.args.iter().any(|a| a.starts_with("--rlimit-nproc=")));
+        // `--quiet` must NOT be a firejail *wrapper* flag: it would suppress firejail's "existing
+        // sandbox was detected" warning, blinding the run-time silent-degradation backstop (security
+        // threat #1). Scope the check to the wrapper flags (before `--`); the inner argv legitimately
+        // carries `cargo test --quiet`.
+        let dd = plan.args.iter().position(|a| a == "--").unwrap();
+        let wrapper = &plan.args[..dd];
+        assert!(
+            !wrapper.contains(&"--quiet".to_string()),
+            "firejail wrapper must not pass --quiet (it hides the degradation warning): {wrapper:?}"
+        );
     }
 
     #[test]

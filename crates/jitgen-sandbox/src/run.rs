@@ -84,6 +84,31 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     }
     let (stdout_raw, out_trunc) = collect(out_cap);
     let (stderr_raw, err_trunc) = collect(err_cap);
+
+    // Defense-in-depth backstop for a silently-degrading launcher, checked BEFORE we trust the exit
+    // status (so it fires even on the rare path where `wait_with_timeout` itself errored). firejail
+    // prints a warning and runs the command with NO sandboxing (exit 0) when it detects it is already
+    // inside a sandbox/container. The detect-time functional probe is the primary guard (such a
+    // firejail is never auto-selected), but an operator who explicitly set `backend=firejail` bypasses
+    // detection — so if a degraded launcher is reached here, refuse rather than report an unsandboxed
+    // run as a clean pass (that would fail open: full network + filesystem).
+    //
+    // Scan only the FIRST stderr line: firejail emits this warning as its first output, before the
+    // child is exec'd, so the inner (untrusted) command's output is always on later lines. Scoping to
+    // the first line keeps a hostile repo from forging the marker in its own test stderr to
+    // force-refuse every firejail-tier run. The marker is fixed jitgen-known text matched on the raw
+    // (pre-redaction) bytes, so nothing untrusted or secret leaks into the error. (security threat #1)
+    {
+        let stderr_lossy = String::from_utf8_lossy(&stderr_raw);
+        let launcher_first_line = stderr_lossy.lines().next().unwrap_or("");
+        if plan
+            .backend
+            .stderr_shows_silent_degradation(launcher_first_line)
+        {
+            return Err(SandboxError::SandboxDegraded(plan.backend.id()));
+        }
+    }
+
     let (status, timed_out) = wait_result?;
 
     let disp = Disposition {
@@ -680,6 +705,16 @@ mod tests {
             }
         }
 
+        // Same `/bin/sh -c <script>` executor plan, but tagged with an arbitrary backend so the
+        // silent-degradation backstop (keyed on `plan.backend`) can be exercised without a live
+        // firejail.
+        fn sh_plan_backend(backend: Backend, script: &str) -> SandboxPlan {
+            SandboxPlan {
+                backend,
+                ..sh_plan(script)
+            }
+        }
+
         #[test]
         fn exit_zero_is_passed() {
             let r = run(&sh_plan("exit 0"), &ExecPolicy::default()).unwrap();
@@ -785,6 +820,72 @@ mod tests {
                 "join hung on a backgrounded pipe-holder ({:?})",
                 start.elapsed()
             );
+        }
+
+        #[test]
+        fn firejail_silent_degradation_warning_is_refused() {
+            // Simulate a firejail launcher that printed its "existing sandbox was detected" warning to
+            // stderr and ran the command UNSANDBOXED (exit 0). run() must refuse the result rather than
+            // report a clean pass — the run-time backstop to the detect-time probe (security threat #1).
+            let warning = "Warning: an existing sandbox was detected. cargo will run without any \
+                           additional sandboxing features";
+            let script = format!("echo '{warning}' >&2; exit 0");
+            let err = run(
+                &sh_plan_backend(Backend::Firejail, &script),
+                &ExecPolicy::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SandboxError::SandboxDegraded("firejail")),
+                "a degraded firejail run must be refused, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn firejail_without_degradation_warning_passes_normally() {
+            // A genuinely-sandboxing firejail (no degradation warning, just its ordinary banner) must
+            // pass — the backstop must not fire on ordinary firejail stderr.
+            let plan = sh_plan_backend(
+                Backend::Firejail,
+                "echo 'Child process initialized in 5.0 ms' >&2; printf ok",
+            );
+            let r = run(&plan, &ExecPolicy::default()).unwrap();
+            assert_eq!(r.outcome, ExecOutcome::Passed);
+            assert_eq!(r.stdout, "ok");
+        }
+
+        #[test]
+        fn firejail_marker_only_on_a_later_stderr_line_is_not_refused() {
+            // A genuinely-sandboxing firejail prints its banner first (line 1); if the inner
+            // (untrusted) test then emits the marker phrase on a LATER line, that must NOT be mistaken
+            // for firejail degrading — the backstop scans only firejail's own first line. This stops a
+            // hostile repo from forging the warning in its test stderr to force-refuse every
+            // firejail-tier run.
+            let script = "echo 'Parent pid 2, child pid 3' >&2; \
+                          echo 'an existing sandbox was detected ... without any additional sandboxing' >&2; \
+                          printf ok";
+            let r = run(
+                &sh_plan_backend(Backend::Firejail, script),
+                &ExecPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(r.outcome, ExecOutcome::Passed);
+            assert_eq!(r.stdout, "ok");
+        }
+
+        #[test]
+        fn degradation_text_from_a_non_firejail_backend_is_not_refused() {
+            // The backstop is per-backend: only firejail has a silent-degradation mode. The same text
+            // emitted under the constrained-local tier (which never degrades this way) must NOT be
+            // refused — otherwise ordinary test output mentioning the phrase would be misclassified.
+            let script = "echo 'an existing sandbox was detected ... without any additional \
+                          sandboxing' >&2; exit 0";
+            let r = run(
+                &sh_plan_backend(Backend::ConstrainedLocal, script),
+                &ExecPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(r.outcome, ExecOutcome::Passed);
         }
 
         #[test]

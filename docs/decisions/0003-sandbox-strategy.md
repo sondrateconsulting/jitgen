@@ -38,6 +38,15 @@ constrained-local tier is **never auto-selected**; it runs only when the trusted
   live `#[ignore]`d conformance tests (`crates/jitgen-sandbox/tests/conformance.rs`) probe
   outbound-connect denial per backend: sandbox-exec, bwrap, firejail, and Docker (Podman shares
   the Docker invocation plan).
+- **Detection probes real isolation, not mere presence.** An OS-sandbox backend is "available" only
+  if a probe that *actually sandboxes* succeeds — not a bare `--version`. This closes a **firejail**
+  fail-open: firejail runs the command **unsandboxed and exits 0** (printing only a stderr warning)
+  when it detects it is already inside a sandbox/container, so `firejail --version` would wrongly mark
+  it available. The probe runs `firejail --net=none -- /bin/true` and treats the "existing sandbox was
+  detected" warning as unavailable; the run-time executor refuses any firejail result carrying that
+  warning as defense-in-depth (the firejail plan omits `--quiet` so it stays visible). bwrap fails
+  *loudly* instead (nonzero exit when it cannot namespace), so it has no such backstop. See
+  `docs/security.md` threat #1.
 - **Environment is a hardcoded allowlist**, not inherited — synthetic `HOME`; no token/credential/
   socket vars; trusted additions only, still subject to deny-patterns.
 - **argv-based execution only** — never pass commands as shell strings. `shell: true` is
