@@ -105,10 +105,11 @@ fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
     Some(Sandbox::new(&[backend], policy).unwrap())
 }
 
-/// Gate-1 probe shared by every backend's network-denial test. Picks a connect tool that actually
-/// EXISTS in the sandboxed environment, then attempts an outbound TCP connect. Distinguishes
-/// "denied" from "no probe tool" so a toolless environment can't masquerade as a passing
-/// network-denial test (T1/F7 P3). Emits a sentinel word; callers assert on it (not on exit).
+/// Gate-1 probe shared by the bwrap, firejail, and Docker network-denial gates (the sandbox-exec
+/// gate uses its own python3 probe). Picks a connect tool that actually EXISTS in the sandboxed
+/// environment, then attempts an outbound TCP connect. Distinguishes "denied" from "no probe tool"
+/// so a toolless environment can't masquerade as a passing network-denial test (T1/F7 P3). Emits a
+/// sentinel word; callers assert on it (not on exit).
 const NET_PROBE_SCRIPT: &str = "\
     if command -v nc >/dev/null 2>&1; then \
         nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
@@ -116,15 +117,16 @@ const NET_PROBE_SCRIPT: &str = "\
         bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
     else echo NO_PROBE_TOOL; fi";
 
-/// Run [`NET_PROBE_SCRIPT`] under `sb` and assert egress is denied; skip loudly when the sandboxed
-/// environment offers no probe tool.
+/// Run [`NET_PROBE_SCRIPT`] under `sb` and assert egress is denied; fail loudly when the sandboxed
+/// environment offers no probe tool — an unverifiable gate must not read as a passing one.
 fn assert_network_denied(sb: &Sandbox, fx: &Fixture, run_as: Option<&str>, what: &str) {
     let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), NET_PROBE_SCRIPT.into()]);
     let res = exec_as(sb, &cmd, fx, run_as);
-    if res.stdout.contains("NO_PROBE_TOOL") {
-        eprintln!("SKIP {what}: no nc/bash probe tool in the sandboxed environment");
-        return;
-    }
+    assert!(
+        !res.stdout.contains("NO_PROBE_TOOL"),
+        "{what}: no nc/bash probe tool in the sandboxed environment, so network denial cannot \
+         be verified; rerun with an image/host that provides nc or bash"
+    );
     assert!(
         res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
         "{what}: network must be denied (expected NET_DENIED); got {res:?}"

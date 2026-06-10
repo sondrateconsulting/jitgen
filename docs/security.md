@@ -173,11 +173,10 @@ exfiltrate env".
 ## Secure defaults (summary)
 
 Fail-closed execution (isolating sandbox required); non-destructive (patch unless `--write`); no
-network in sandbox (live per-backend conformance tests); jitgen-owned env allowlist + synthetic
-HOME; argv-only;
-`shell`/provider/real-LLM/state-root are **trusted-config only**; keys from a trusted-named env var;
-redaction + caps everywhere; blob-based intake with git filters disabled; immutable OIDs; private
-`0700` state dir; preflight resource budgets; per-format report escaping.
+network in sandbox (live per-backend conformance tests); jitgen-owned env allowlist + synthetic HOME;
+argv-only; `shell`/provider/real-LLM/state-root are **trusted-config only**; keys from a
+trusted-named env var; redaction + caps everywhere; blob-based intake with git filters disabled;
+immutable OIDs; private `0700` state dir; preflight resource budgets; per-format report escaping.
 
 ## Operational ownership: published-image CVE/SBOM rebuilds
 
@@ -206,11 +205,11 @@ their dependency versions from the pinned `Cargo.lock`, audited separately by `.
 
 These MUST exist and pass before the relevant phase is complete (built security-review-first at F7):
 
-1. **Sandbox network denial** — the network is cut wholesale per backend (bwrap `--unshare-all`,
-   firejail `--net=none`, `sandbox-exec` SBPL `(deny network*)`, containers `--network=none`); live
-   `#[ignore]`d conformance tests (`crates/jitgen-sandbox/tests/conformance.rs`) probe
-   outbound-connect denial on `sandbox-exec`, bwrap, firejail, and Docker (Podman shares the Docker
-   invocation plan). Execution **fails closed** when no isolating backend is available.
+1. **Sandbox network denial** — the network is cut wholesale per backend (the per-backend flags are
+   enumerated under threat #1); live `#[ignore]`d conformance tests
+   (`crates/jitgen-sandbox/tests/conformance.rs`) probe outbound-connect denial on `sandbox-exec`,
+   bwrap, firejail, and Docker (Podman shares the Docker invocation plan). Execution **fails
+   closed** when no isolating backend is available.
 2. **No write outside overlay** — symlinked `tests/ -> ~/.ssh`, ancestor-swap races, `..`/absolute
    paths all rejected; `O_NOFOLLOW`/`O_EXCL`/`fstat` enforced.
 3. **Env allowlist** — token/socket/credential vars absent; synthetic HOME; trusted additions only.
