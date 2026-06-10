@@ -8,6 +8,9 @@
 //! cargo test -p jitgen-sandbox --test conformance -- --ignored --test-threads=1
 //! # Docker gates also need a digest-pinned local image (we never pull during a test):
 //! JITGEN_TEST_DOCKER_IMAGE=name@sha256:... cargo test -p jitgen-sandbox --test conformance -- --ignored
+//! # Running as root (CI)? Also set JITGEN_TEST_DOCKER_UID_GID=<nonroot uid:gid> (e.g. 1000:1000):
+//! # once the image is configured, the docker gates fail loudly (rather than skip) if
+//! # JITGEN_TEST_DOCKER_UID_GID is missing or invalid — skipping would read as a pass.
 //! # bwrap/firejail gates need a Linux host with the launcher installed (they skip elsewhere).
 //! ```
 //!
@@ -514,27 +517,125 @@ fn docker_sandbox(image: String) -> Option<Sandbox> {
     Some(Sandbox::new(&[Backend::Docker], policy).unwrap())
 }
 
-/// The non-root `uid:gid` to run containers as: `current_uid_gid()` for a normal user, or the
-/// `JITGEN_TEST_DOCKER_UID_GID` override for a root CI context (where `current_uid_gid()` returns
-/// `None` by design). `None` means "no non-root user available" → the caller skips loudly rather than
-/// panicking on `MissingContainerUser` (T2/F7 P4).
+/// Pure decision core for [`test_uid_gid`]: pick the non-root `uid:gid` to run containers as,
+/// from the live user probe and the `JITGEN_TEST_DOCKER_UID_GID` override. `Err` carries the
+/// actionable reason no usable value exists, distinguishing "override absent" from "override set
+/// but invalid" — the absent-style message is misleading when the operator DID set the variable
+/// and it was silently rejected.
 ///
 /// The override is validated with the PRODUCTION `is_uid_gid` gate itself (via `test_support`), so
 /// the accepted value — and therefore the control probe's `--user` — is exactly what
 /// `plan_container` will accept for the sandboxed run; its accept/reject boundary is pinned by the
 /// CI-run regression table in `command.rs`.
-fn test_uid_gid() -> Option<String> {
-    if let Some(u) = current_uid_gid() {
-        return Some(u);
+fn resolve_test_uid_gid(
+    current: Option<String>,
+    override_var: Option<&str>,
+) -> Result<String, String> {
+    if let Some(u) = current {
+        return Ok(u);
     }
-    match std::env::var("JITGEN_TEST_DOCKER_UID_GID") {
-        Ok(v) if is_uid_gid(&v) => Some(v),
-        _ => {
-            eprintln!(
-                "SKIP docker test: running as root and no JITGEN_TEST_DOCKER_UID_GID=<nonroot uid:gid>"
-            );
-            None
-        }
+    match override_var {
+        Some(v) if is_uid_gid(v) => Ok(v.to_string()),
+        Some(v) => Err(format!(
+            "JITGEN_TEST_DOCKER_UID_GID={v:?} is set but invalid: expected <nonroot uid:gid> with \
+             both fields all-digit and non-empty and a non-root uid (e.g. 1000:1000)"
+        )),
+        None => Err(
+            "running as root and JITGEN_TEST_DOCKER_UID_GID is not set; set \
+             JITGEN_TEST_DOCKER_UID_GID=<nonroot uid:gid> (e.g. 1000:1000)"
+                .to_string(),
+        ),
+    }
+}
+
+/// The non-root `uid:gid` to run containers as: `current_uid_gid()` for a normal user, or the
+/// `JITGEN_TEST_DOCKER_UID_GID` override for a root CI context (where `current_uid_gid()` returns
+/// `None` by design).
+///
+/// Callers reach this only AFTER `docker_test_image()` and `docker_sandbox()` succeed — the
+/// operator has opted into the docker gates (image configured, daemon present) — so "no non-root
+/// user available" panics loudly instead of skipping: a gate the operator opted into must not
+/// report green while never running (parity with the `sandbox_exec_denies_network` /
+/// `assert_network_denied` loud-failure standard). The genuinely-honest skips (daemon absent,
+/// image not configured) stay in those two helpers.
+fn test_uid_gid(what: &str) -> String {
+    // `var()` would collapse a set-but-non-UTF-8 value into "absent" (`VarError::NotUnicode` →
+    // `Err`), panicking with the misleading "is not set" message while the variable IS set.
+    // `var_os` + lossy keeps it on the set-but-invalid path: U+FFFD can never satisfy
+    // `is_uid_gid`, so the value is quoted and rejected, not erased.
+    let override_var =
+        std::env::var_os("JITGEN_TEST_DOCKER_UID_GID").map(|v| v.to_string_lossy().into_owned());
+    resolve_test_uid_gid(current_uid_gid(), override_var.as_deref()).unwrap_or_else(|why| {
+        panic!(
+            "{what}: {why}. The docker gates are opted in (JITGEN_TEST_DOCKER_IMAGE set, daemon \
+             present) but containers require an explicit non-root --user (fail-closed), so this \
+             gate cannot run truthfully — and skipping would read as a pass. This is an \
+             environment problem, NOT a sandbox-isolation failure — fix the variable and rerun"
+        )
+    })
+}
+
+// Decision-logic tests for `resolve_test_uid_gid`. Pure (no live sandbox, no env reads), so NOT
+// `#[ignore]`d: they run in the normal `cargo test` pass.
+
+#[test]
+fn resolve_test_uid_gid_prefers_the_live_probe() {
+    // Once the live probe answers, the override is irrelevant — valid or invalid. The valid-override
+    // case is the load-bearing one: an implementation that consulted the override first would
+    // return Ok("1000:1000") there, not fall through to an Err the other asserts already catch.
+    let live = Some("501:20".to_string());
+    assert_eq!(
+        resolve_test_uid_gid(live.clone(), Some("1000:1000")),
+        Ok("501:20".to_string()),
+        "live probe must win even over a valid override"
+    );
+    assert_eq!(
+        resolve_test_uid_gid(live.clone(), Some("0:0")),
+        Ok("501:20".to_string())
+    );
+    assert_eq!(resolve_test_uid_gid(live, None), Ok("501:20".to_string()));
+}
+
+#[test]
+fn resolve_test_uid_gid_accepts_a_valid_override_when_root() {
+    assert_eq!(
+        resolve_test_uid_gid(None, Some("1000:1000")),
+        Ok("1000:1000".to_string())
+    );
+}
+
+#[test]
+fn resolve_test_uid_gid_absent_override_says_set_it() {
+    // The contract is absent ≠ invalid, pinned from both directions: the absent-var message must
+    // NOT be the set-but-invalid one AND must carry its own discriminating marker ("not set" —
+    // `JITGEN_TEST_DOCKER_UID_GID=` alone appears in BOTH messages, so it can't discriminate),
+    // and it must tell the operator how to fix it. Wording beyond those markers is not pinned.
+    let err = resolve_test_uid_gid(None, None).unwrap_err();
+    assert!(
+        !err.contains("set but invalid"),
+        "absent-var must not reuse the invalid-var message: {err}"
+    );
+    assert!(
+        err.contains("not set"),
+        "absent-var message must say the variable is unset: {err}"
+    );
+    assert!(
+        err.contains("JITGEN_TEST_DOCKER_UID_GID="),
+        "message must show how to fix: {err}"
+    );
+}
+
+#[test]
+fn resolve_test_uid_gid_invalid_override_quotes_the_rejected_value() {
+    // Root uid, all-zero uid, non-numeric gid, missing colon, empty: all rejected by the
+    // production `is_uid_gid` gate, and each message must say "set but invalid" and quote the
+    // value — the absent-style message would misread as "you forgot to set it".
+    for bad in ["0:0", "00:500", "1000:users", "1000", ""] {
+        let err = resolve_test_uid_gid(None, Some(bad)).unwrap_err();
+        assert!(
+            err.contains("set but invalid") && err.contains(&format!("{bad:?}")),
+            "invalid-var message for {bad:?}: {err}"
+        );
     }
 }
 
@@ -648,10 +749,8 @@ fn docker_denies_network() {
     let Some(sb) = docker_sandbox(image.clone()) else {
         return;
     };
-    // Containers require an explicit non-root --user (fail-closed); supply it or skip loudly.
-    let Some(uid_gid) = test_uid_gid() else {
-        return;
-    };
+    // Containers require an explicit non-root --user (fail-closed); supply it or fail loudly.
+    let uid_gid = test_uid_gid("docker_denies_network");
     let fx = Fixture::new("docker-net");
     assert_network_denied(
         &sb,
@@ -718,9 +817,7 @@ fn docker_runs_as_requested_nonroot_user() {
     let Some(sb) = docker_sandbox(image) else {
         return;
     };
-    let Some(uid_gid) = test_uid_gid() else {
-        return;
-    };
+    let uid_gid = test_uid_gid("docker_runs_as_requested_nonroot_user");
     let want_uid = uid_gid.split(':').next().unwrap().to_string();
     assert_ne!(want_uid, "0", "test must not run as root to be meaningful");
 
@@ -747,9 +844,7 @@ fn docker_confines_writes_to_overlay() {
     let Some(sb) = docker_sandbox(image) else {
         return;
     };
-    let Some(uid_gid) = test_uid_gid() else {
-        return;
-    };
+    let uid_gid = test_uid_gid("docker_confines_writes_to_overlay");
 
     // Fresh fixture per execution (run() refuses a pre-existing synthetic dir; production rebuilds
     // the overlay each run). Write outside the overlay (root fs is --read-only) must fail.
