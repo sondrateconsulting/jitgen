@@ -80,13 +80,36 @@ impl Backend {
         }
     }
 
-    /// The argv used to confirm the backend is present and functional. `None` for the local tier
-    /// (nothing to probe). For Docker/Podman this checks the **daemon** (so a present client with a
-    /// dead daemon is correctly treated as unavailable).
-    pub fn version_probe(self) -> Option<(&'static str, &'static [&'static str])> {
+    /// The argv used to confirm the backend is present **and able to actually isolate**. `None` for
+    /// the local tier (nothing to probe). A present-but-non-functional backend must fail this probe
+    /// so it is treated as unavailable (fail-closed) — a mere `--version` check is **not** enough:
+    ///
+    /// - **firejail** silently degrades to a *passthrough* (prints a warning, runs the command with
+    ///   NO sandboxing, exits 0) when it detects it is already inside a sandbox/container. A
+    ///   `firejail --version` succeeds there, so it would be wrongly selected and then run hostile
+    ///   tests unconfined (full network + filesystem). The probe therefore **exercises real
+    ///   sandboxing** (`--net=none -- /bin/true`, no `--quiet` so the warning reaches stderr) and the
+    ///   caller treats a [`silent_degradation_markers`](Self::silent_degradation_markers) hit as
+    ///   unavailable.
+    /// - **bwrap** is upgraded for the same reason, though it does **not** fail open: when it cannot
+    ///   create a namespace it fails *loudly* (`No permissions to create new namespace`, nonzero
+    ///   exit, command not run). A real namespacing probe (`--unshare-all --ro-bind / / /bin/true`)
+    ///   skips bwrap on a host where it cannot isolate, so AUTO falls through to the container tier
+    ///   instead of selecting a bwrap that would error on every run.
+    /// - For Docker/Podman this checks the **daemon** (so a present client with a dead daemon is
+    ///   correctly treated as unavailable).
+    pub fn availability_probe(self) -> Option<(&'static str, &'static [&'static str])> {
         match self {
-            Backend::Bwrap => Some(("bwrap", &["--version"])),
-            Backend::Firejail => Some(("firejail", &["--version"])),
+            // Exercise real namespacing (a strict subset of `plan_bwrap`'s flags). Fails loudly with
+            // a nonzero exit if the host cannot create a user namespace → naturally excluded.
+            Backend::Bwrap => Some((
+                "bwrap",
+                &["--unshare-all", "--ro-bind", "/", "/", "/bin/true"],
+            )),
+            // Exercise real sandboxing, NOT `--version`: a `--version` succeeds even when firejail
+            // will silently degrade to a no-op passthrough inside a container. No `--quiet`, so the
+            // "existing sandbox was detected" warning surfaces on stderr for the caller to detect.
+            Backend::Firejail => Some(("firejail", &["--net=none", "--", "/bin/true"])),
             // A permissive no-op profile exercises sandbox-exec without confining `true`.
             Backend::SandboxExec => Some((
                 "sandbox-exec",
@@ -113,7 +136,62 @@ impl Backend {
             Backend::ConstrainedLocal => None,
         }
     }
+
+    /// Lowercased stderr substrings that mean the backend launcher ran the command **without any
+    /// sandboxing** while still exiting 0 (a silent fail-open). Only **firejail** has such a mode: it
+    /// degrades to a passthrough and prints this warning when it detects it is already inside a
+    /// sandbox/container. Every other backend either isolates or fails loudly with a nonzero exit, so
+    /// they have no markers. `None` = no silent-degradation mode.
+    fn silent_degradation_markers(self) -> Option<&'static [&'static str]> {
+        match self {
+            Backend::Firejail => Some(SILENT_DEGRADATION_MARKERS_FIREJAIL),
+            // `None` here is a security claim ("this backend cannot silently fail open"), so the
+            // arms are enumerated without a wildcard: adding a backend is a compile error until its
+            // degradation behavior is decided explicitly. NetnsHelper (util-linux `unshare`) fails
+            // loudly with a nonzero exit when it cannot create the namespaces — no passthrough mode.
+            Backend::Bwrap
+            | Backend::SandboxExec
+            | Backend::Docker
+            | Backend::Podman
+            | Backend::NetnsHelper
+            | Backend::ConstrainedLocal => None,
+        }
+    }
+
+    /// Whether this backend can run a command **without any sandboxing while still exiting 0** (a
+    /// silent fail-open) — i.e. it has [`silent_degradation_markers`](Self::silent_degradation_markers).
+    /// Gates the run-time pre-execution re-probe and the stderr-capture floor so only the affected
+    /// backend (firejail) pays for them.
+    pub(crate) fn has_silent_degradation_mode(self) -> bool {
+        self.silent_degradation_markers().is_some()
+    }
+
+    /// Whether `stderr` shows this backend silently degraded to a no-sandbox passthrough (matched
+    /// case-insensitively against [`silent_degradation_markers`](Self::silent_degradation_markers)).
+    /// The single source of truth shared by the detect-time probe ([`crate::detect`]) and the
+    /// run-time backstop ([`crate::run`]): both must agree on what "degraded" means, so neither can
+    /// drift. A backend with no markers is never considered degraded.
+    pub(crate) fn stderr_shows_silent_degradation(self, stderr: &str) -> bool {
+        match self.silent_degradation_markers() {
+            Some(markers) => {
+                let low = stderr.to_ascii_lowercase();
+                markers.iter().any(|m| low.contains(*m))
+            }
+            None => false,
+        }
+    }
 }
+
+/// firejail 0.9.x prints one of these to stderr (then runs the command unsandboxed and exits 0) when
+/// it detects an existing sandbox/container. Two substrings from the **same** message give resilience
+/// if firejail rewords one across versions; either match means "degraded". Kept lowercase for the
+/// case-insensitive compare in [`Backend::stderr_shows_silent_degradation`]. Stderr matching is
+/// version/locale-fragile, so this is the run-time *backstop*; the detect-time functional probe is the
+/// primary guard (a degrading firejail is never selected).
+const SILENT_DEGRADATION_MARKERS_FIREJAIL: &[&str] = &[
+    "existing sandbox was detected",
+    "without any additional sandboxing",
+];
 
 /// Backends worth probing on the current OS, in preference order.
 pub fn os_candidates() -> Vec<Backend> {
@@ -372,8 +450,65 @@ mod tests {
     fn tiers_and_probes_are_consistent() {
         assert_eq!(Backend::Docker.tier(), Tier::Container);
         assert_eq!(Backend::SandboxExec.tier(), Tier::OsSandbox);
-        assert!(Backend::ConstrainedLocal.version_probe().is_none());
-        assert!(Backend::Docker.version_probe().is_some());
+        assert!(Backend::ConstrainedLocal.availability_probe().is_none());
+        assert!(Backend::Docker.availability_probe().is_some());
+    }
+
+    #[test]
+    fn os_sandbox_probes_exercise_real_isolation_not_just_version() {
+        // The fail-open fix: firejail's probe must actually try to sandbox (and omit `--quiet` so its
+        // degradation warning surfaces), NOT run `--version` — which succeeds even when firejail will
+        // silently run the command unsandboxed inside a container.
+        let (prog, args) = Backend::Firejail.availability_probe().unwrap();
+        assert_eq!(prog, "firejail");
+        assert!(
+            args.contains(&"--net=none"),
+            "firejail probe must exercise the net namespace: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--version"),
+            "firejail probe must not be a mere version check: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--quiet"),
+            "firejail probe must not suppress the degradation warning: {args:?}"
+        );
+
+        // bwrap is upgraded to a real namespacing probe too (it fails loudly, never fails open).
+        let (prog, args) = Backend::Bwrap.availability_probe().unwrap();
+        assert_eq!(prog, "bwrap");
+        assert!(
+            args.contains(&"--unshare-all"),
+            "bwrap probe must exercise namespacing: {args:?}"
+        );
+        assert!(!args.contains(&"--version"));
+    }
+
+    #[test]
+    fn only_firejail_has_a_silent_degradation_mode() {
+        // firejail's exact 0.9.74 warning (and a case variant) is recognized as degradation.
+        let warning =
+            "Warning: an existing sandbox was detected. /bin/true will run without any additional sandboxing features";
+        assert!(Backend::Firejail.stderr_shows_silent_degradation(warning));
+        assert!(Backend::Firejail.stderr_shows_silent_degradation(&warning.to_uppercase()));
+        // Clean stderr (firejail's normal startup banner) is not a degradation.
+        assert!(!Backend::Firejail
+            .stderr_shows_silent_degradation("Child process initialized in 7.21 ms"));
+        assert!(!Backend::Firejail.stderr_shows_silent_degradation(""));
+        // No other backend treats that text — or anything — as a silent degradation: their failure
+        // mode is a loud nonzero exit, caught by the probe's success check, not a stderr string.
+        for b in [
+            Backend::Bwrap,
+            Backend::SandboxExec,
+            Backend::Docker,
+            Backend::Podman,
+            Backend::ConstrainedLocal,
+        ] {
+            assert!(
+                !b.stderr_shows_silent_degradation(warning),
+                "{b:?} must not have a silent-degradation mode"
+            );
+        }
     }
 
     #[test]
