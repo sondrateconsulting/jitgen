@@ -333,13 +333,21 @@ jobs:
           # --tlog-upload=false: the fat image's SBOM (all four toolchains) is multi-MB and exceeds the
           # public Rekor transparency-log entry the DSSE/intoto upload tries to write, so the upload times
           # out. (`cosign attest` uses --tlog-upload, NOT sign's --no-tlog-upload flag.) The attestation
-          # is still a real DSSE envelope signed by the ephemeral Fulcio cert and stored alongside the
-          # image in GHCR — bound to the digest and identity-verifiable — it is just not recorded in the
-          # public transparency log. The image SIGNATURES (above) DO go to the tlog (small entries), so
-          # normal `cosign verify` is unaffected; only `verify-attestation` needs --insecure-ignore-tlog
-          # (documented in docs/ci.md).
-          cosign attest --recursive --tlog-upload=false --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
-          cosign attest --recursive --tlog-upload=false --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
+          # is a real DSSE envelope signed by the ephemeral Fulcio cert and stored alongside the image in
+          # GHCR, bound to the digest. It is NOT in the public transparency log.
+          #
+          # --timestamp-server-url: a Fulcio cert is short-lived (~10 min), so without a trusted timestamp
+          # `verify-attestation` cannot prove the cert was valid at signing time once it expires — it fails
+          # with "expected a signed timestamp to verify an expired certificate" (the tlog SignedEntryTimestamp
+          # is what normally provides that, but the SBOM is not in the tlog). We instead request an RFC3161
+          # timestamp from the Sigstore public-good TSA; it is tiny (just a signed hash + time) regardless of
+          # SBOM size, and its TSA cert ships in cosign's default trusted root, so consumers verify with no
+          # extra flags. The image SIGNATURES (above) DO go to the tlog (small entries), so normal `cosign
+          # verify` is unaffected; only `verify-attestation` needs --insecure-ignore-tlog (the TSA timestamp,
+          # not a tlog entry, anchors the signing time). All documented in docs/ci.md.
+          TSA=https://timestamp.sigstore.dev/api/v1/timestamp
+          cosign attest --recursive --tlog-upload=false --timestamp-server-url "$TSA" --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
+          cosign attest --recursive --tlog-upload=false --timestamp-server-url "$TSA" --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
 
   # Publish the GitHub Release. `needs:` the binary builds AND the image publish, so this runs only when
   # every binary smoke passed AND both multi-arch images were built, smoked, pushed, signed, and SBOM'd

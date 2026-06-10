@@ -158,15 +158,15 @@ A tagged release (`v*`) publishes, from [`.github/workflows/release.yml`](../.gi
 **per-platform binaries with SHA-256 checksums** and **digest-pinned, cosign-signed multi-arch container
 images** — each artifact smoke-tested (`--version` + `analyze` on a fixture; the images also exercise their
 bundled toolchains / run the demo) *before* it is published. Choose the acquisition path that fits your
-runner. The `v0.2.1` and `@sha256:<digest>` tokens below are **placeholders** — substitute a published
-release tag and the digest that release reports (no release is cut yet; this pipeline is what produces
-them):
+runner. The `v0.2.2` and `@sha256:<digest>` tokens below are **placeholders** — substitute the release
+tag you are pinning and the digest that release reports (see the [Releases
+page](https://github.com/sondrateconsulting/jitgen/releases)):
 
 **Prebuilt binary** (Linux x86-64, macOS arm64), checksum-verified before use. *(Intel macOS —
 `x86_64-apple-darwin` — is not prebuilt; build from source or use the container image.)*
 
 ```bash
-ver=v0.2.1; target=x86_64-unknown-linux-gnu          # your release tag + platform
+ver=v0.2.2; target=x86_64-unknown-linux-gnu          # your release tag + platform
 base="https://github.com/sondrateconsulting/jitgen/releases/download/${ver}"
 curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz"
 curl -fsSLO "${base}/jitgen-${ver}-${target}.tar.gz.sha256"
@@ -178,7 +178,7 @@ tar -xzf "jitgen-${ver}-${target}.tar.gz" && ./jitgen --version
 package, so name the CLI crate explicitly:
 
 ```bash
-cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.2.1 jitgen-cli
+cargo install --locked --git https://github.com/sondrateconsulting/jitgen --tag v0.2.2 jitgen-cli
 ```
 
 **Container images** — both **multi-arch** (`linux/amd64` + `linux/arm64`, built natively per arch) and
@@ -210,27 +210,28 @@ cosign verify ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
   --certificate-identity-regexp "$id_re" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
-# SPDX SBOM attestation — bound to the image digest and stored in the registry, but NOT in the
-# transparency log (the fat image's SBOM is too large for a Rekor entry), so pass --insecure-ignore-tlog.
-# The Fulcio cert identity is still verified; only the public-tlog timestamp is skipped.
+# SPDX SBOM attestation — bound to the image digest and stored in the registry, NOT in the transparency
+# log (the fat image's SBOM is too large for a Rekor entry), so pass --insecure-ignore-tlog. The
+# attestation carries an RFC3161 timestamp from the Sigstore public-good TSA, which anchors the signing
+# time so the (short-lived) Fulcio cert still verifies after it expires. The TSA cert ships in cosign's
+# default trusted root, so no extra flags are needed.
 cosign verify-attestation --type spdxjson --insecure-ignore-tlog \
   ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
   --certificate-identity-regexp "$id_re" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
-The image **signature** is recorded in the public transparency log; the **SBOM attestation** is stored in
-the registry only (registry-backed, identity-verifiable, but not tlog-recorded — hence
-`--insecure-ignore-tlog`). Both are applied immediately after the manifest is published, in the same
-release run (a release whose signing step fails produces no GitHub Release).
+The image **signature** is recorded in the public transparency log (so `cosign verify` is unqualified).
+The **SBOM attestation** is stored in the registry only and is RFC3161-timestamped rather than tlog-recorded
+— hence `--insecure-ignore-tlog`: the TSA timestamp, not a tlog entry, proves it was signed while the
+certificate was valid, so it verifies indefinitely. Both are applied immediately after the manifest is
+published, in the same release run (a release whose signing step fails produces no GitHub Release).
 
 **Build from source** (always works, no release required): `cargo build --release` →
 `target/release/jitgen`. Pin to a tag/commit in a real workflow.
 
-> The repository is currently **private**, so every hosted path is **auth-gated**: `docker login
-> ghcr.io` for the image, and a token (e.g. `GITHUB_TOKEN`) for release-asset downloads and
-> `cargo install --git`. Making the repo public turns these into anonymous downloads — nothing else
-> changes (the binaries and image are built public-grade today).
+> The repository and both GHCR packages are **public**: the image pulls, release-asset downloads, and
+> `cargo install --git` above all work anonymously, no `docker login` or token required.
 
 #### "The container IS the sandbox"
 
