@@ -57,8 +57,8 @@ flake-filter, the strong-catch assessment, and reporting) **offline** — but **
   findings, block nothing — until its strong-catch calls earn trust on your codebase. The findings
   gate (`--fail-on-catch`) is opt-in, thresholded, and has a baseline file for known catches.
 - **Plain open source.** Apache-2.0. No SaaS backend, no account, no telemetry (the sandbox even
-  strips `SENTRY_DSN`/token-style vars from test commands). Diff context goes to the one LLM provider
-  *you* configure — or to no network at all in the default mock mode.
+  strips `SENTRY_DSN`/token-style vars from every command it runs). Diff context goes to the one LLM
+  provider *you* configure — or to no network at all in the default mock mode.
 
 **It isn't:**
 
@@ -69,7 +69,7 @@ flake-filter, the strong-catch assessment, and reporting) **offline** — but **
   code is; treat findings as "a reviewer should look here".
 - **Free to run for real.** Mock mode (the default everywhere, including the demo) costs nothing but
   proves the pipeline, not generation quality. Real runs make provider API calls you pay for — bounded
-  by `--max-tests` (default 20) and hard timeouts, with no silent retries
+  by `--max-tests` (default 20) and hard timeouts, with no automatic retries
   ([user guide → cost, data, and egress](docs/user-guide.md#operating-a-real-provider-cost-data-and-egress)).
   You choose the provider and hold the key.
 - **Network-isolated on every host.** The isolating sandbox backends (bwrap / firejail /
