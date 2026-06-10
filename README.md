@@ -197,7 +197,8 @@ OpenAI-compatible, and local servers (Ollama/LM Studio) — are opt-in via trust
 with the API key read only from an environment variable named by that config (see
 [user guide → Real LLM providers](docs/user-guide.md#real-llm-providers)). `./scripts/check.sh` is the
 always-offline gate; `./scripts/audit.sh` is the separate supply-chain audit (config in
-[`deny.toml`](deny.toml)).
+[`deny.toml`](deny.toml)), which CI also runs weekly and on every dependency change
+([supply-chain.yml](.github/workflows/supply-chain.yml)).
 
 ## Documentation
 

@@ -171,8 +171,9 @@ exfiltrate env".
   rejects obviously dangerous constructs before execution.
 
 ### 8. Supply chain
-- Ours: pinned `Cargo.lock` + `.bazelversion`; `cargo audit` + `cargo deny` (F10); vendored where
-  practical.
+- Ours: pinned `Cargo.lock` + `.bazelversion`; `cargo audit` + `cargo deny` (F10) via
+  `./scripts/audit.sh`, run in CI on a weekly schedule and on every `Cargo.lock`/`deny.toml` change
+  ([supply-chain.yml](../.github/workflows/supply-chain.yml)); vendored where practical.
 - Toolchain images: **digest-pinned** (not floating `node`/`python` tags); frozen lockfiles; offline
   caches. Any dependency fetch is a **single explicit, trusted fetch phase** — not implicit during
   sandboxed execution (which stays no-network). ([ADR-0009](decisions/0009-hermetic-toolchains-ci.md))

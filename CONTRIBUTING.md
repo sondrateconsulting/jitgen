@@ -58,6 +58,10 @@ fetches the RustSec advisory database:
 ./scripts/audit.sh    # cargo audit + cargo deny (advisories, licenses, bans, sources)
 ```
 
+CI runs the same script weekly and on every `Cargo.lock`/`Cargo.toml`/`deny.toml` change
+([supply-chain.yml](.github/workflows/supply-chain.yml)), so a PR that bumps a dependency gets
+audited automatically.
+
 If your change adds or bumps a crate, you must also **repin the Bazel lockfile** so
 `--lockfile_mode=error` keeps passing — see
 [troubleshooting.md](docs/troubleshooting.md#bazel-environment-variables-the-extension-depends-on-have-changed-after-adding-a-crate).
