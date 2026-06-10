@@ -147,11 +147,13 @@ impl Backend {
             Backend::Firejail => Some(SILENT_DEGRADATION_MARKERS_FIREJAIL),
             // `None` here is a security claim ("this backend cannot silently fail open"), so the
             // arms are enumerated without a wildcard: adding a backend is a compile error until its
-            // degradation behavior is decided explicitly.
+            // degradation behavior is decided explicitly. NetnsHelper (util-linux `unshare`) fails
+            // loudly with a nonzero exit when it cannot create the namespaces — no passthrough mode.
             Backend::Bwrap
             | Backend::SandboxExec
             | Backend::Docker
             | Backend::Podman
+            | Backend::NetnsHelper
             | Backend::ConstrainedLocal => None,
         }
     }

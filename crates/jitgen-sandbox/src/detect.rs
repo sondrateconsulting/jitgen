@@ -250,6 +250,7 @@ mod tests {
         let out = probe(
             "/bin/sh",
             &["-c", "echo hi >&2; (sleep 600 &) ; exit 0"],
+            false,
             PROBE_TIMEOUT,
         );
         assert!(out.success, "leader exited 0: {out:?}");
