@@ -328,8 +328,8 @@ mod tests {
         assert_eq!(res.outcome, jitgen_core::ExecOutcome::Passed, "{res:?}");
         assert_eq!(res.stdout, "hi");
 
-        // Denies network: the same sentinel probe the conformance suite uses (tool-existence
-        // checked, so a toolless host skips instead of vacuously passing).
+        // Denies network: the same sentinel probe the conformance suite uses. A toolless host
+        // (no nc/bash) skips LOUDLY below — never silently green without the denial assertion.
         let script = "\
             if command -v nc >/dev/null 2>&1; then \
                 nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
@@ -348,12 +348,18 @@ mod tests {
                 run_as: None,
             })
             .unwrap();
-        if !res.stdout.contains("NO_PROBE_TOOL") {
-            assert!(
-                res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
-                "netns helper must deny network; got {res:?}"
+        if res.stdout.contains("NO_PROBE_TOOL") {
+            eprintln!(
+                "SKIP netns network-denial check: host has neither nc nor bash to probe with \
+                 (execution half already verified)"
             );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
         }
+        assert!(
+            res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+            "netns helper must deny network; got {res:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
