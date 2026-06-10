@@ -105,8 +105,11 @@ fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
     Some(Sandbox::new(&[backend], policy).unwrap())
 }
 
+/// Outbound connect timeout (seconds) bounding both probe branches (`nc -w` and `timeout bash`).
+const PROBE_CONNECT_TIMEOUT_SECS: u32 = 3;
+
 /// Gate-1 probe shared by the bwrap, firejail, and Docker network-denial gates (the sandbox-exec
-/// gate uses its own python3 probe). Picks a connect tool that actually EXISTS in the sandboxed
+/// gate uses its own python3 probe). Picks a connect tool that actually EXISTS in the probed
 /// environment, then attempts an outbound TCP connect. Distinguishes "denied" from "no probe tool"
 /// so a toolless environment can't masquerade as a passing network-denial test (T1/F7 P3). Emits a
 /// sentinel word; callers assert on it (not on exit).
@@ -118,29 +121,49 @@ fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
 /// without `/dev/tcp`) exit nonzero unconditionally, which the control probe in
 /// [`assert_network_denied`] converts into a loud failure instead of a false pass.
 ///
+/// The script resolves its tools ITSELF, by absolute path across [`TRUSTED_PATH_DIRS`] in order —
+/// `PATH` plays no role. That makes the control run and the sandboxed run pick the IDENTICAL
+/// binary on the same filesystem by construction (host fs for bwrap/firejail, image fs for
+/// Docker), so the control's `NET_OK` baselines exactly the variant the sandboxed probe will use;
+/// with `command -v` the two could resolve different `nc`s through their differing `PATH`s.
+///
 /// The bash fallback needs `timeout`: `/dev/tcp` has no connect timeout of its own, so on a
 /// packet-DROPPING (not rejecting) host a control run would otherwise block the test process
 /// indefinitely. bash-without-timeout reads as `NO_PROBE_TOOL` (fail loud, not hang).
-const NET_PROBE_SCRIPT: &str = "\
-    if command -v nc >/dev/null 2>&1; then \
-        nc -z -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-    elif command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then \
-        timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-    else echo NO_PROBE_TOOL; fi";
+fn net_probe_script() -> String {
+    let dirs = TRUSTED_PATH_DIRS.join(" ");
+    let t = PROBE_CONNECT_TIMEOUT_SECS;
+    format!(
+        "nc=; bash=; to=; \
+         for d in {dirs}; do \
+             [ -n \"$nc\" ] || [ ! -x \"$d/nc\" ] || nc=\"$d/nc\"; \
+             [ -n \"$bash\" ] || [ ! -x \"$d/bash\" ] || bash=\"$d/bash\"; \
+             [ -n \"$to\" ] || [ ! -x \"$d/timeout\" ] || to=\"$d/timeout\"; \
+         done; \
+         if [ -n \"$nc\" ]; then \
+             \"$nc\" -z -w {t} 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+         elif [ -n \"$bash\" ] && [ -n \"$to\" ]; then \
+             \"$to\" {t} \"$bash\" -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 \
+                 && echo NET_OK || echo NET_DENIED; \
+         else echo NO_PROBE_TOOL; fi"
+    )
+}
 
-/// Where [`assert_network_denied`] runs its control probe — the same [`NET_PROBE_SCRIPT`],
-/// OUTSIDE the sandbox, in the same userland the sandboxed probe will see.
+/// Where [`assert_network_denied`] runs its control probe — the same [`net_probe_script`],
+/// OUTSIDE the sandbox, on the same filesystem the sandboxed probe will see (the script resolves
+/// its own tools by absolute path, so both runs use the identical binaries).
 enum ControlProbe<'a> {
-    /// Directly on the host: bwrap/firejail sandbox the host's own filesystem, so the host
-    /// baselines the same nc/bash the sandboxed probe picks (the sandboxed env's `PATH` is the
-    /// parent `PATH` filtered by `build_env`; the control pins [`TRUSTED_PATH_DIRS`], where the
-    /// standard tools live on any real host).
+    /// Directly on the host: bwrap/firejail sandbox the host's own filesystem (`--ro-bind / /` /
+    /// `--read-only=/`), so a host control probes the very same tool binaries.
     Host,
     /// Inside the same digest-pinned image with Docker's default (unrestricted) networking,
     /// mirroring `plan_container`'s discipline: pinned `--entrypoint` (an image `ENTRYPOINT` must
     /// not be able to intercept the probe or fake its sentinel), `--pull=never` (the suite's
-    /// never-pull-during-a-test rule), and the same validated non-root `--user` as the sandboxed
-    /// run. Only the network restriction is dropped — that is the variable under test.
+    /// never-pull-during-a-test rule), the same validated non-root `--user` as the sandboxed run,
+    /// and the same network-independent confinement (`--read-only`, `--cap-drop ALL`,
+    /// `no-new-privileges`). Deliberate deltas from the sandboxed run: default networking (the
+    /// variable under test), no overlay mount (nothing to write), and no resource limits (the
+    /// control is bounded by [`CONTROL_DEADLINE`] instead).
     Docker { image: &'a str, user: &'a str },
 }
 
@@ -158,13 +181,24 @@ const TRUSTED_PATH_DIRS: &[&str] = &[
 ];
 
 /// Resolve a bare launcher name across [`TRUSTED_PATH_DIRS`] (mirror of the non-public
-/// `which::resolve_trusted` bare-name arm; `is_file` stands in for its executable check — close
-/// enough for a test helper whose failure is a loud panic, not a fail-open).
+/// `which::resolve_trusted` bare-name arm, including its executable-bit check).
 fn resolve_trusted_for_control(program: &str) -> Option<PathBuf> {
+    #[cfg(unix)]
+    fn is_executable_file(p: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(p) {
+            Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    fn is_executable_file(p: &Path) -> bool {
+        p.is_file()
+    }
     TRUSTED_PATH_DIRS
         .iter()
         .map(|d| Path::new(d).join(program))
-        .find(|c| c.is_file())
+        .find(|c| is_executable_file(c))
 }
 
 /// Hard deadline for one control run: generously above the probe's own 3s connect bound, low
@@ -220,20 +254,20 @@ fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::pro
     }
 }
 
-/// Run [`NET_PROBE_SCRIPT`] outside the sandbox per `control` and return its raw output.
+/// Run [`net_probe_script`] outside the sandbox per `control` and return its raw output.
 ///
 /// Env discipline mirrors production `run()` (which spawns every launcher with
 /// `env_clear().envs(&plan.env)`): the control process gets a cleared env with `PATH` pinned to
-/// [`TRUSTED_PATH_DIRS`], so neither the docker CLI nor the probe tools can be swapped via an
-/// inherited hostile `PATH`, and both control flavors resolve tools identically.
+/// [`TRUSTED_PATH_DIRS`], so the launcher itself cannot be influenced by an inherited hostile
+/// env. The probe script does not consult `PATH` at all (it self-resolves its tools).
 fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output {
-    let trusted_path = TRUSTED_PATH_DIRS.join(":");
+    let script = net_probe_script();
     let mut cmd = match control {
         ControlProbe::Host => {
             // `/bin/sh` is a literal absolute path inside a trusted dir (the same form
             // `resolve_trusted` accepts) — the launcher itself cannot come from `PATH`.
             let mut c = std::process::Command::new("/bin/sh");
-            c.args(["-c", NET_PROBE_SCRIPT]);
+            c.args(["-c", &script]);
             c
         }
         ControlProbe::Docker { image, user } => {
@@ -241,21 +275,28 @@ fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output
                 panic!("{what}: docker not found in any trusted bin dir for the control probe")
             });
             let mut c = std::process::Command::new(docker);
-            // Argument shape mirrors `plan_container`: options, `--user`, `-e`, `--entrypoint`,
-            // image, then the entrypoint's args. The in-container PATH is pinned the same way as
-            // the control process's own, so `command -v` resolves from the image's standard dirs.
-            c.args(["run", "--rm", "--pull=never", "--user", user]);
-            c.args(["-e", &format!("PATH={trusted_path}")]);
-            c.args(["--entrypoint", "/bin/sh", image, "-c", NET_PROBE_SCRIPT]);
+            // Argument shape mirrors `plan_container`: options, `--user`, `--entrypoint`, image,
+            // then the entrypoint's args (see `ControlProbe::Docker` for the deliberate deltas).
+            c.args(["run", "--rm", "--pull=never", "--read-only"]);
+            c.args(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"]);
+            c.args([
+                "--user",
+                user,
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                &script,
+            ]);
             c
         }
     };
     cmd.env_clear();
-    cmd.env("PATH", &trusted_path);
+    cmd.env("PATH", TRUSTED_PATH_DIRS.join(":"));
     output_with_deadline(&mut cmd, what)
 }
 
-/// Run [`NET_PROBE_SCRIPT`] under `sb` and assert egress is denied; fail loudly when the sandboxed
+/// Run [`net_probe_script`] under `sb` and assert egress is denied; fail loudly when the sandboxed
 /// environment offers no probe tool — an unverifiable gate must not read as a passing one.
 ///
 /// A control run of the same probe OUTSIDE the sandbox must report `NET_OK` first: the pass
@@ -286,7 +327,7 @@ fn assert_network_denied(
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), NET_PROBE_SCRIPT.into()]);
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), net_probe_script()]);
     let res = exec_as(sb, &cmd, fx, run_as);
     assert!(
         !res.stdout.contains("NO_PROBE_TOOL"),
