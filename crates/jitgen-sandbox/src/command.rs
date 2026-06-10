@@ -119,7 +119,10 @@ fn is_digest_pinned(image: &str) -> bool {
 /// Whether `s` is a **non-root** `<digits>:<digits>` uid:gid pair (for the container `--user` flag).
 /// uid `0` is rejected: the non-root invariant is the whole point of `--user` here, so `0:0` (and any
 /// all-zero uid like `00`) must not pass (T1/F7 P3). `current_uid_gid` likewise refuses root.
-fn is_uid_gid(s: &str) -> bool {
+///
+/// `pub` only for the hidden `crate::test_support` re-export (the conformance suite validates its
+/// `JITGEN_TEST_DOCKER_UID_GID` override with this exact gate); the module itself stays private.
+pub fn is_uid_gid(s: &str) -> bool {
     match s.split_once(':') {
         Some((uid, gid)) => {
             let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
@@ -442,6 +445,40 @@ fn plan_local(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPla
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Direct regression table for the non-root `--user` gate. The conformance suite's Docker
+    /// control probe consumes this exact predicate (via `test_support`), so its accept/reject
+    /// boundary is pinned here where it runs in CI — the live gates are all `#[ignore]`d.
+    #[test]
+    fn is_uid_gid_accepts_only_nonroot_numeric_pairs() {
+        // Accepted: both fields non-empty all-digits, uid with at least one non-`0` digit.
+        // gid `0` is allowed — the non-root invariant is about the uid.
+        for ok in ["1000:1000", "1:1", "1000:0", "010:0"] {
+            assert!(is_uid_gid(ok), "{ok} must be accepted");
+        }
+        // Rejected: any all-zero uid spelling (the old conformance guard accepted "00:500" —
+        // `!starts_with("0:")` cannot see leading zeros), non-digit or empty fields, missing
+        // colon, extra separators, whitespace.
+        for bad in [
+            "",
+            ":",
+            "0:0",
+            "00:500",
+            "0:1000",
+            "1000:users",
+            "root:root",
+            "1000:",
+            ":1000",
+            "1000",
+            "1000:10:10",
+            " 1000:1000",
+            "1000:1000 ",
+            "+1:1",
+            "0x10:10",
+        ] {
+            assert!(!is_uid_gid(bad), "{bad:?} must be rejected");
+        }
+    }
 
     fn env() -> BTreeMap<String, String> {
         [("PATH", "/usr/bin"), ("HOME", "/state/home")]

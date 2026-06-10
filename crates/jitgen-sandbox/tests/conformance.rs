@@ -11,12 +11,21 @@
 //! # bwrap/firejail gates need a Linux host with the launcher installed (they skip elsewhere).
 //! ```
 //!
-//! Only the crate's public API is used (these run as a separate integration binary).
+//! Only the crate's public surface is used (these run as a separate integration binary); the
+//! production internals the control probe needs for exact parity come through the hidden
+//! `test_support` re-exports (see `lib.rs`).
 //!
 //! Note: the Docker helpers/tests are gated behind `#[ignore]` but must still compile cleanly under
 //! `-D warnings`; they are referenced by the ignored tests below, so they are never dead code.
 
 use jitgen_core::{ExecOutcome, ExecutionResult, SandboxBackend};
+// The PRODUCTION trusted-launcher items themselves (hidden, test-only re-exports — see `lib.rs`):
+// the control probe must resolve `docker` and its tools with exactly production's discipline
+// (`resolve_trusted` over `TRUSTED_BIN_DIRS`, never the inherited `PATH`), and the
+// `JITGEN_TEST_DOCKER_UID_GID` override must satisfy exactly the gate `plan_container` applies
+// (`is_uid_gid`). Using the production items directly — instead of test-local mirror copies —
+// makes drift impossible by construction.
+use jitgen_sandbox::test_support::{is_uid_gid, resolve_trusted, TRUSTED_BIN_DIRS};
 use jitgen_sandbox::{current_uid_gid, Backend, ExecPolicy, RunRequest, Sandbox, SpawnRequest};
 use std::path::{Path, PathBuf};
 
@@ -121,17 +130,19 @@ const PROBE_CONNECT_TIMEOUT_SECS: u32 = 3;
 /// without `/dev/tcp`) exit nonzero unconditionally, which the control probe in
 /// [`assert_network_denied`] converts into a loud failure instead of a false pass.
 ///
-/// The script resolves its tools ITSELF, by absolute path across [`TRUSTED_PATH_DIRS`] in order —
-/// `PATH` plays no role. That makes the control run and the sandboxed run pick the IDENTICAL
-/// binary on the same filesystem by construction (host fs for bwrap/firejail, image fs for
-/// Docker), so the control's `NET_OK` baselines exactly the variant the sandboxed probe will use;
-/// with `command -v` the two could resolve different `nc`s through their differing `PATH`s.
+/// The script resolves its tools ITSELF, by absolute path across the production `TRUSTED_BIN_DIRS`
+/// in order — `PATH` plays no role. That makes the control run and the sandboxed run pick the
+/// IDENTICAL binary on the same filesystem by construction (host fs for bwrap/firejail, image fs
+/// for Docker), so the control's `NET_OK` baselines exactly the variant the sandboxed probe will
+/// use; with `command -v` the two could resolve different `nc`s through their differing `PATH`s.
+/// (Entries are literal absolute paths without spaces or glob characters, so interpolating them
+/// into the unquoted `for` list below is exact.)
 ///
 /// The bash fallback needs `timeout`: `/dev/tcp` has no connect timeout of its own, so on a
 /// packet-DROPPING (not rejecting) host a control run would otherwise block the test process
 /// indefinitely. bash-without-timeout reads as `NO_PROBE_TOOL` (fail loud, not hang).
 fn net_probe_script() -> String {
-    let dirs = TRUSTED_PATH_DIRS.join(" ");
+    let dirs = TRUSTED_BIN_DIRS.join(" ");
     let t = PROBE_CONNECT_TIMEOUT_SECS;
     format!(
         "nc=; bash=; to=; \
@@ -149,6 +160,77 @@ fn net_probe_script() -> String {
     )
 }
 
+// ---- CI-runnable probe-script checks (NOT `#[ignore]`d) ------------------------------------
+// The live gates above/below only run on a manual host invocation, so a structural or syntax
+// regression in the generated script would otherwise surface only there — as a confusing control
+// failure. These three pin the script's contract in every `cargo test` / `bazel test` run.
+
+/// The script's load-bearing pieces are present: all three sentinels, the `-z` connect-report-
+/// close flag with the interpolated timeout (losing `-z` reintroduces the idle-timeout false
+/// `NET_DENIED` this probe exists to prevent), the `timeout`-wrapped bash fallback, and every
+/// production trusted dir in the self-resolution scan.
+#[test]
+fn net_probe_script_is_structurally_sound() {
+    let s = net_probe_script();
+    for sentinel in ["echo NET_OK", "echo NET_DENIED", "echo NO_PROBE_TOOL"] {
+        assert!(s.contains(sentinel), "missing {sentinel:?} in: {s}");
+    }
+    let t = PROBE_CONNECT_TIMEOUT_SECS;
+    assert!(
+        s.contains(&format!("-z -w {t} ")),
+        "nc must use -z with the {t}s connect bound: {s}"
+    );
+    assert!(
+        s.contains(&format!("\"$to\" {t} \"$bash\"")),
+        "bash /dev/tcp fallback must be wrapped in `timeout {t}`: {s}"
+    );
+    for d in TRUSTED_BIN_DIRS {
+        assert!(s.contains(d), "probe script must scan trusted dir {d}: {s}");
+    }
+}
+
+/// `sh -n` parses without executing: a quoting/syntax regression in the `format!`-built script
+/// fails HERE, in CI, instead of as a live-gate control failure (no network, no probe tools
+/// needed — every unix host has `/bin/sh`).
+#[cfg(unix)]
+#[test]
+fn net_probe_script_parses_under_posix_sh() {
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-n", "-c", &net_probe_script()])
+        .output()
+        .expect("spawn /bin/sh -n");
+    assert!(
+        out.status.success(),
+        "probe script failed the sh -n syntax check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Executing the script on the build host must put EXACTLY one sentinel on stdout, alone on its
+/// line — whichever of `NET_OK`/`NET_DENIED`/`NO_PROBE_TOOL` this environment truthfully
+/// produces. All three outcomes are accepted (CI may or may not have egress or tools), so the
+/// test is environment-independent; what it pins is that the script RUNS under `/bin/sh` and
+/// speaks exactly the protocol the gates assert on (bounded by the probe's own connect timeout).
+#[cfg(unix)]
+#[test]
+fn net_probe_script_emits_exactly_one_sentinel_line() {
+    let out = std::process::Command::new("/bin/sh")
+        .args(["-c", &net_probe_script()])
+        .output()
+        .expect("spawn /bin/sh -c");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the script must print its sentinel ALONE on stdout; got {stdout:?}"
+    );
+    assert!(
+        matches!(lines[0].trim(), "NET_OK" | "NET_DENIED" | "NO_PROBE_TOOL"),
+        "not a sentinel line: {stdout:?}"
+    );
+}
+
 /// Where [`assert_network_denied`] runs its control probe — the same [`net_probe_script`],
 /// OUTSIDE the sandbox, on the same filesystem the sandboxed probe will see (the script resolves
 /// its own tools by absolute path, so both runs use the identical binaries).
@@ -162,43 +244,11 @@ enum ControlProbe<'a> {
     /// never-pull-during-a-test rule), the same validated non-root `--user` as the sandboxed run,
     /// and the same network-independent confinement (`--read-only`, `--cap-drop ALL`,
     /// `no-new-privileges`). Deliberate deltas from the sandboxed run: default networking (the
-    /// variable under test), no overlay mount (nothing to write), and no resource limits (the
-    /// control is bounded by [`CONTROL_DEADLINE`] instead).
+    /// variable under test), no overlay mount / `--tmpfs` / `--workdir` (the probe writes
+    /// nothing), no `--name` (nothing to tear down beyond `--rm`), no injected env (the script
+    /// self-resolves its tools), and no resource limits (the control is bounded by
+    /// [`CONTROL_DEADLINE`] instead).
     Docker { image: &'a str, user: &'a str },
-}
-
-/// Mirror of the non-public `which::TRUSTED_BIN_DIRS`: root-owned system bin dirs, in search
-/// order. The control resolves `docker` and its probe tools ONLY from these — never the inherited
-/// `PATH` — matching production's trusted-launcher discipline (`which::resolve_trusted`): a
-/// hostile `PATH` entry must not be able to swap a fake docker/nc into an unsandboxed control run.
-const TRUSTED_PATH_DIRS: &[&str] = &[
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
-    "/usr/local/bin",
-    "/opt/homebrew/bin",
-];
-
-/// Resolve a bare launcher name across [`TRUSTED_PATH_DIRS`] (mirror of the non-public
-/// `which::resolve_trusted` bare-name arm, including its executable-bit check).
-fn resolve_trusted_for_control(program: &str) -> Option<PathBuf> {
-    #[cfg(unix)]
-    fn is_executable_file(p: &Path) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        match std::fs::metadata(p) {
-            Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(unix))]
-    fn is_executable_file(p: &Path) -> bool {
-        p.is_file()
-    }
-    TRUSTED_PATH_DIRS
-        .iter()
-        .map(|d| Path::new(d).join(program))
-        .find(|c| is_executable_file(c))
 }
 
 /// Hard deadline for one control run: generously above the probe's own 3s connect bound, low
@@ -207,8 +257,11 @@ const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60)
 
 /// `Command::output()` with [`CONTROL_DEADLINE`]: on overrun the child is killed and the gate
 /// panics loudly — a control must never be able to hang an `#[ignore]`d gate indefinitely.
+///
+/// Pipe read errors are control failures in their own right: they are reported as such instead of
+/// being swallowed, where the resulting empty output would misread downstream as "no egress / no
+/// probe tool" and send whoever runs the gate chasing the wrong cause.
 fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::process::Output {
-    use std::io::Read;
     use std::process::Stdio;
     let mut child = cmd
         .stdin(Stdio::null())
@@ -217,19 +270,19 @@ fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::pro
         .spawn()
         .expect("control probe failed to spawn");
     // Drain both pipes on reader threads so a chatty child can never block on a full pipe and
-    // defeat the deadline below; the threads see EOF once the child exits (or is killed).
-    let mut out_pipe = child.stdout.take().expect("control stdout piped");
-    let mut err_pipe = child.stderr.take().expect("control stderr piped");
-    let out_thread = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = out_pipe.read_to_end(&mut v);
-        v
-    });
-    let err_thread = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = err_pipe.read_to_end(&mut v);
-        v
-    });
+    // defeat the deadline below; the threads see EOF once the child exits (or is killed). Each
+    // returns (bytes read so far, read result) — the bytes survive even when the read errors.
+    fn drain(
+        mut pipe: impl std::io::Read + Send + 'static,
+    ) -> std::thread::JoinHandle<(Vec<u8>, std::io::Result<()>)> {
+        std::thread::spawn(move || {
+            let mut v = Vec::new();
+            let res = pipe.read_to_end(&mut v).map(|_| ());
+            (v, res)
+        })
+    }
+    let out_thread = drain(child.stdout.take().expect("control stdout piped"));
+    let err_thread = drain(child.stderr.take().expect("control stderr piped"));
     let deadline = std::time::Instant::now() + CONTROL_DEADLINE;
     let status = loop {
         match child.try_wait().expect("control probe wait failed") {
@@ -237,20 +290,54 @@ fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::pro
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                // The child is dead and reaped, so its pipe ends are closed: give the readers a
+                // short grace to hit EOF, then join them — surfacing whatever the child managed
+                // to say (the difference between "docker never answered" and "docker printed
+                // half an error, then wedged" is what makes this diagnosable) and leaving no
+                // reader thread running past the panic. The fallback exists only for a
+                // pathological grandchild that inherited the pipes and outlived the kill: panic
+                // without the partial output rather than trade a loud panic for a hang.
+                let grace = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while (!out_thread.is_finished() || !err_thread.is_finished())
+                    && std::time::Instant::now() < grace
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let (out_partial, err_partial) =
+                    if out_thread.is_finished() && err_thread.is_finished() {
+                        let (o, _) = out_thread.join().expect("control stdout reader");
+                        let (e, _) = err_thread.join().expect("control stderr reader");
+                        (o, e)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
                 panic!(
-                    "{what}: CONTROL probe did not finish within {}s and was killed; a wedged \
-                     docker daemon or a black-holing network can cause this. This is a control \
-                     failure, NOT a sandbox-isolation failure — fix the environment and rerun",
-                    CONTROL_DEADLINE.as_secs()
+                    "{what}: CONTROL probe did not finish within {}s and was killed (stdout so \
+                     far {:?}, stderr so far {:?}); a wedged docker daemon or a black-holing \
+                     network can cause this. This is a control failure, NOT a sandbox-isolation \
+                     failure — fix the environment and rerun",
+                    CONTROL_DEADLINE.as_secs(),
+                    String::from_utf8_lossy(&out_partial),
+                    String::from_utf8_lossy(&err_partial),
                 );
             }
             None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     };
+    let (stdout, out_res) = out_thread.join().expect("control stdout reader");
+    let (stderr, err_res) = err_thread.join().expect("control stderr reader");
+    for (pipe, res) in [("stdout", out_res), ("stderr", err_res)] {
+        if let Err(e) = res {
+            panic!(
+                "{what}: CONTROL probe {pipe} pipe read failed ({e}); its output cannot be \
+                 trusted. This is a control failure, NOT a sandbox-isolation failure — rerun"
+            );
+        }
+    }
     std::process::Output {
         status,
-        stdout: out_thread.join().expect("control stdout reader"),
-        stderr: err_thread.join().expect("control stderr reader"),
+        stdout,
+        stderr,
     }
 }
 
@@ -258,8 +345,8 @@ fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::pro
 ///
 /// Env discipline mirrors production `run()` (which spawns every launcher with
 /// `env_clear().envs(&plan.env)`): the control process gets a cleared env with `PATH` pinned to
-/// [`TRUSTED_PATH_DIRS`], so the launcher itself cannot be influenced by an inherited hostile
-/// env. The probe script does not consult `PATH` at all (it self-resolves its tools).
+/// the production `TRUSTED_BIN_DIRS`, so the launcher itself cannot be influenced by an inherited
+/// hostile env. The probe script does not consult `PATH` at all (it self-resolves its tools).
 fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output {
     let script = net_probe_script();
     let mut cmd = match control {
@@ -271,7 +358,9 @@ fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output
             c
         }
         ControlProbe::Docker { image, user } => {
-            let docker = resolve_trusted_for_control("docker").unwrap_or_else(|| {
+            // The PRODUCTION resolver itself (via `test_support`): a hostile `PATH` entry must
+            // not be able to swap a fake docker into an unsandboxed control run.
+            let docker = resolve_trusted("docker").unwrap_or_else(|| {
                 panic!("{what}: docker not found in any trusted bin dir for the control probe")
             });
             let mut c = std::process::Command::new(docker);
@@ -292,7 +381,7 @@ fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output
         }
     };
     cmd.env_clear();
-    cmd.env("PATH", TRUSTED_PATH_DIRS.join(":"));
+    cmd.env("PATH", TRUSTED_BIN_DIRS.join(":"));
     output_with_deadline(&mut cmd, what)
 }
 
@@ -373,30 +462,21 @@ fn docker_sandbox(image: String) -> Option<Sandbox> {
     Some(Sandbox::new(&[Backend::Docker], policy).unwrap())
 }
 
-/// Mirror of the production `is_uid_gid` gate (`command.rs`): both fields all-digit and
-/// non-empty, uid non-root (at least one non-`0` digit). Keeps the override — and therefore the
-/// control probe's `--user` — identical to what `plan_container` will accept for the sandboxed
-/// run (e.g. `1000:users` or `00:500` must not run the control under a user the real run rejects).
-fn is_nonroot_uid_gid(v: &str) -> bool {
-    match v.split_once(':') {
-        Some((uid, gid)) => {
-            let digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
-            digits(uid) && digits(gid) && uid.bytes().any(|b| b != b'0')
-        }
-        None => false,
-    }
-}
-
 /// The non-root `uid:gid` to run containers as: `current_uid_gid()` for a normal user, or the
 /// `JITGEN_TEST_DOCKER_UID_GID` override for a root CI context (where `current_uid_gid()` returns
 /// `None` by design). `None` means "no non-root user available" → the caller skips loudly rather than
 /// panicking on `MissingContainerUser` (T2/F7 P4).
+///
+/// The override is validated with the PRODUCTION `is_uid_gid` gate itself (via `test_support`), so
+/// the accepted value — and therefore the control probe's `--user` — is exactly what
+/// `plan_container` will accept for the sandboxed run; its accept/reject boundary is pinned by the
+/// CI-run regression table in `command.rs`.
 fn test_uid_gid() -> Option<String> {
     if let Some(u) = current_uid_gid() {
         return Some(u);
     }
     match std::env::var("JITGEN_TEST_DOCKER_UID_GID") {
-        Ok(v) if is_nonroot_uid_gid(&v) => Some(v),
+        Ok(v) if is_uid_gid(&v) => Some(v),
         _ => {
             eprintln!(
                 "SKIP docker test: running as root and no JITGEN_TEST_DOCKER_UID_GID=<nonroot uid:gid>"
