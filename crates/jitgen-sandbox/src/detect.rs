@@ -48,28 +48,42 @@ pub fn netns_helper_available() -> bool {
 }
 
 fn available(backend: Backend) -> bool {
-    match backend.availability_probe() {
-        // No probe (constrained-local): never auto-detected.
+    match probe_backend(backend) {
+        Some(outcome) => probe_is_available(backend, &outcome),
         None => false,
-        // Resolve the launcher from a trusted system dir, never the inherited `PATH` — otherwise a
-        // fake `docker`/`sandbox-exec` planted on `PATH` could pass the probe and be deemed
-        // "available", later running the inner command with no isolation (S2/F7 P1).
-        Some((program, args)) => match crate::which::resolve_trusted(program) {
-            Some(abs) => {
-                // Container probes keep the ambient env: `DOCKER_HOST`/`DOCKER_CONFIG` (and the
-                // Podman equivalents) are how an operator points the client at their daemon, and
-                // stripping them would mis-report a working daemon as unavailable. Every other
-                // probe argv is static and env-independent, so it runs env-cleared — probe
-                // hygiene matching the run path's `env_clear()` (no ambient secrets handed to a
-                // child we merely spawn for an exit code).
-                let inherit_env = backend.tier() == crate::backend::Tier::Container;
-                probe_is_available(
-                    backend,
-                    &probe(&abs.to_string_lossy(), args, inherit_env, PROBE_TIMEOUT),
-                )
-            }
-            None => false,
-        },
+    }
+}
+
+/// Run a backend's availability probe, resolving its launcher from a trusted system dir, never the
+/// inherited `PATH` — otherwise a fake `docker`/`sandbox-exec` planted on `PATH` could pass the probe
+/// and be deemed "available", later running the inner command with no isolation (S2/F7 P1). `None`
+/// when the backend has no probe (constrained-local) or its launcher can't be trusted-resolved.
+fn probe_backend(backend: Backend) -> Option<ProbeOutcome> {
+    let (program, args) = backend.availability_probe()?;
+    let abs = crate::which::resolve_trusted(program)?;
+    // Container probes keep the ambient env: `DOCKER_HOST`/`DOCKER_CONFIG` (and the Podman
+    // equivalents) are how an operator points the client at their daemon, and stripping them
+    // would mis-report a working daemon as unavailable. Every other probe argv is static and
+    // env-independent, so it runs env-cleared — probe hygiene matching the run path's
+    // `env_clear()` (no ambient secrets handed to a child we merely spawn for an exit code).
+    let inherit_env = backend.tier() == crate::backend::Tier::Container;
+    Some(probe(&abs.to_string_lossy(), args, inherit_env, PROBE_TIMEOUT))
+}
+
+/// Whether `backend` would run a command **without sandboxing while exiting 0** right now — i.e. it
+/// has a silent-degradation mode (firejail) AND a fresh functional probe shows it degrading. Used by
+/// [`crate::run`] as a PRE-execution guard so a degrading firejail is refused before any untrusted
+/// command runs (closing the detect→run window). Short-circuits to `false` with no spawn when the
+/// launcher can't be trusted-resolved (the real run would then fail to spawn anyway).
+pub(crate) fn backend_silently_degrades(backend: Backend) -> bool {
+    if !backend.has_silent_degradation_mode() {
+        return false;
+    }
+    match probe_backend(backend) {
+        Some(outcome) => {
+            outcome.success && backend.stderr_shows_silent_degradation(&outcome.stderr)
+        }
+        None => false,
     }
 }
 
@@ -93,26 +107,28 @@ fn probe_is_available(backend: Backend, outcome: &ProbeOutcome) -> bool {
 
 /// Spawn `program args` with stdout discarded, stderr captured (bounded), and a wall-clock bound;
 /// runs env-cleared unless `inherit_env` (container probes keep the operator's daemon-pointing
-/// vars — see the call site in [`available`]). A spawn failure, nonzero exit, or timeout all yield
-/// `success: false`.
+/// vars — see the call site in [`probe_backend`]). A spawn failure, nonzero exit, or timeout all
+/// yield `success: false`.
 ///
-/// stderr is read **after** the child is reaped. This cannot deadlock for our probes: every probe
-/// argv (`/bin/true` under a launcher, `docker version`) emits at most a short line to stderr — far
-/// below the OS pipe buffer — so the child never blocks on a full, unread stderr pipe. The read is
-/// additionally capped ([`PROBE_STDERR_CAP`]). On timeout the child is killed and whatever stderr was
-/// buffered is still read back.
+/// The child runs in its **own process group**; on timeout the whole group is killed (not just the
+/// direct child), so a launcher that forked a descendant holding the stderr pipe can't keep the
+/// post-reap read blocked past the timeout. stderr is read after the child is reaped — safe because
+/// every shipped probe argv (`/bin/true` under a launcher, `docker version`) emits at most a short
+/// line, and a chatty probe that filled the pipe would block, hit the timeout, and be group-killed
+/// before the read drains the buffered bytes. The read is bounded by [`PROBE_STDERR_CAP`] and uses
+/// `read_to_end` + lossy UTF-8 so a mid-stream read error or invalid UTF-8 keeps the bytes already
+/// read (the degradation marker is the first line) rather than discarding the whole signal.
 fn probe(program: &str, args: &[&str], inherit_env: bool, timeout: Duration) -> ProbeOutcome {
     let mut cmd = Command::new(program);
     if !inherit_env {
         cmd.env_clear();
     }
-    let mut child = match cmd
-        .args(args)
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    crate::run::set_process_group(&mut cmd, true);
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(_) => {
             return ProbeOutcome {
@@ -121,6 +137,7 @@ fn probe(program: &str, args: &[&str], inherit_env: bool, timeout: Duration) -> 
             }
         }
     };
+    let pid = child.id();
     let err_pipe = child.stderr.take();
     let deadline = Instant::now() + timeout;
     let success = loop {
@@ -128,6 +145,9 @@ fn probe(program: &str, args: &[&str], inherit_env: bool, timeout: Duration) -> 
             Ok(Some(status)) => break status.success(),
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    // Kill the whole group, not just the direct child, so a descendant holding the
+                    // stderr pipe can't hang the read below; then reap.
+                    crate::run::kill_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
                     break false;
@@ -137,14 +157,14 @@ fn probe(program: &str, args: &[&str], inherit_env: bool, timeout: Duration) -> 
             Err(_) => break false,
         }
     };
-    let mut stderr = String::new();
+    let mut bytes = Vec::new();
     if let Some(mut pipe) = err_pipe {
-        let _ = pipe
-            .by_ref()
-            .take(PROBE_STDERR_CAP)
-            .read_to_string(&mut stderr);
+        let _ = pipe.by_ref().take(PROBE_STDERR_CAP).read_to_end(&mut bytes);
     }
-    ProbeOutcome { success, stderr }
+    ProbeOutcome {
+        success,
+        stderr: String::from_utf8_lossy(&bytes).into_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +280,19 @@ mod tests {
                 "{b:?} nonzero exit → unavailable"
             );
         }
+    }
+
+    #[test]
+    fn backend_silently_degrades_short_circuits_without_a_marker_mode() {
+        // The run-time pre-execution guard only runs the probe for a degradation-capable backend.
+        // Backends with no silent-degradation mode return false immediately (no spawn).
+        assert!(!backend_silently_degrades(Backend::ConstrainedLocal));
+        assert!(!backend_silently_degrades(Backend::Docker));
+        assert!(!backend_silently_degrades(Backend::Bwrap));
+        // firejail HAS a marker mode; on a host with no trusted `firejail` the probe can't run and it
+        // short-circuits to false (no spawn, no hang) rather than refusing. The positive "degrades →
+        // true" path needs a live containerized firejail and is covered by the manual/conformance test.
+        // Here we only assert it terminates and yields a bool without panicking or blocking.
+        let _: bool = backend_silently_degrades(Backend::Firejail);
     }
 }

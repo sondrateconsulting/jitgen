@@ -149,6 +149,14 @@ impl Backend {
         }
     }
 
+    /// Whether this backend can run a command **without any sandboxing while still exiting 0** (a
+    /// silent fail-open) — i.e. it has [`silent_degradation_markers`](Self::silent_degradation_markers).
+    /// Gates the run-time pre-execution re-probe and the stderr-capture floor so only the affected
+    /// backend (firejail) pays for them.
+    pub(crate) fn has_silent_degradation_mode(self) -> bool {
+        self.silent_degradation_markers().is_some()
+    }
+
     /// Whether `stderr` shows this backend silently degraded to a no-sandbox passthrough (matched
     /// case-insensitively against [`silent_degradation_markers`](Self::silent_degradation_markers)).
     /// The single source of truth shared by the detect-time probe ([`crate::detect`]) and the
