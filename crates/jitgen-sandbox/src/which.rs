@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 /// Root-owned, non-world-writable system binary directories, in search order. A hostile repo cannot
 /// write here without already owning the host. (A symlink *in* one of these dirs — e.g. Docker
 /// Desktop's `/usr/local/bin/docker` — is trusted because the link itself is root-owned.)
-const TRUSTED_BIN_DIRS: &[&str] = &[
+///
+/// `pub` only for the hidden `crate::test_support` re-export (the conformance suite's control
+/// probe scans exactly this list); the module itself stays private.
+pub const TRUSTED_BIN_DIRS: &[&str] = &[
     "/usr/bin",
     "/bin",
     "/usr/sbin",
