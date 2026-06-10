@@ -8,6 +8,16 @@ run state and report formats.
 
 ## [Unreleased]
 
+### Fixed
+- **The documented SBOM verify command now actually verifies after the signing certificate expires.**
+  `cosign verify-attestation` only consults RFC3161 timestamps when the verifier passes
+  `--use-signed-timestamps`; without it the command in `docs/ci.md` failed with *"expected a signed
+  timestamp to verify an expired certificate"* once the ~10-minute Fulcio certificate window had passed
+  (the 0.2.2 verification was run inside that window, which is how the omission slipped through).
+  The flag is now part of the documented command, and the "no extra flags are needed" wording in
+  `docs/ci.md`, `release.yml`, and the 0.2.2 changelog entry has been corrected. Docs only — the
+  v0.2.2 attestations themselves are valid and verify with the corrected command.
+
 ## [0.2.2] — 2026-06-09
 
 ### Changed
@@ -19,7 +29,8 @@ run state and report formats.
   `cosign verify-attestation --insecure-ignore-tlog` failed with *"expected a signed timestamp to verify
   an expired certificate"* — the SBOM was attached but not verifiable. The RFC3161 timestamp is tiny
   (unlike the multi-MB SBOM that overflows a Rekor tlog entry), and its TSA certificate ships in cosign's
-  default trusted root, so verification needs no extra flags. The image signatures were always tlog-backed
+  default trusted root; verifiers opt in to checking it with `--use-signed-timestamps` (corrected
+  post-release — see Unreleased). The image signatures were always tlog-backed
   and unaffected. `docs/ci.md` updated accordingly. (No code change; release-pipeline + docs only.)
 
 ## [0.2.1] — 2026-06-08
