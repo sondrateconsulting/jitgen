@@ -17,8 +17,8 @@
 #
 # Conventions (docs/ci.md / .github/zizmor.yml): every action pinned to a full commit SHA,
 # least-privilege permissions, per-job timeout. No dependency cache, matching the repo's
-# cold-by-design CI stance (zizmor `cache-poisoning`) — this is a correctness lane; cold-build
-# minutes are an acceptable price for an unpoisonable one.
+# cold-by-design CI stance (zizmor `cache-poisoning`) — this is a correctness lane, and with
+# debuginfo off the cold build is fast enough (~42s observed) that a cache buys nothing anyway.
 name: tests
 
 on:
@@ -38,11 +38,14 @@ jobs:
   cargo-test-linux:
     name: cargo test (linux)
     runs-on: ubuntu-latest
-    # Calibration ceiling: the COLD build dominates and the first run of this lane was killed by a
-    # 30m timeout mid-build on the 4-core runner. Tighten once a few green runs establish the real
-    # duration. (A genuine TEST hang is bounded much tighter by the inner `timeout` on the run step
-    # below — this job-level value mostly just bounds the build.)
-    timeout-minutes: 60
+    # Calibrated from a real green run: cold build 42s + tests 14s (~70s job total) — debuginfo off
+    # and no incremental keep even the cold build fast. 15m is ~13x headroom for slow runners or
+    # networks. The job-level timeout is only the backstop: each step carries its own inner
+    # `timeout` (below) so a stall fails THAT step with its log intact — this lane's very first run
+    # stalled ~30m (infrastructure; the same tree ran the full suite clean in a local Linux
+    # container) and the runner-level cancel dropped the in-flight step's log entirely, which is
+    # exactly the failure mode the inner timeouts exist to avoid.
+    timeout-minutes: 15
     permissions:
       contents: read
     env:
@@ -58,10 +61,11 @@ jobs:
       - name: Build the test binaries (cargo test --no-run)
         # rust-toolchain.toml pins 1.95.0; the runner's rustup installs it on first use (same as
         # release.yml). --locked: a drifted Cargo.lock fails loud instead of silently re-resolving.
-        run: cargo test --workspace --locked --no-run
+        # Inner timeout (TERM, then KILL 30s later if it won't die): a toolchain/crates.io download
+        # stall or build hang fails this step with its log intact instead of riding to the
+        # runner-level cancel. Observed cold build: ~42s.
+        run: timeout --kill-after=30s 12m cargo test --workspace --locked --no-run
       - name: cargo test --workspace (offline mock provider, no key)
-        # Inner timeout, well under the job's timeout-minutes: if a test ever hangs, coreutils
-        # `timeout` fails THIS step while the runner is still healthy, so the log showing which test
-        # was running survives. A runner-level cancel can drop that log (it did on this lane's first
-        # run). TERM first, KILL 30s later if the harness doesn't die.
-        run: timeout --kill-after=30s 20m cargo test --workspace --locked
+        # Same inner-timeout rationale: a hung test fails this step while the runner is still
+        # healthy, so the log showing which test was running survives. Observed: ~14s, 589 tests.
+        run: timeout --kill-after=30s 10m cargo test --workspace --locked
