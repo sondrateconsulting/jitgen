@@ -32,7 +32,7 @@ use jitgen_sandbox::test_support::{
     is_digest_pinned, is_uid_gid, resolve_trusted, TRUSTED_BIN_DIRS,
 };
 use jitgen_sandbox::{current_uid_gid, Backend, ExecPolicy, RunRequest, Sandbox, SpawnRequest};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// A temp overlay+state pair that cleans up on drop. Paths are canonicalized so the SBPL write
 /// subpath matches the real path (macOS temp dirs are commonly symlinked, e.g. `/tmp`→`/private/tmp`).
@@ -122,8 +122,9 @@ fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
 /// Outbound connect timeout (seconds) bounding both probe branches (`nc -w` and `timeout bash`).
 const PROBE_CONNECT_TIMEOUT_SECS: u32 = 3;
 
-/// Gate-1 probe shared by the bwrap, firejail, and Docker network-denial gates (the sandbox-exec
-/// gate uses its own python3 probe). Picks a connect tool that actually EXISTS in the probed
+/// Gate-1 probe shared by the sandbox-exec, bwrap, firejail, and Docker network-denial gates (the
+/// netns-helper gates use their own inline probes — see "Gate 1 (netns-helper)" below). Picks a
+/// connect tool that actually EXISTS in the probed
 /// environment, then attempts an outbound TCP connect. Distinguishes "denied" from "no probe tool"
 /// so a toolless environment can't masquerade as a passing network-denial test (T1/F7 P3). Emits a
 /// sentinel word; callers assert on it (not on exit).
@@ -240,8 +241,9 @@ fn net_probe_script_emits_exactly_one_sentinel_line() {
 /// OUTSIDE the sandbox, on the same filesystem the sandboxed probe will see (the script resolves
 /// its own tools by absolute path, so both runs use the identical binaries).
 enum ControlProbe<'a> {
-    /// Directly on the host: bwrap/firejail sandbox the host's own filesystem (`--ro-bind / /` /
-    /// `--read-only=/`), so a host control probes the very same tool binaries.
+    /// Directly on the host: sandbox-exec, bwrap, and firejail all confine the host's own
+    /// filesystem (SBPL `(allow file-read*)` / `--ro-bind / /` / `--read-only=/`), so a host
+    /// control probes the very same tool binaries.
     Host,
     /// Inside the same digest-pinned image with Docker's default (unrestricted) networking,
     /// mirroring `plan_container`'s discipline: pinned `--entrypoint` (an image `ENTRYPOINT` must
@@ -639,35 +641,29 @@ fn resolve_test_uid_gid_invalid_override_quotes_the_rejected_value() {
     }
 }
 
-/// Gate 1 — network denial. A connect attempt inside the sandbox must fail.
+/// Gate 1 — network denial. The shared probe must report `NET_DENIED` inside sandbox-exec only
+/// after the SAME probe reports `NET_OK` on the host: on an egress-less macOS host
+/// (firewalled/offline) the connect fails outside the sandbox too, so without the control this
+/// gate would pass while sandbox-exec's confinement is unverified. The sentinel match also
+/// replaces the old `assert_ne!(Passed)` direction, which read ANY probe startup failure as
+/// denial.
 #[test]
 #[ignore = "live sandbox; run with --ignored on the host"]
 fn sandbox_exec_denies_network() {
     // Skipping is honest only when the backend itself is absent (non-macOS host). Once
-    // sandbox-exec IS available, a missing probe tool must fail loudly — an unverifiable gate
-    // must not read as a passing one (parity with `assert_network_denied`'s NO_PROBE_TOOL guard).
+    // sandbox-exec IS available, a missing probe tool or a no-egress host must fail loudly via
+    // `assert_network_denied`'s control + NO_PROBE_TOOL guards — an unverifiable gate must not
+    // read as a passing one.
     if !jitgen_sandbox::detect().contains(&Backend::SandboxExec) {
         eprintln!("SKIP sandbox_exec_denies_network: sandbox-exec not available on this host");
         return;
     }
-    assert!(
-        Path::new("/usr/bin/python3").exists(),
-        "sandbox_exec_denies_network: /usr/bin/python3 absent, so network denial cannot be \
-         verified on this sandbox-exec host; install the Xcode Command Line Tools and rerun"
-    );
-    let cmd = SpawnRequest::argv(
-        "/usr/bin/python3",
-        [
-            "-c".into(),
-            "import socket; socket.setdefaulttimeout(3); socket.create_connection(('1.1.1.1',53))"
-                .into(),
-        ],
-    );
-    let res = exec(&sandbox_exec(), &cmd, &Fixture::new("net"));
-    assert_ne!(
-        res.outcome,
-        ExecOutcome::Passed,
-        "network MUST be denied under sandbox-exec; got {res:?}"
+    assert_network_denied(
+        &sandbox_exec(),
+        &Fixture::new("net"),
+        None,
+        "sandbox_exec_denies_network",
+        &ControlProbe::Host,
     );
 }
 
