@@ -35,7 +35,14 @@ pub fn resolve_trusted(program: &str) -> Option<PathBuf> {
         // parent dir is exactly a trusted bin dir. Rejecting `ParentDir`/`CurDir` is essential:
         // `/usr/bin/../../tmp/x` lexically `starts_with("/usr/bin")` yet resolves outside it
         // (T1/F7 P3). We do not canonicalize — the trust anchor is the literal trusted-dir entry.
+        // `has_only_normal_components` alone cannot see an INTERIOR `.` or an empty `//` segment:
+        // `Path::components()` normalizes them away (std-documented), so `/usr/bin/./sh` sails
+        // through the component check and — on usr-merge Linux, where `/usr/bin/sh` exists —
+        // resolves. That is not an escape (the normalized path is still a direct child of a
+        // trusted dir), but the documented contract is the LITERAL form, so enforce it on the raw
+        // string too: every `/`-separated segment after the leading root must be a plain name.
         if p.is_absolute()
+            && has_no_curdir_or_empty_segments(program)
             && has_only_normal_components(p)
             && parent_is_trusted_dir(p)
             && is_executable_file(p)
@@ -55,6 +62,18 @@ fn has_only_normal_components(p: &Path) -> bool {
     use std::path::Component;
     p.components()
         .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+}
+
+/// Raw-string strictness check for an absolute path: no `.` segments, no empty segments (`//`,
+/// trailing `/`). Complements [`has_only_normal_components`], which cannot see these — Rust's
+/// `Path::components()` normalizes interior `.` and duplicate separators away by design.
+fn has_no_curdir_or_empty_segments(program: &str) -> bool {
+    // skip(1): an absolute path's leading `/` yields one empty segment before the root, which is
+    // the only empty segment a well-formed literal path contains.
+    program
+        .split('/')
+        .skip(1)
+        .all(|s| !s.is_empty() && s != ".")
 }
 
 /// Whether `p`'s immediate parent directory is exactly one of the trusted bin dirs (so the launcher
@@ -101,7 +120,39 @@ mod tests {
         // (T1/F7 P3). Also a nested path one level below a trusted dir is refused.
         assert!(resolve_trusted("/usr/bin/../../bin/sh").is_none());
         assert!(resolve_trusted("/usr/bin/sub/sh").is_none());
+        // Interior `.` / empty segments are invisible to `Path::components()` (std normalizes them
+        // away), so these are enforced on the raw string. The `.` case is only OBSERVABLE on hosts
+        // where the normalized target exists (`/usr/bin/sh` on usr-merge Linux — this assertion
+        // passed vacuously on macOS, which has no /usr/bin/sh, and there was no Linux lane to
+        // catch it); `/bin/./sh` and `/bin//sh` normalize to `/bin/sh`, which exists everywhere.
         assert!(resolve_trusted("/usr/bin/./sh").is_none());
+        assert!(resolve_trusted("/bin/./sh").is_none());
+        assert!(resolve_trusted("/bin//sh").is_none());
+        assert!(resolve_trusted("/bin/sh/").is_none());
+        // `//bin` has parent `/bin` (a trusted dir), so the raw-string check is the SOLE gate here.
+        assert!(resolve_trusted("//bin/sh").is_none());
+    }
+
+    /// Direct test of the raw-string predicate. The `resolve_trusted` assertions above can pass
+    /// for filesystem reasons unrelated to the predicate (e.g. `/bin/sh/` fails `metadata` with
+    /// ENOTDIR on macOS; `/usr/bin/./sh` needs usr-merge Linux to be observable at all), so this
+    /// pins the predicate's behavior on every platform with no filesystem involved.
+    #[test]
+    fn raw_segment_check_rejects_curdir_and_empty_segments() {
+        assert!(has_no_curdir_or_empty_segments("/bin/sh"));
+        assert!(has_no_curdir_or_empty_segments("/usr/local/bin/docker"));
+        // `..` segments pass HERE by design — rejecting them is `has_only_normal_components`' job
+        // (Component::ParentDir is NOT normalized away); the two checks are complementary.
+        assert!(has_no_curdir_or_empty_segments("/usr/bin/../sh"));
+
+        assert!(!has_no_curdir_or_empty_segments("/bin/./sh")); // interior `.`
+        assert!(!has_no_curdir_or_empty_segments("/./bin/sh")); // `.` right after root
+        assert!(!has_no_curdir_or_empty_segments("/bin/sh/.")); // trailing `.` segment
+        assert!(!has_no_curdir_or_empty_segments("/bin//sh")); // interior empty segment
+        assert!(!has_no_curdir_or_empty_segments("//bin/sh")); // empty segment right after root
+        assert!(!has_no_curdir_or_empty_segments("/bin/sh/")); // trailing empty segment
+        assert!(!has_no_curdir_or_empty_segments("/")); // bare root: one trailing empty segment
+        assert!(!has_no_curdir_or_empty_segments("/.")); // root + curdir
     }
 
     #[cfg(unix)]
