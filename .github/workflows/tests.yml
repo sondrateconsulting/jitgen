@@ -39,14 +39,16 @@ jobs:
     name: cargo test (linux)
     runs-on: ubuntu-latest
     # Calibrated from a real green run: cold build 42s + tests 14s (~70s job total) — debuginfo off
-    # and no incremental keep even the cold build fast. Each step carries its own inner `timeout`
-    # (below) at ~13x observed headroom, so a stall fails THAT step with its log intact — this
-    # lane's very first run stalled ~30m (infrastructure; the same tree ran the full suite clean in
-    # a local Linux container) and the runner-level cancel dropped the in-flight step's log
-    # entirely, which is exactly the failure mode the inner timeouts exist to avoid. The job
-    # ceiling is only the backstop, by arithmetic: worst-case inner budgets (9m + 3m, plus a 30s
-    # KILL grace each) and checkout sum to under 15m, so an inner timeout always fires before the
-    # runner-level cancel can. Keep that inequality true when recalibrating any of these numbers.
+    # and no incremental keep even the cold build fast. Every step is individually bounded (the
+    # cargo steps by inner coreutils `timeout`s at ~13x observed headroom, checkout by a step-level
+    # timeout-minutes) so a stall fails THAT step instead of riding to the runner-level cancel —
+    # this lane's very first run stalled ~30m (infrastructure; the same tree ran the full suite
+    # clean in a local Linux container) and the runner-level cancel dropped the in-flight step's
+    # log entirely, which is exactly the failure mode the per-step bounds exist to avoid. The job
+    # ceiling is only the backstop, by arithmetic: checkout (1m) + worst-case cargo budgets
+    # (9m + 3m, plus a 30s KILL grace each) sum to 14m < 15m, so a per-step bound always fires
+    # before the runner-level cancel can. Keep that inequality true when recalibrating any of
+    # these numbers.
     timeout-minutes: 15
     permissions:
       contents: read
@@ -55,6 +57,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0" # nothing attaches a debugger here; dropping debuginfo cuts compile time substantially
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # The one step without an inner coreutils timeout, so it gets a step-level bound (observed:
+        # seconds) — needed for the sum-under-the-job-ceiling arithmetic above to cover every step.
+        timeout-minutes: 1
         with:
           persist-credentials: false
       # Build and run as SEPARATE steps so the job timeline attributes time (and a future stall) to
