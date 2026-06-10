@@ -9,16 +9,21 @@
 #      no /usr/bin/sh) and only bites on usr-merge Linux, where the normalized path resolves
 #      (fixed in PR #16).
 #
-# Scope: the DEFAULT `cargo test --workspace` set. Sandbox/e2e tests that need a real backend,
-# network, or docker are #[ignore]d or environment-gated (ADR-0009) and stay skipped here.
+# Scope: the DEFAULT `cargo test --workspace` set. Two classes stay skipped here: language-e2e
+# tests, #[ignore]d / environment-gated per ADR-0009 (hermetic containerized toolchains), and the
+# sandbox conformance gates, #[ignore]d for a different reason — they need a live host backend
+# (bwrap / firejail / docker / netns).
 #
 # Fork-safe by construction: no secrets, no Environment — tests run against the offline mock
 # provider by default (real-LLM paths are env-gated), so the lane behaves identically for fork PRs.
 #
 # Conventions (docs/ci.md / .github/zizmor.yml): every action pinned to a full commit SHA,
-# least-privilege permissions, per-job timeout. No dependency cache, matching the repo's
-# cold-by-design CI stance (zizmor `cache-poisoning`) — this is a correctness lane, and with
-# debuginfo off the cold build is fast enough (~42s observed) that a cache buys nothing anyway.
+# least-privilege permissions. The per-job timeout is NOT one of those documented conventions —
+# it's this lane's own addition, born from the log-loss incident described at timeout-minutes
+# below (jitgen-advisory.yml bounds its jobs the same way). No dependency cache, matching the
+# repo's cold-by-design CI stance (zizmor `cache-poisoning`) — this is a correctness lane, and
+# with debuginfo off the cold build is fast enough (~42s observed) that a cache buys nothing
+# anyway.
 name: tests
 
 on:
@@ -64,7 +69,9 @@ jobs:
           persist-credentials: false
       # Build and run as SEPARATE steps so the job timeline attributes time (and a future stall) to
       # the right phase — when the runner cancels a job on timeout-minutes, the in-flight step's log
-      # can be lost entirely, so phase visibility has to come from step boundaries.
+      # can be lost entirely, so phase visibility has to come from step boundaries. One caveat:
+      # `--no-run` does NOT precompile doctests (the workspace has none today), so any future
+      # doctest compilation — and its failures — lands in the run step, not here.
       - name: Build the test binaries (cargo test --no-run)
         # rust-toolchain.toml pins 1.95.0; the runner's rustup installs it on first use (same as
         # release.yml). --locked: a drifted Cargo.lock fails loud instead of silently re-resolving.
