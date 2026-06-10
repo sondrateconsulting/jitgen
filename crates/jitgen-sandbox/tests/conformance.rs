@@ -132,30 +132,127 @@ const NET_PROBE_SCRIPT: &str = "\
 /// OUTSIDE the sandbox, in the same userland the sandboxed probe will see.
 enum ControlProbe<'a> {
     /// Directly on the host: bwrap/firejail sandbox the host's own filesystem, so the host
-    /// baselines the same nc/bash the sandboxed probe picks.
+    /// baselines the same nc/bash the sandboxed probe picks (the sandboxed env's `PATH` is the
+    /// parent `PATH` filtered by `build_env`; the control pins [`TRUSTED_PATH_DIRS`], where the
+    /// standard tools live on any real host).
     Host,
-    /// Inside the same digest-pinned image with Docker's default (unrestricted) networking and
-    /// the same non-root `--user`: the container userland's nc/bash, not the host's, is what the
-    /// sandboxed probe runs. `--pull=never` keeps the suite's never-pull-during-a-test rule.
+    /// Inside the same digest-pinned image with Docker's default (unrestricted) networking,
+    /// mirroring `plan_container`'s discipline: pinned `--entrypoint` (an image `ENTRYPOINT` must
+    /// not be able to intercept the probe or fake its sentinel), `--pull=never` (the suite's
+    /// never-pull-during-a-test rule), and the same validated non-root `--user` as the sandboxed
+    /// run. Only the network restriction is dropped — that is the variable under test.
     Docker { image: &'a str, user: &'a str },
 }
 
+/// Mirror of the non-public `which::TRUSTED_BIN_DIRS`: root-owned system bin dirs, in search
+/// order. The control resolves `docker` and its probe tools ONLY from these — never the inherited
+/// `PATH` — matching production's trusted-launcher discipline (`which::resolve_trusted`): a
+/// hostile `PATH` entry must not be able to swap a fake docker/nc into an unsandboxed control run.
+const TRUSTED_PATH_DIRS: &[&str] = &[
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+];
+
+/// Resolve a bare launcher name across [`TRUSTED_PATH_DIRS`] (mirror of the non-public
+/// `which::resolve_trusted` bare-name arm; `is_file` stands in for its executable check — close
+/// enough for a test helper whose failure is a loud panic, not a fail-open).
+fn resolve_trusted_for_control(program: &str) -> Option<PathBuf> {
+    TRUSTED_PATH_DIRS
+        .iter()
+        .map(|d| Path::new(d).join(program))
+        .find(|c| c.is_file())
+}
+
+/// Hard deadline for one control run: generously above the probe's own 3s connect bound, low
+/// enough that a wedged docker daemon cannot hang the gate (`Command::output` has no timeout).
+const CONTROL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `Command::output()` with [`CONTROL_DEADLINE`]: on overrun the child is killed and the gate
+/// panics loudly — a control must never be able to hang an `#[ignore]`d gate indefinitely.
+fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::process::Output {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("control probe failed to spawn");
+    // Drain both pipes on reader threads so a chatty child can never block on a full pipe and
+    // defeat the deadline below; the threads see EOF once the child exits (or is killed).
+    let mut out_pipe = child.stdout.take().expect("control stdout piped");
+    let mut err_pipe = child.stderr.take().expect("control stderr piped");
+    let out_thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out_pipe.read_to_end(&mut v);
+        v
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err_pipe.read_to_end(&mut v);
+        v
+    });
+    let deadline = std::time::Instant::now() + CONTROL_DEADLINE;
+    let status = loop {
+        match child.try_wait().expect("control probe wait failed") {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "{what}: CONTROL probe did not finish within {}s and was killed; a wedged \
+                     docker daemon or a black-holing network can cause this. This is a control \
+                     failure, NOT a sandbox-isolation failure — fix the environment and rerun",
+                    CONTROL_DEADLINE.as_secs()
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+    std::process::Output {
+        status,
+        stdout: out_thread.join().expect("control stdout reader"),
+        stderr: err_thread.join().expect("control stderr reader"),
+    }
+}
+
 /// Run [`NET_PROBE_SCRIPT`] outside the sandbox per `control` and return its raw output.
-fn run_control_probe(control: &ControlProbe) -> std::process::Output {
+///
+/// Env discipline mirrors production `run()` (which spawns every launcher with
+/// `env_clear().envs(&plan.env)`): the control process gets a cleared env with `PATH` pinned to
+/// [`TRUSTED_PATH_DIRS`], so neither the docker CLI nor the probe tools can be swapped via an
+/// inherited hostile `PATH`, and both control flavors resolve tools identically.
+fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output {
+    let trusted_path = TRUSTED_PATH_DIRS.join(":");
     let mut cmd = match control {
         ControlProbe::Host => {
+            // `/bin/sh` is a literal absolute path inside a trusted dir (the same form
+            // `resolve_trusted` accepts) — the launcher itself cannot come from `PATH`.
             let mut c = std::process::Command::new("/bin/sh");
             c.args(["-c", NET_PROBE_SCRIPT]);
             c
         }
         ControlProbe::Docker { image, user } => {
-            let mut c = std::process::Command::new("docker");
-            c.args(["run", "--rm", "--pull=never", "--user", user, image]);
-            c.args(["/bin/sh", "-c", NET_PROBE_SCRIPT]);
+            let docker = resolve_trusted_for_control("docker").unwrap_or_else(|| {
+                panic!("{what}: docker not found in any trusted bin dir for the control probe")
+            });
+            let mut c = std::process::Command::new(docker);
+            // Argument shape mirrors `plan_container`: options, `--user`, `-e`, `--entrypoint`,
+            // image, then the entrypoint's args. The in-container PATH is pinned the same way as
+            // the control process's own, so `command -v` resolves from the image's standard dirs.
+            c.args(["run", "--rm", "--pull=never", "--user", user]);
+            c.args(["-e", &format!("PATH={trusted_path}")]);
+            c.args(["--entrypoint", "/bin/sh", image, "-c", NET_PROBE_SCRIPT]);
             c
         }
     };
-    cmd.output().expect("control probe failed to spawn")
+    cmd.env_clear();
+    cmd.env("PATH", &trusted_path);
+    output_with_deadline(&mut cmd, what)
 }
 
 /// Run [`NET_PROBE_SCRIPT`] under `sb` and assert egress is denied; fail loudly when the sandboxed
@@ -174,7 +271,7 @@ fn assert_network_denied(
     what: &str,
     control: &ControlProbe,
 ) {
-    let out = run_control_probe(control);
+    let out = run_control_probe(control, what);
     let control_stdout = String::from_utf8_lossy(&out.stdout);
     // Exact-line match: the control's stdout is raw `Command::output()` bytes (docker noise, image
     // entrypoints), so a substring `contains` could coincide; the probe emits the sentinel alone
@@ -196,8 +293,11 @@ fn assert_network_denied(
         "{what}: no nc/bash probe tool in the sandboxed environment, so network denial cannot \
          be verified; rerun with an image/host that provides nc or bash"
     );
+    // The pass signal (NET_DENIED) is matched as an exact line — symmetric with the control's
+    // NET_OK match; the failure sentinels stay substring matches (the safer direction: catching
+    // more counts as failing).
     assert!(
-        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+        res.stdout.lines().any(|l| l.trim() == "NET_DENIED") && !res.stdout.contains("NET_OK"),
         "{what}: network must be denied (expected NET_DENIED); got {res:?}"
     );
 }
