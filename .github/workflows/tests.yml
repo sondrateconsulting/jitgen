@@ -38,14 +38,30 @@ jobs:
   cargo-test-linux:
     name: cargo test (linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 30 # cold debug build of the C-heavy deps (vendored libgit2, ring, tree-sitter) dominates
+    # Calibration ceiling: the COLD build dominates and the first run of this lane was killed by a
+    # 30m timeout mid-build on the 4-core runner. Tighten once a few green runs establish the real
+    # duration. (A genuine TEST hang is bounded much tighter by the inner `timeout` on the run step
+    # below — this job-level value mostly just bounds the build.)
+    timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: "0" # incremental bookkeeping is pure overhead in a cold, cache-free CI build
+      CARGO_PROFILE_DEV_DEBUG: "0" # nothing attaches a debugger here; dropping debuginfo cuts compile time substantially
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: cargo test --workspace (offline mock provider, no key)
+      # Build and run as SEPARATE steps so the job timeline attributes time (and a future stall) to
+      # the right phase — when the runner cancels a job on timeout-minutes, the in-flight step's log
+      # can be lost entirely, so phase visibility has to come from step boundaries.
+      - name: Build the test binaries (cargo test --no-run)
         # rust-toolchain.toml pins 1.95.0; the runner's rustup installs it on first use (same as
         # release.yml). --locked: a drifted Cargo.lock fails loud instead of silently re-resolving.
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-run
+      - name: cargo test --workspace (offline mock provider, no key)
+        # Inner timeout, well under the job's timeout-minutes: if a test ever hangs, coreutils
+        # `timeout` fails THIS step while the runner is still healthy, so the log showing which test
+        # was running survives. A runner-level cancel can drop that log (it did on this lane's first
+        # run). TERM first, KILL 30s later if the harness doesn't die.
+        run: timeout --kill-after=30s 20m cargo test --workspace --locked
