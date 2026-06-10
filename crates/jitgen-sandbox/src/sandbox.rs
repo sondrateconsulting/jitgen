@@ -56,7 +56,16 @@ impl Sandbox {
 
     /// Detect available backends on this host and select one (fail-closed).
     pub fn detect_and_select(policy: ExecPolicy) -> Result<Self> {
-        Self::new(&crate::detect::detect(), policy)
+        let mut available = crate::detect::detect();
+        // The netns helper is never part of `detect()` (it is not an isolating sandbox); probe it
+        // only when the policy could actually select it — the unsafe-local opt-in (Auto upgrade)
+        // or an explicit request — so other runs never spawn the extra probe.
+        if (policy.allow_unsafe_local || policy.backend == jitgen_core::SandboxBackend::NetnsHelper)
+            && crate::detect::netns_helper_available()
+        {
+            available.push(Backend::NetnsHelper);
+        }
+        Self::new(&available, policy)
     }
 
     /// The backend this sandbox will use.
@@ -273,6 +282,78 @@ mod tests {
         let res = sb.run(&req).unwrap();
         assert_eq!(res.outcome, jitgen_core::ExecOutcome::Passed);
         assert_eq!(res.stdout, "hi");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netns_local_runs_end_to_end_and_denies_network() {
+        // Probe-gated, NOT `#[ignore]`d: unlike the OS-sandbox/container tiers, the netns helper
+        // nests fine inside build sandboxes wherever unprivileged user namespaces are permitted —
+        // and where they aren't, the functional probe says so and the test skips loudly. This gives
+        // plain `cargo test`/`bazel test` on a capable Linux host live coverage of the
+        // tier-defining property (GP15): the command executes AND cannot reach the network.
+        if !crate::detect::netns_helper_available() {
+            eprintln!("SKIP netns_local_runs_end_to_end: unshare user+net namespaces not usable");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("jitgen-netns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let overlay = base.join("overlay");
+        let state = base.join("state");
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        // Auto + the unsafe-local opt-in upgrades to the netns helper (the production CI path).
+        let policy = ExecPolicy {
+            backend: SandboxBackend::Auto,
+            allow_unsafe_local: true,
+            ..ExecPolicy::default()
+        };
+        let sb = Sandbox::new(&[Backend::NetnsHelper], policy).unwrap();
+        assert_eq!(sb.backend(), Backend::NetnsHelper);
+
+        // Executes: an ordinary command passes and produces output.
+        let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "printf hi".into()]);
+        let res = sb
+            .run(&RunRequest {
+                command: &cmd,
+                overlay_root: &overlay,
+                state_root: &state,
+                instance: "netns-exec",
+                run_as: None,
+            })
+            .unwrap();
+        assert_eq!(res.outcome, jitgen_core::ExecOutcome::Passed, "{res:?}");
+        assert_eq!(res.stdout, "hi");
+
+        // Denies network: the same sentinel probe the conformance suite uses (tool-existence
+        // checked, so a toolless host skips instead of vacuously passing).
+        let script = "\
+            if command -v nc >/dev/null 2>&1; then \
+                nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+            elif command -v bash >/dev/null 2>&1; then \
+                bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+            else echo NO_PROBE_TOOL; fi";
+        let overlay2 = base.join("overlay2");
+        std::fs::create_dir_all(&overlay2).unwrap();
+        let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script.into()]);
+        let res = sb
+            .run(&RunRequest {
+                command: &cmd,
+                overlay_root: &overlay2,
+                state_root: &state,
+                instance: "netns-net",
+                run_as: None,
+            })
+            .unwrap();
+        if !res.stdout.contains("NO_PROBE_TOOL") {
+            assert!(
+                res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+                "netns helper must deny network; got {res:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

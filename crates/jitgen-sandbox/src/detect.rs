@@ -20,6 +20,24 @@ pub fn detect() -> Vec<Backend> {
         .collect()
 }
 
+/// Whether the Linux netns helper tier ([ADR-0013]) is usable on this host. Deliberately **not**
+/// part of [`detect`]: the helper is not an isolating sandbox (no filesystem confinement) and must
+/// never satisfy the fail-closed gate, so it is probed separately and only consulted behind the
+/// unsafe-local opt-in. The probe is **functional** — it creates a real user+net namespace pair
+/// (`Backend::version_probe`) — because the `unshare` binary being present says nothing about
+/// whether the kernel/runtime permits unprivileged user namespaces (container seccomp profiles and
+/// hardened kernels commonly block them).
+pub fn netns_helper_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        available(Backend::NetnsHelper)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 fn available(backend: Backend) -> bool {
     match backend.version_probe() {
         // No probe (constrained-local): never auto-detected.

@@ -144,11 +144,13 @@ model; full `openat`/`O_NOFOLLOW` dirfd traversal is the F7 hardening.
 Runs the adapter's `test_command` under a **fail-closed** sandbox: untrusted execution **requires** an
 OS sandbox (bubblewrap/firejail on Linux; `sandbox-exec` on macOS) or container (Docker/Podman); if
 none is available, execution is **refused** unless the trusted user passes `--unsafe-local-execution`
-(loud, recorded). **No network by default** (live conformance tests per backend; Podman shares the
-Docker invocation plan); **hardcoded env
+(loud, recorded; on Linux kernels permitting unprivileged user namespaces the opted-in run is
+auto-upgraded to the **netns-helper** tier — a kernel network cut via the util-linux `unshare`
+helper process, [ADR-0013](decisions/0013-netns-helper-backend.md)). **No network by default**
+(live conformance tests per backend; Podman shares the Docker invocation plan); **hardcoded env
 allowlist** with synthetic `HOME` (no inherited tokens/creds); cwd pinned to the overlay; mandatory
 timeouts, output caps, and **per-backend** resource limits (containers via cgroup flags
-`--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/constrained-local via a
+`--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/netns-local/constrained-local via a
 `ulimit` preamble applying **CPU-time + address-space only** — process-count is intentionally omitted,
 since `ulimit -u` is per-UID and the container `--pids-limit` + wall-clock timeout are the fork-bomb
 controls); **preflight resource budgets** before sandboxing. **argv-only** execution; `shell: true` is trusted-config only and high-risk. See

@@ -55,9 +55,13 @@ Test commands and build scripts are attacker-controlled.
   sound only because the container is **throwaway and jitgen-owned** and `--unsafe-local-execution` is
   **trusted-config only** — a hostile `.jitgen.yaml` cannot set it. The constrained-local tier itself
   provides **no kernel-enforced network/file isolation** ([ADR-0003](decisions/0003-sandbox-strategy.md);
-  crate-wide `#![forbid(unsafe_code)]` rules out `unshare`/`setns`) — in this model the **container**
-  supplies the network/filesystem boundary, not jitgen, which is the reason it must be ephemeral and
-  jitgen-owned. It is the inverse of the **`--docker-image` tier** (jitgen spawning its *own*
+  crate-wide `#![forbid(unsafe_code)]` rules out calling `unshare`/`setns` directly) — in this model
+  the **container** supplies the network/filesystem boundary, not jitgen, which is the reason it must
+  be ephemeral and jitgen-owned. Where the kernel permits unprivileged user namespaces, the
+  **netns-local** tier ([ADR-0013](decisions/0013-netns-helper-backend.md)) now closes the *network*
+  half from inside: an opted-in run is auto-upgraded to wrap the command with the util-linux
+  `unshare` **helper process** (user+net namespaces), making the network cut kernel-enforced even
+  inside an ordinary job container — the **filesystem** boundary still comes from the container. It is the inverse of the **`--docker-image` tier** (jitgen spawning its *own*
   containers, which needs a Docker socket); do **not** mount a Docker socket to satisfy the CI model.
   Note that "same-repo PR" is a **policy** trust decision (trust anyone with push access), **not** an
   isolation boundary — a same-repo PR's unreviewed head code runs in the key-bearing job, kept safe by
@@ -69,8 +73,11 @@ Test commands and build scripts are attacker-controlled.
   `--network=none`), with **live conformance tests probing outbound-connect denial** on
   `sandbox-exec`, bwrap, firejail, and Docker (Podman shares the Docker invocation plan). The
   opt-in **constrained-local** tier does **not** itself cut the network — it relies on the surrounding
-  ephemeral container (above). cwd pinned to overlay; resource limits **per backend** (containers via
-  cgroup flags `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/constrained-
+  ephemeral container (above) — but where unprivileged user namespaces work, the opted-in run is
+  auto-upgraded to the **netns-local** tier (the `unshare` helper: DNS/TCP/UDP/IPv6/loopback all
+  kernel-denied, conformance-tested; [ADR-0013](decisions/0013-netns-helper-backend.md)). cwd pinned
+  to overlay; resource limits **per backend** (containers via cgroup flags
+  `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/netns-local/constrained-
   local via a `ulimit` preamble applying CPU-time + address-space only — process-count is omitted by
   design, see Residual risks); whole-process-group timeout kill; output caps.
 - **Environment is a jitgen-owned hardcoded allowlist**, NOT inherited: a **synthetic `HOME`**, no

@@ -33,7 +33,7 @@ mod user;
 mod which;
 
 pub use backend::{os_candidates, select, Backend, Tier};
-pub use detect::detect;
+pub use detect::{detect, netns_helper_available};
 pub use env::{build_env, is_denied};
 pub use error::{Result, SandboxError};
 pub use policy::{ExecPolicy, ResourceLimits, DEFAULT_OUTPUT_CAP_BYTES, DEFAULT_TIMEOUT};

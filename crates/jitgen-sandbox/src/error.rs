@@ -21,6 +21,15 @@ pub enum SandboxError {
     #[error("requested sandbox backend {0:?} is not available on this host")]
     BackendUnavailable(&'static str),
 
+    /// The netns helper was requested without the unsafe-local opt-in. It adds a kernel network
+    /// cut but does **not** confine the filesystem, so it requires the same explicit acceptance as
+    /// the constrained-local tier ([ADR-0013]).
+    #[error(
+        "sandbox backend \"netns-helper\" denies network but does NOT confine the filesystem; \
+         it requires the explicit --unsafe-local-execution opt-in"
+    )]
+    NetnsRequiresUnsafeLocal,
+
     /// A `shell: true` command was supplied but the trusted config did not permit a shell. Refused
     /// rather than silently downgraded (security §5).
     #[error("shell command requires trusted shell_allowed=true; refusing")]

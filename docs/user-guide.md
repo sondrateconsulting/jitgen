@@ -365,9 +365,17 @@ container tier needs a digest-pinned image supplied via `--docker-image`/`JITGEN
 (`name@sha256:…`); without one, container execution fails closed (no floating tag is ever pulled). If
 no tier is available, execution is **refused** — unless a trusted operator passes
 `--unsafe-local-execution` to opt into the no-isolation constrained-local tier (never auto-selected).
-The sandbox enforces no-network, an env allowlist with synthetic `HOME`, overlay-confined writes,
-timeouts, output caps, and per-backend resource limits. See
-[ADR-0003](decisions/0003-sandbox-strategy.md).
+On Linux hosts that permit unprivileged user namespaces, an opted-in run is **auto-upgraded to the
+`netns-helper` tier**: the same constrained-local model, but the command is wrapped with util-linux
+`unshare` (user+net namespaces), so network access — including loopback — is kernel-denied even
+though filesystem confinement still relies on the surrounding container. `--sandbox netns-helper`
+requests it by name (still requires the opt-in; fails closed when the kernel blocks user
+namespaces), and `--sandbox local` pins plain constrained-local with no upgrade — use it if your
+tests need loopback networking, or refuse to run as the namespace's apparent-root uid. The sandbox
+enforces no-network, an env allowlist with synthetic `HOME`, overlay-confined writes, timeouts,
+output caps, and per-backend resource limits. See
+[ADR-0003](decisions/0003-sandbox-strategy.md) and
+[ADR-0013](decisions/0013-netns-helper-backend.md).
 
 ## Platform support
 
