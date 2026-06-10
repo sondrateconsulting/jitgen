@@ -39,12 +39,14 @@ jobs:
     name: cargo test (linux)
     runs-on: ubuntu-latest
     # Calibrated from a real green run: cold build 42s + tests 14s (~70s job total) — debuginfo off
-    # and no incremental keep even the cold build fast. 15m is ~13x headroom for slow runners or
-    # networks. The job-level timeout is only the backstop: each step carries its own inner
-    # `timeout` (below) so a stall fails THAT step with its log intact — this lane's very first run
-    # stalled ~30m (infrastructure; the same tree ran the full suite clean in a local Linux
-    # container) and the runner-level cancel dropped the in-flight step's log entirely, which is
-    # exactly the failure mode the inner timeouts exist to avoid.
+    # and no incremental keep even the cold build fast. Each step carries its own inner `timeout`
+    # (below) at ~13x observed headroom, so a stall fails THAT step with its log intact — this
+    # lane's very first run stalled ~30m (infrastructure; the same tree ran the full suite clean in
+    # a local Linux container) and the runner-level cancel dropped the in-flight step's log
+    # entirely, which is exactly the failure mode the inner timeouts exist to avoid. The job
+    # ceiling is only the backstop, by arithmetic: worst-case inner budgets (9m + 3m, plus a 30s
+    # KILL grace each) and checkout sum to under 15m, so an inner timeout always fires before the
+    # runner-level cancel can. Keep that inequality true when recalibrating any of these numbers.
     timeout-minutes: 15
     permissions:
       contents: read
@@ -63,9 +65,10 @@ jobs:
         # release.yml). --locked: a drifted Cargo.lock fails loud instead of silently re-resolving.
         # Inner timeout (TERM, then KILL 30s later if it won't die): a toolchain/crates.io download
         # stall or build hang fails this step with its log intact instead of riding to the
-        # runner-level cancel. Observed cold build: ~42s.
-        run: timeout --kill-after=30s 12m cargo test --workspace --locked --no-run
+        # runner-level cancel. Observed cold build: ~42s; 9m ≈ 13x.
+        run: timeout --kill-after=30s 9m cargo test --workspace --locked --no-run
       - name: cargo test --workspace (offline mock provider, no key)
         # Same inner-timeout rationale: a hung test fails this step while the runner is still
-        # healthy, so the log showing which test was running survives. Observed: ~14s, 589 tests.
-        run: timeout --kill-after=30s 10m cargo test --workspace --locked
+        # healthy, so the log showing which test was running survives. Observed: ~14s, 589 tests;
+        # 3m ≈ 13x.
+        run: timeout --kill-after=30s 3m cargo test --workspace --locked
