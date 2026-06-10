@@ -1,0 +1,11 @@
+# THROWAWAY — validates that the zizmor code-scanning ruleset blocks an unpinned action.
+# This PR is meant to be REJECTED by the gate and then closed, never merged.
+name: ruleset-gate-validation (throwaway)
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # intentionally UNPINNED (tag, not SHA) — must trip zizmor unpinned-uses
