@@ -1,0 +1,86 @@
+# Linux test lane: `cargo test --workspace` on ubuntu-latest. Until this lane existed, NO workflow
+# ran cargo tests at all (security.yml = zizmor + gitleaks, release.yml = build + smoke,
+# jitgen-advisory.yml = the self-dogfood advisory), so the suite was effectively macOS-local-only.
+# That blind spot hid two Linux-only bugs:
+#   1. the dash-exec rlimit preamble (`exec -- "$@"`): dash — /bin/sh on Debian/Ubuntu — rejects
+#      `exec --`, so every sandboxed command exited 127 on dash Linux while macOS/bash worked
+#      (fixed in PR #1), and
+#   2. `resolve_trusted("/usr/bin/./sh")`: the test assertion passed VACUOUSLY on macOS (which has
+#      no /usr/bin/sh) and only bites on usr-merge Linux, where the normalized path resolves
+#      (fixed in PR #16).
+#
+# Scope: the DEFAULT `cargo test --workspace` set. Two classes stay skipped here: language-e2e
+# tests, #[ignore]d / environment-gated per ADR-0009 (hermetic containerized toolchains), and the
+# sandbox conformance gates, #[ignore]d for a different reason — they need a live host backend
+# (bwrap / firejail / docker / netns).
+#
+# Fork-safe by construction: no secrets, no Environment — tests run against the offline mock
+# provider by default (real-LLM paths are env-gated), so the lane behaves identically for fork PRs.
+#
+# Conventions (docs/ci.md / .github/zizmor.yml): every action pinned to a full commit SHA,
+# least-privilege permissions. The per-job timeout is NOT one of those documented conventions —
+# it's this lane's own addition, born from the log-loss incident described at timeout-minutes
+# below (jitgen-advisory.yml bounds its jobs the same way). No dependency cache, matching the
+# repo's cold-by-design CI stance (zizmor `cache-poisoning`) — this is a correctness lane, and
+# with debuginfo off the cold build is fast enough (~42s observed) that a cache buys nothing
+# anyway.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test-linux:
+    name: cargo test (linux)
+    runs-on: ubuntu-latest
+    # Calibrated from a real green run: cold build 42s + tests 14s (~70s job total) — debuginfo off
+    # and no incremental keep even the cold build fast. Every step is individually bounded (the
+    # cargo steps by inner coreutils `timeout`s at ~13x observed headroom, checkout by a step-level
+    # timeout-minutes) so a stall fails THAT step instead of riding to the runner-level cancel —
+    # this lane's very first run stalled ~30m (infrastructure; the same tree ran the full suite
+    # clean in a local Linux container) and the runner-level cancel dropped the in-flight step's
+    # log entirely, which is exactly the failure mode the per-step bounds exist to avoid. The job
+    # ceiling is only the backstop, by arithmetic: checkout (1m) + worst-case cargo budgets
+    # (9m + 3m, plus a 30s KILL grace each) sum to 14m < 15m, so a per-step bound always fires
+    # before the runner-level cancel can. Keep that inequality true when recalibrating any of
+    # these numbers.
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0" # incremental bookkeeping is pure overhead in a cold, cache-free CI build
+      CARGO_PROFILE_DEV_DEBUG: "0" # nothing attaches a debugger here; dropping debuginfo cuts compile time substantially
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        # The one step without an inner coreutils timeout, so it gets a step-level bound (observed:
+        # seconds) — needed for the sum-under-the-job-ceiling arithmetic above to cover every step.
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+      # Build and run as SEPARATE steps so the job timeline attributes time (and a future stall) to
+      # the right phase — when the runner cancels a job on timeout-minutes, the in-flight step's log
+      # can be lost entirely, so phase visibility has to come from step boundaries. One caveat:
+      # `--no-run` does NOT precompile doctests (the workspace has none today), so any future
+      # doctest compilation — and its failures — lands in the run step, not here.
+      - name: Build the test binaries (cargo test --no-run)
+        # rust-toolchain.toml pins 1.95.0; the runner's rustup installs it on first use (same as
+        # release.yml). --locked: a drifted Cargo.lock fails loud instead of silently re-resolving.
+        # Inner timeout (TERM, then KILL 30s later if it won't die): a toolchain/crates.io download
+        # stall or build hang fails this step with its log intact instead of riding to the
+        # runner-level cancel. Observed cold build: ~42s; 9m ≈ 13x.
+        run: timeout --kill-after=30s 9m cargo test --workspace --locked --no-run
+      - name: cargo test --workspace (offline mock provider, no key)
+        # Same inner-timeout rationale: a hung test fails this step while the runner is still
+        # healthy, so the log showing which test was running survives. Observed: ~14s, 589 tests;
+        # 3m ≈ 13x.
+        run: timeout --kill-after=30s 3m cargo test --workspace --locked

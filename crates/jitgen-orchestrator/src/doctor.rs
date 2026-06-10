@@ -60,6 +60,12 @@ pub struct DoctorReport {
     pub sandbox_note: String,
     /// Detected container runtime, if any.
     pub container_runtime: Option<String>,
+    /// Whether the Linux netns network-denying helper (util-linux `unshare`) is usable on this host
+    /// (functional user+net-namespace probe; ADR-0013). It hardens `--unsafe-local-execution` runs
+    /// with a kernel network cut — it is NOT an isolating tier and never satisfies the fail-closed
+    /// gate on its own.
+    #[serde(default)]
+    pub netns_helper: bool,
     /// Resolved state root path.
     pub state_root: String,
     /// Active LLM provider description.
@@ -159,14 +165,21 @@ impl DoctorReport {
                 // A real isolating tier (os-sandbox/container) will be auto-selected — the strong
                 // boundary. jitgen prefers it even if --unsafe-local-execution is also passed.
             } else if req.unsafe_local_execution {
-                v.notes.push(
-                    "--require-sandbox: no isolating tier detected; passing because \
+                let mut note = "--require-sandbox: no isolating tier detected; passing because \
                      --unsafe-local-execution accepts the constrained-local tier. That tier has NO \
                      kernel-enforced network/file isolation and relies on the surrounding ephemeral \
                      container for it (ADR-0003) — it is NOT a real isolating sandbox. Only safe \
                      inside a throwaway, jitgen-owned container."
-                        .to_string(),
-                );
+                    .to_string();
+                if self.netns_helper {
+                    note.push_str(
+                        " The netns helper (unshare) IS usable here, so the run will be \
+                         auto-upgraded to the netns-local tier: network access is then \
+                         kernel-denied, but filesystem confinement still relies on the \
+                         surrounding container (ADR-0013).",
+                    );
+                }
+                v.notes.push(note);
             } else {
                 v.failures.push(
                     "--require-sandbox: no isolating sandbox tier (os-sandbox/container) detected and \
@@ -308,6 +321,7 @@ fn lang_note(native: bool, container: &Option<String>) -> String {
 fn classify_sandbox(
     detected: &[jitgen_sandbox::Backend],
     container_client_present: bool,
+    netns_helper: bool,
     os: &str,
 ) -> (String, String, Option<String>) {
     use jitgen_sandbox::Tier;
@@ -326,24 +340,35 @@ fn classify_sandbox(
             "container".to_string(),
             format!("using {id} container backend"),
         ),
-        // `detect` never returns the constrained-local tier; fold it into "none" defensively.
-        Some((Tier::ConstrainedLocal, _)) | None => {
+        // `detect` never returns the constrained-local or netns-local tiers (the netns helper is
+        // probed separately and never satisfies the gate alone); fold both into "none" defensively.
+        Some((Tier::ConstrainedLocal | Tier::NetnsLocal, _)) | None => {
             // Distinguish "a container client is installed but no isolating backend is usable" (its
             // daemon is unreachable/unauthorized/misconfigured, or it is off the trusted launcher path
             // — a common CI misconfig) from "nothing at all", so a failed `--require-sandbox` points
             // at the real problem.
-            let note = if container_client_present {
+            let mut note = if container_client_present {
                 "FAIL-CLOSED: a container runtime client is installed but no isolating backend is \
                  usable — its daemon is not usable (unreachable, unauthorized, or misconfigured, \
                  e.g. DOCKER_HOST/permissions) or the client is not on a trusted launcher path, so \
                  untrusted tests cannot run in a container. Start/authorize the daemon, install an \
                  OS sandbox (bubblewrap), or pass --unsafe-local-execution if this IS a throwaway \
                  container (ADR-0003/0010)"
+                    .to_string()
             } else {
                 "FAIL-CLOSED: no OS sandbox or container available; untrusted execution is refused \
                  unless the trusted --unsafe-local-execution flag is passed (ADR-0003/0010)"
+                    .to_string()
             };
-            ("none".to_string(), note.to_string())
+            if netns_helper {
+                note.push_str(
+                    ". A netns network-denying helper (unshare) IS usable: an \
+                     --unsafe-local-execution run will be auto-upgraded to the netns-local tier — \
+                     a kernel-enforced network cut, though filesystem confinement still relies on \
+                     the surrounding container (ADR-0013)",
+                );
+            }
+            ("none".to_string(), note)
         }
     };
     (tier, note, container_runtime)
@@ -391,8 +416,16 @@ pub fn run_doctor(state_root: &str, provider: &str) -> DoctorReport {
     // modeled here — doctor reports the strongest *available* tier.) The pure mapping lives in
     // `classify_sandbox` so the tier decision is deterministically testable off the live environment.
     let detected = jitgen_sandbox::detect();
-    let (sandbox_tier, sandbox_note, container) =
-        classify_sandbox(&detected, have("docker") || have("podman"), os);
+    // The netns helper is probed separately from `detect()` (it is not an isolating tier and must
+    // never satisfy the gate alone; ADR-0013) — doctor reports it so an operator knows whether an
+    // --unsafe-local-execution run gets the kernel network cut.
+    let netns_helper = jitgen_sandbox::netns_helper_available();
+    let (sandbox_tier, sandbox_note, container) = classify_sandbox(
+        &detected,
+        have("docker") || have("podman"),
+        netns_helper,
+        os,
+    );
 
     let languages = vec![
         LanguageStatus {
@@ -429,6 +462,7 @@ pub fn run_doctor(state_root: &str, provider: &str) -> DoctorReport {
         sandbox_tier,
         sandbox_note,
         container_runtime: container,
+        netns_helper,
         state_root: state_root.to_string(),
         provider: provider.to_string(),
     }
@@ -527,6 +561,7 @@ mod tests {
             sandbox_tier: "container".into(),
             sandbox_note: "using docker container backend".into(),
             container_runtime: Some("docker".into()),
+            netns_helper: false,
             state_root: "/tmp/state".into(),
             provider: "mock (default)".into(),
         }
@@ -622,7 +657,7 @@ mod tests {
         // `detect()` found no USABLE backend (daemon down / off the trusted path) ⇒ tier "none", NOT
         // "container". The pre-fix client-only `docker --version` probe reported "container" here,
         // letting `--require-sandbox` pass on a runner that would then fail-closed mid-run (GP8).
-        let (tier, note, rt) = classify_sandbox(&[], true, "linux");
+        let (tier, note, rt) = classify_sandbox(&[], true, false, "linux");
         assert_eq!(
             tier, "none",
             "client present + no usable backend must be 'none'"
@@ -634,26 +669,41 @@ mod tests {
         );
 
         // Nothing at all ⇒ "none" with the plain fail-closed note (no client/daemon hint).
-        let (tier, note, rt) = classify_sandbox(&[], false, "linux");
+        let (tier, note, rt) = classify_sandbox(&[], false, false, "linux");
         assert_eq!(tier, "none");
         assert_eq!(rt, None);
         assert!(
             note.contains("no OS sandbox or container") && !note.contains("client is installed")
         );
+        assert!(
+            !note.contains("netns"),
+            "no netns hint when the helper is unusable: {note}"
+        );
+
+        // Nothing isolating but the netns helper IS usable ⇒ still "none" (the helper must never
+        // satisfy the gate alone), with the upgrade hint appended.
+        let (tier, note, rt) = classify_sandbox(&[], false, true, "linux");
+        assert_eq!(tier, "none", "netns helper alone must NOT change the tier");
+        assert_eq!(rt, None);
+        assert!(
+            note.contains("netns") && note.contains("auto-upgraded"),
+            "the netns upgrade hint should be appended: {note}"
+        );
 
         // A usable container backend ⇒ "container", naming the runtime.
-        let (tier, _n, rt) = classify_sandbox(&[Backend::Docker], true, "linux");
+        let (tier, _n, rt) = classify_sandbox(&[Backend::Docker], true, false, "linux");
         assert_eq!(tier, "container");
         assert_eq!(rt.as_deref(), Some("docker"));
 
         // An OS sandbox wins even when a usable container is ALSO present; the selected tier is
         // os-sandbox, but container_runtime is still reported (for the language notes).
-        let (tier, _n, rt) = classify_sandbox(&[Backend::Bwrap, Backend::Docker], true, "linux");
+        let (tier, _n, rt) =
+            classify_sandbox(&[Backend::Bwrap, Backend::Docker], true, false, "linux");
         assert_eq!(tier, "os-sandbox");
         assert_eq!(rt.as_deref(), Some("docker"));
 
         // os-sandbox only ⇒ no container_runtime.
-        let (tier, note, rt) = classify_sandbox(&[Backend::SandboxExec], false, "macos");
+        let (tier, note, rt) = classify_sandbox(&[Backend::SandboxExec], false, false, "macos");
         assert_eq!(tier, "os-sandbox");
         assert_eq!(rt, None);
         assert!(note.contains("macos"));
@@ -740,6 +790,23 @@ mod tests {
         );
         assert_eq!(v.notes.len(), 1);
         assert!(v.notes[0].contains("constrained-local") && v.notes[0].contains("NOT a real"));
+        assert!(
+            !v.notes[0].contains("netns"),
+            "no netns upgrade mention when the helper is unusable"
+        );
+
+        // Same pass, but with the netns helper usable: the note records the auto-upgrade (kernel
+        // network cut) while still flagging that filesystem confinement rests on the container.
+        let mut r = report_tier("none");
+        r.netns_helper = true;
+        let v = r.strict_verdict(&req, false);
+        assert!(v.failures.is_empty());
+        assert_eq!(v.notes.len(), 1);
+        assert!(
+            v.notes[0].contains("netns-local") && v.notes[0].contains("kernel-denied"),
+            "the netns upgrade should be recorded: {}",
+            v.notes[0]
+        );
     }
 
     #[test]

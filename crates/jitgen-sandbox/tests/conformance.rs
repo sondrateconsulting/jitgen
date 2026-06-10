@@ -783,3 +783,128 @@ fn docker_confines_writes_to_overlay() {
         "in-overlay file not written to host overlay"
     );
 }
+
+// ---- netns-helper (Linux; ADR-0013) ------------------------------------------------------------
+
+/// Build a netns-helper sandbox, or skip when the functional probe fails: the helper needs
+/// unprivileged user namespaces, which container seccomp profiles and hardened kernels commonly
+/// block — exactly what the probe exists to detect.
+#[cfg(target_os = "linux")]
+fn netns_sandbox() -> Option<Sandbox> {
+    if !jitgen_sandbox::netns_helper_available() {
+        eprintln!(
+            "SKIP netns test: `unshare --user --map-root-user --net` is not usable on this host"
+        );
+        return None;
+    }
+    let policy = ExecPolicy {
+        backend: SandboxBackend::NetnsHelper,
+        allow_unsafe_local: true,
+        ..ExecPolicy::default()
+    };
+    Some(Sandbox::new(&[Backend::NetnsHelper], policy).expect("netns-helper selectable"))
+}
+
+/// Gate 1 (netns-helper) — THE tier-defining pair (GP15): a command inside the netns helper cannot
+/// open a network connection, AND an ordinary command still executes successfully. Both halves run
+/// against the same sandbox so a probe that "denies network" by failing to execute anything at all
+/// cannot pass.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "live netns; run with --ignored on a Linux host"]
+fn netns_helper_denies_network_and_still_executes() {
+    let Some(sb) = netns_sandbox() else {
+        return;
+    };
+
+    // Half 1: an ordinary command executes and produces output.
+    let fx = Fixture::new("netns-exec");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "printf hi".into()]);
+    let res = exec(&sb, &cmd, &fx);
+    assert_eq!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "a plain command must still execute under the netns helper: {res:?}"
+    );
+    assert_eq!(res.stdout, "hi");
+
+    // Half 2: a connect attempt is denied in-kernel. Same robust sentinel probe as the Docker gate
+    // (a toolless host can't masquerade as a passing denial test).
+    let script = "\
+        if command -v nc >/dev/null 2>&1; then \
+            nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        elif command -v bash >/dev/null 2>&1; then \
+            bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        else echo NO_PROBE_TOOL; fi";
+    let fx = Fixture::new("netns-net");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script.into()]);
+    let res = exec(&sb, &cmd, &fx);
+    if res.stdout.contains("NO_PROBE_TOOL") {
+        eprintln!("SKIP netns network probe: host has no nc/bash probe tool");
+        return;
+    }
+    assert!(
+        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+        "netns helper must deny network (expected NET_DENIED); got {res:?}"
+    );
+}
+
+/// Gate 1b (netns-helper) — loopback is denied too. The parent namespace binds a REAL listener on
+/// 127.0.0.1 and proves it reachable, then the sandboxed probe must FAIL to reach that same
+/// listener: in the helper's fresh network namespace the only interface is a DOWN loopback and
+/// the listener does not exist there, while a broken wrapper executing in the parent namespace
+/// would connect (NET_OK) and fail the gate. (A bare closed-port probe proves nothing — it
+/// prints NET_DENIED via ECONNREFUSED even with no namespace at all.) Scope: this tier denies the
+/// IP socket families; it is **NOT** a general unix-socket boundary — pathname AF_UNIX sockets
+/// are filesystem objects and cross network namespaces freely (abstract-namespace AF_UNIX sockets
+/// happen to be netns-scoped, but jitgen does not rely on that). The "unix socket denied" part of
+/// the security baseline applies to the fully isolating backends only.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "live netns; run with --ignored on a Linux host"]
+fn netns_helper_denies_loopback() {
+    let Some(sb) = netns_sandbox() else {
+        return;
+    };
+
+    // Execution half first (same sandbox), so a wrapper that executes nothing fails here with a
+    // clear diagnosis instead of a confusing "must deny loopback" message on empty output.
+    let fx = Fixture::new("netns-lo-exec");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "printf hi".into()]);
+    let res = exec(&sb, &cmd, &fx);
+    assert_eq!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "a plain command must still execute under the netns helper: {res:?}"
+    );
+    assert_eq!(res.stdout, "hi");
+
+    // A live parent-namespace listener. An unaccepted connection still completes the TCP
+    // handshake via the backlog, so no accept loop is needed — just keep the listener alive
+    // across the probe.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("listener addr").port();
+    // Sanity half: the parent namespace CAN reach it, so a NET_DENIED below proves the namespace
+    // boundary, not a dead listener.
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .expect("parent namespace must reach its own loopback listener");
+
+    let script = format!(
+        "if command -v nc >/dev/null 2>&1; then \
+            nc -w 3 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        elif command -v bash >/dev/null 2>&1; then \
+            bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        else echo NO_PROBE_TOOL; fi"
+    );
+    let fx = Fixture::new("netns-lo");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script]);
+    let res = exec(&sb, &cmd, &fx);
+    if res.stdout.contains("NO_PROBE_TOOL") {
+        eprintln!("SKIP netns loopback probe: host has no nc/bash probe tool");
+        return;
+    }
+    assert!(
+        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+        "netns helper must deny loopback (lo is DOWN in the fresh namespace); got {res:?}"
+    );
+}

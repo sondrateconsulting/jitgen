@@ -179,6 +179,10 @@ pub enum SandboxBackend {
     SandboxExec,
     Docker,
     Podman,
+    /// Linux network-denying helper tier (util-linux `unshare` user+net namespaces): the
+    /// constrained-local tier hardened with a kernel-enforced network cut, but still **no**
+    /// filesystem isolation — only usable with `unsafe_local_execution` (ADR-0013).
+    NetnsHelper,
     /// No-isolation local tier — only usable with `unsafe_local_execution`.
     Local,
 }

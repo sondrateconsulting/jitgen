@@ -15,6 +15,25 @@ jitgen is **fail-closed**: it will not run untrusted test commands without an is
   constrained-local tier. This is loud, recorded, and never auto-selected. Only do this on a host you
   trust to run the repo's test command directly. See [ADR-0003](decisions/0003-sandbox-strategy.md).
 
+## firejail: "ran the command without isolation (silent degradation)" / firejail not detected
+
+`firejail` runs a command **completely unsandboxed and exits 0** (dropping `--net=none`/`--read-only`/
+rlimits) when it detects it is already inside a sandbox/container, warning only on stderr
+(`an existing sandbox was detected … will run without any additional sandboxing features`). jitgen
+treats that as a fail-open and refuses it:
+
+- **Cause:** you are running jitgen on a **containerized Linux host** with firejail installed (and
+  `bubblewrap` absent or unable to create namespaces). The detect-time probe sees firejail degrade and
+  marks it **unavailable**; if a degraded firejail is somehow reached at run time, the run is refused
+  with `SandboxError::SandboxDegraded`.
+- **Fix (preferred):** use the **container as the sandbox** — run jitgen inside the published
+  digest-pinned image and pass `--unsafe-local-execution` (no nested firejail; the container is the
+  boundary), or run on a host where `bubblewrap` can create namespaces. See [ci.md](ci.md) and
+  [ADR-0003](decisions/0003-sandbox-strategy.md).
+- **Not a bug:** this is the fail-closed invariant working as designed — jitgen will **not** report an
+  unsandboxed run as a clean pass. `bubblewrap` does not have this failure mode (it errors loudly
+  instead of degrading). See [security.md → Residual risks](security.md#residual-risks).
+
 ## Windows / other platforms: "no OS sandbox" (container-only)
 
 Only **Linux** (`bubblewrap`/`firejail`) and **macOS** (`sandbox-exec`) have a native OS sandbox tier.

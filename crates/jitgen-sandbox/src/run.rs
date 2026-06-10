@@ -43,13 +43,23 @@ const COLLECT_GRACE: Duration = Duration::from_secs(2);
 /// Max time to wait for a teardown command (`docker kill …`) before killing it. A stalled daemon
 /// must not let cleanup hang `run()` past the wall-clock watchdog (T2/F7 P3).
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Floor on the stderr capture for a backend that can *silently degrade* (firejail). The degradation
+/// marker is the launcher's first stderr line (≤ a few hundred bytes); the security signal must not
+/// be defeatable by a small trusted `output_cap_bytes`, so we always capture at least this much stderr
+/// for such a backend (the user-facing result is still redacted/capped — this only widens the window
+/// the degradation scan sees). Comfortably larger than firejail's warning + any banner line.
+const DEGRADATION_SCAN_FLOOR: usize = 4096;
 
 /// Spawn and run a fully-resolved plan, returning a redacted, capped, classified result.
 pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     let start = Instant::now();
     let cap = REDACT_WINDOW.min(policy.output_cap_bytes as usize);
 
-    // Resolve the launcher from a trusted system dir (never inherited PATH) before spawning.
+    // Resolve the launcher from a trusted system dir (never inherited PATH) before spawning. (The
+    // PRE-execution re-probe that refuses a degrading firejail before any command runs lives at the
+    // `Sandbox::run` layer — all production runs go through it; this low-level executor keeps the
+    // post-execution stderr backstop below as the third layer, after detect-time selection and
+    // that pre-execution re-probe.)
     let program = resolve_trusted(&plan.program)
         .ok_or_else(|| SandboxError::UntrustedLauncher(plan.program.clone()))?;
 
@@ -69,8 +79,18 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     })?;
     let pid = child.id();
 
+    // Capture stdout at the user cap; capture stderr at a floor for a degradation-capable backend so a
+    // small `output_cap_bytes` can never truncate the marker away and silently disable the backstop.
+    let err_capture_cap = if plan.backend.has_silent_degradation_mode() {
+        cap.max(DEGRADATION_SCAN_FLOOR)
+    } else {
+        cap
+    };
     let out_cap = child.stdout.take().map(|p| spawn_capture(p, cap));
-    let err_cap = child.stderr.take().map(|p| spawn_capture(p, cap));
+    let err_cap = child
+        .stderr
+        .take()
+        .map(|p| spawn_capture(p, err_capture_cap));
 
     let deadline = start + policy.timeout;
     let wait_result = wait_with_timeout(&mut child, plan, deadline);
@@ -84,6 +104,48 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     }
     let (stdout_raw, out_trunc) = collect(out_cap);
     let (stderr_raw, err_trunc) = collect(err_cap);
+
+    // Third-layer backstop for a silently-degrading launcher, checked BEFORE we trust the exit status
+    // (so it fires even on the rare path where `wait_with_timeout` itself errored). The PRIMARY guards
+    // are earlier and *prevent* the unsandboxed run: detection at `Sandbox` construction never selects
+    // a degrading firejail, and the pre-execution re-probe above refuses one before the command is
+    // spawned. This post-execution check is a net for the residual case where firejail degraded only
+    // for the real command (a tight detect→run race the pre-probe didn't observe): the command has
+    // already run unsandboxed, so this cannot prevent that run — it ensures we **refuse rather than
+    // report it as a clean pass** (fail-closed), and surfaces it as an error.
+    //
+    // Scan the FIRST NON-EMPTY stderr line. firejail normally emits its warning/banner as its first
+    // output (before the child is exec'd), so scanning the first line catches a real degradation while
+    // a hostile repo's forged marker — which firejail's own output precedes — lands on a later line and
+    // is ignored. The stderr capture is floored (see `err_capture_cap`) so a small `output_cap_bytes`
+    // cannot truncate the marker away. The marker is fixed jitgen-known text matched on the raw
+    // (pre-redaction) bytes, so nothing untrusted or secret leaks.
+    //
+    // LIMITATION (deliberate, fail-closed): the launcher's stderr and the child's stderr share one
+    // pipe, so the streams can't be separated at the byte level. On a firejail configured *banner-quiet*
+    // (e.g. `quiet-by-default` in firejail.config, which suppresses pre-exec output) the child's first
+    // line is the first line we see — so a repo could forge the marker there and force this refusal.
+    // We accept that as the safe direction: it is **fail-closed** (the worst case is a *visible*
+    // `SandboxDegraded` refusal of the repo's OWN run — never a sandbox escape or a clean pass of an
+    // unsandboxed run), and refusing here is strictly safer than dropping the backstop (which would
+    // leave a fail-OPEN micro-window). The AUTHORITATIVE degradation detector is the pre-execution
+    // probe in `Sandbox::run`, which runs `/bin/true` with no untrusted output and cannot be forged;
+    // this post-execution check is only the residual-race net. (security threat #1; see Residual risks.)
+    {
+        let stderr_lossy = String::from_utf8_lossy(&stderr_raw);
+        let launcher_first_line = stderr_lossy
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        if plan
+            .backend
+            .stderr_shows_silent_degradation(launcher_first_line)
+        {
+            return Err(SandboxError::SandboxDegraded(plan.backend.id()));
+        }
+    }
+
     let (status, timed_out) = wait_result?;
 
     let disp = Disposition {
@@ -98,13 +160,23 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
         ),
     };
 
+    // Honor the user's `output_cap_bytes` for the returned stderr even though we may have captured more
+    // (`err_capture_cap` floor) to keep the degradation scan reliable. Only narrows in the degenerate
+    // case where a degradation-capable backend ran under a sub-floor cap; normally `cap >= floor` so
+    // this is a no-op.
+    let (stderr_for_result, stderr_trunc) = if stderr_raw.len() > cap {
+        (&stderr_raw[..cap], true)
+    } else {
+        (&stderr_raw[..], err_trunc)
+    };
+
     Ok(ExecutionResult {
         outcome: classify(disp),
         exit_code: status.code(),
         duration_ms: start.elapsed().as_millis() as u64,
-        truncated: out_trunc || err_trunc,
+        truncated: out_trunc || stderr_trunc,
         stdout: redact_capped(&stdout_raw, out_trunc),
-        stderr: redact_capped(&stderr_raw, err_trunc),
+        stderr: redact_capped(stderr_for_result, stderr_trunc),
     })
 }
 
@@ -173,8 +245,9 @@ fn redact_capped(bytes: &[u8], truncated: bool) -> String {
 
 /// A streaming capture: a reader thread appends into a shared buffer (bounded by `cap`) while the
 /// main thread can snapshot it at any time — so an escaped descendant holding the pipe cannot
-/// prevent us from returning what was captured.
-struct Capture {
+/// prevent us from returning what was captured. Shared with [`crate::detect`]'s probe so it gets the
+/// same no-hang guarantee (a quiet pipe-holder cannot block a bounded read).
+pub(crate) struct Capture {
     buf: Arc<Mutex<Vec<u8>>>,
     truncated: Arc<AtomicBool>,
     handle: thread::JoinHandle<()>,
@@ -197,7 +270,7 @@ struct Capture {
 /// call) — or register a global allocator that *unwinds* instead of aborting on allocation failure —
 /// re-check this: keep the lock scope panic-free so recovery stays a safety net, not a load-bearing
 /// path.
-fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture {
+pub(crate) fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture {
     let buf = Arc::new(Mutex::new(Vec::new()));
     let truncated = Arc::new(AtomicBool::new(false));
     let buf_w = Arc::clone(&buf);
@@ -261,7 +334,7 @@ fn spawn_capture<R: Read + Send + 'static>(mut reader: R, cap: usize) -> Capture
 /// finished when we gave up — an unfinished reader means the captured bytes are an arbitrary
 /// mid-stream prefix, which is exactly the "truncated" contract: it flags the result and makes the
 /// caller apply the redaction tail-guard to that boundary (T1/F7 P2).
-fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
+pub(crate) fn collect(cap: Option<Capture>) -> (Vec<u8>, bool) {
     let Some(cap) = cap else {
         return (Vec::new(), false);
     };
@@ -332,11 +405,13 @@ fn run_cleanup(argv: &[String]) {
 }
 
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     // The child leads a fresh group (pgid == pid); a negative pid signals the whole group. The pgid
     // stays reserved while any group member is alive, so this reaches stragglers; the narrow
     // post-reap recycle window is the documented residual (use the container tier for a real pid
     // namespace). `/bin/kill` is resolved from a trusted dir for the same reason launchers are.
+    // Shared with [`crate::detect`]'s probe so a timed-out launcher can't leave a descendant holding
+    // the stderr pipe and hang the probe.
     if let Some(kill) = resolve_trusted("kill") {
         let _ = Command::new(kill)
             .arg("-KILL")
@@ -349,17 +424,17 @@ fn kill_process_group(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
+pub(crate) fn kill_process_group(_pid: u32) {}
 
 #[cfg(unix)]
-fn set_process_group(cmd: &mut Command, new_group: bool) {
+pub(crate) fn set_process_group(cmd: &mut Command, new_group: bool) {
     if new_group {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
 }
 #[cfg(not(unix))]
-fn set_process_group(_cmd: &mut Command, _new_group: bool) {}
+pub(crate) fn set_process_group(_cmd: &mut Command, _new_group: bool) {}
 
 #[cfg(unix)]
 fn exit_signal(status: &ExitStatus) -> Option<i32> {
@@ -680,6 +755,16 @@ mod tests {
             }
         }
 
+        // Same `/bin/sh -c <script>` executor plan, but tagged with an arbitrary backend so the
+        // silent-degradation backstop (keyed on `plan.backend`) can be exercised without a live
+        // firejail.
+        fn sh_plan_backend(backend: Backend, script: &str) -> SandboxPlan {
+            SandboxPlan {
+                backend,
+                ..sh_plan(script)
+            }
+        }
+
         #[test]
         fn exit_zero_is_passed() {
             let r = run(&sh_plan("exit 0"), &ExecPolicy::default()).unwrap();
@@ -785,6 +870,134 @@ mod tests {
                 "join hung on a backgrounded pipe-holder ({:?})",
                 start.elapsed()
             );
+        }
+
+        #[test]
+        fn firejail_silent_degradation_warning_is_refused() {
+            // Simulate a firejail launcher that printed its "existing sandbox was detected" warning to
+            // stderr and ran the command UNSANDBOXED (exit 0). run() must refuse the result rather than
+            // report a clean pass — the run-time backstop to the detect-time probe (security threat #1).
+            let warning = "Warning: an existing sandbox was detected. cargo will run without any \
+                           additional sandboxing features";
+            let script = format!("echo '{warning}' >&2; exit 0");
+            let err = run(
+                &sh_plan_backend(Backend::Firejail, &script),
+                &ExecPolicy::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SandboxError::SandboxDegraded("firejail")),
+                "a degraded firejail run must be refused, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn firejail_degradation_warning_with_nonzero_exit_is_still_refused() {
+            // The backstop is checked BEFORE the exit status is trusted (`wait_result?`), so a
+            // degraded firejail that ALSO exited nonzero is refused as SandboxDegraded — not
+            // misclassified as an ordinary Failed result. Pins the check-before-status ordering:
+            // moving the marker scan after the status is consumed would regress this to Failed.
+            let warning = "Warning: an existing sandbox was detected. cargo will run without any \
+                           additional sandboxing features";
+            let script = format!("echo '{warning}' >&2; exit 7");
+            let err = run(
+                &sh_plan_backend(Backend::Firejail, &script),
+                &ExecPolicy::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SandboxError::SandboxDegraded("firejail")),
+                "a degraded firejail must be refused even on nonzero exit, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn firejail_without_degradation_warning_passes_normally() {
+            // A genuinely-sandboxing firejail (no degradation warning, just its ordinary banner) must
+            // pass — the backstop must not fire on ordinary firejail stderr.
+            let plan = sh_plan_backend(
+                Backend::Firejail,
+                "echo 'Child process initialized in 5.0 ms' >&2; printf ok",
+            );
+            let r = run(&plan, &ExecPolicy::default()).unwrap();
+            assert_eq!(r.outcome, ExecOutcome::Passed);
+            assert_eq!(r.stdout, "ok");
+        }
+
+        #[test]
+        fn firejail_degradation_marker_survives_a_tiny_output_cap() {
+            // The degradation signal must not be defeatable by a small trusted output cap. Even with an
+            // 8-byte cap (far smaller than the warning), the floored stderr capture keeps the launcher's
+            // first line, so the backstop still refuses. Without the floor an 8-byte stderr would miss
+            // the marker and the unsandboxed run would be reported as Passed — the fail-open this guards.
+            let warning = "Warning: an existing sandbox was detected. cargo will run without any \
+                           additional sandboxing features";
+            let script = format!("echo '{warning}' >&2; exit 0");
+            let policy = ExecPolicy {
+                output_cap_bytes: 8,
+                ..ExecPolicy::default()
+            };
+            let err = run(&sh_plan_backend(Backend::Firejail, &script), &policy).unwrap_err();
+            assert!(
+                matches!(err, SandboxError::SandboxDegraded("firejail")),
+                "a tiny output cap must not disable the degradation backstop, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn firejail_first_line_marker_is_refused_fail_closed_even_if_forged() {
+            // DECIDED BEHAVIOR (codex round-3 finding): the post-execution backstop scans the merged
+            // launcher+child stderr, which can't be split by stream. When the marker is the FIRST
+            // non-empty line — whether it is firejail's real warning OR a banner-quiet firejail running
+            // a hostile child that forged it — we REFUSE (fail-closed). This is intentional: the worst
+            // case is a visible SandboxDegraded refusal of the repo's OWN run (no escape, no clean pass
+            // of an unsandboxed run), which is strictly safer than dropping the backstop. The
+            // authoritative, un-forgeable detector is the pre-execution probe in `Sandbox::run`.
+            let forged = "an existing sandbox was detected ... without any additional sandboxing";
+            let script = format!("echo '{forged}' >&2; exit 0");
+            let err = run(
+                &sh_plan_backend(Backend::Firejail, &script),
+                &ExecPolicy::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SandboxError::SandboxDegraded("firejail")),
+                "a first-line marker must fail closed (refuse), got {err:?}"
+            );
+        }
+
+        #[test]
+        fn firejail_marker_only_on_a_later_stderr_line_is_not_refused() {
+            // A genuinely-sandboxing firejail prints its banner first (line 1); if the inner
+            // (untrusted) test then emits the marker phrase on a LATER line, that must NOT be mistaken
+            // for firejail degrading — the backstop scans only firejail's own first line. This stops a
+            // hostile repo from forging the warning in its test stderr to force-refuse every
+            // firejail-tier run.
+            let script = "echo 'Parent pid 2, child pid 3' >&2; \
+                          echo 'an existing sandbox was detected ... without any additional sandboxing' >&2; \
+                          printf ok";
+            let r = run(
+                &sh_plan_backend(Backend::Firejail, script),
+                &ExecPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(r.outcome, ExecOutcome::Passed);
+            assert_eq!(r.stdout, "ok");
+        }
+
+        #[test]
+        fn degradation_text_from_a_non_firejail_backend_is_not_refused() {
+            // The backstop is per-backend: only firejail has a silent-degradation mode. The same text
+            // emitted under the constrained-local tier (which never degrades this way) must NOT be
+            // refused — otherwise ordinary test output mentioning the phrase would be misclassified.
+            let script = "echo 'an existing sandbox was detected ... without any additional \
+                          sandboxing' >&2; exit 0";
+            let r = run(
+                &sh_plan_backend(Backend::ConstrainedLocal, script),
+                &ExecPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(r.outcome, ExecOutcome::Passed);
         }
 
         #[test]

@@ -55,9 +55,13 @@ Test commands and build scripts are attacker-controlled.
   sound only because the container is **throwaway and jitgen-owned** and `--unsafe-local-execution` is
   **trusted-config only** — a hostile `.jitgen.yaml` cannot set it. The constrained-local tier itself
   provides **no kernel-enforced network/file isolation** ([ADR-0003](decisions/0003-sandbox-strategy.md);
-  crate-wide `#![forbid(unsafe_code)]` rules out `unshare`/`setns`) — in this model the **container**
-  supplies the network/filesystem boundary, not jitgen, which is the reason it must be ephemeral and
-  jitgen-owned. It is the inverse of the **`--docker-image` tier** (jitgen spawning its *own*
+  crate-wide `#![forbid(unsafe_code)]` rules out calling `unshare`/`setns` directly) — in this model
+  the **container** supplies the network/filesystem boundary, not jitgen, which is the reason it must
+  be ephemeral and jitgen-owned. Where the kernel permits unprivileged user namespaces, the
+  **netns-local** tier ([ADR-0013](decisions/0013-netns-helper-backend.md)) now closes the *network*
+  half from inside: an opted-in run is auto-upgraded to wrap the command with the util-linux
+  `unshare` **helper process** (user+net namespaces), making the network cut kernel-enforced even
+  inside an ordinary job container — the **filesystem** boundary still comes from the container. It is the inverse of the **`--docker-image` tier** (jitgen spawning its *own*
   containers, which needs a Docker socket); do **not** mount a Docker socket to satisfy the CI model.
   Note that "same-repo PR" is a **policy** trust decision (trust anyone with push access), **not** an
   isolation boundary — a same-repo PR's unreviewed head code runs in the key-bearing job, kept safe by
@@ -69,10 +73,35 @@ Test commands and build scripts are attacker-controlled.
   `--network=none`), with **live conformance tests probing outbound-connect denial** on
   `sandbox-exec`, bwrap, firejail, and Docker (Podman shares the Docker invocation plan). The
   opt-in **constrained-local** tier does **not** itself cut the network — it relies on the surrounding
-  ephemeral container (above). cwd pinned to overlay; resource limits **per backend** (containers via
-  cgroup flags `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/constrained-
+  ephemeral container (above) — but where unprivileged user namespaces work, the opted-in run is
+  auto-upgraded to the **netns-local** tier (the `unshare` helper: all connectivity beyond the
+  namespace — DNS/TCP/UDP/IPv6 and the host's loopback services — kernel-denied,
+  conformance-tested; a test may re-up its namespace-private loopback to talk to itself, which
+  reaches nothing outside, and it is **not** a unix-socket boundary: pathname AF_UNIX sockets
+  cross network namespaces; [ADR-0013](decisions/0013-netns-helper-backend.md)). cwd pinned
+  to overlay; resource limits **per backend** (containers via cgroup flags
+  `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/netns-local/constrained-
   local via a `ulimit` preamble applying CPU-time + address-space only — process-count is omitted by
   design, see Residual risks); whole-process-group timeout kill; output caps.
+- **Detection probes the *isolation*, not just presence — no silent fail-open.** This guards a real
+  **firejail** fail-open: when firejail detects it is already inside a sandbox/container it prints
+  `an existing sandbox was detected … will run without any additional sandboxing features` to stderr
+  and then runs the command **completely unsandboxed, exiting 0** (`--net=none`/`--read-only=/`/rlimits
+  all silently dropped). A `firejail --version` succeeds there, so jitgen defends in **three layers**:
+  (1) **detect-time** — `detect()` marks an OS-sandbox backend available only if a probe that *actually
+  sandboxes* succeeds (`firejail --net=none -- /bin/true`, no `--quiet`); a degradation warning on that
+  probe's stderr means **unavailable**, so AUTO never selects a degrading firejail and falls through to
+  the next tier or refuses. (2) **pre-execution** — immediately before running the untrusted command,
+  `Sandbox::run` re-probes a degradation-capable backend and **refuses (`SandboxError::SandboxDegraded`)
+  without ever spawning the command** if it would degrade now, closing the detect→run window and
+  covering an explicitly-selected backend. (3) **post-execution backstop** — the executor also refuses
+  if the launcher's *first* stderr line carries the warning (the firejail plan omits `--quiet` so it is
+  visible; the stderr capture is floored so a small `output_cap_bytes` can't truncate the marker). Layer
+  3 cannot un-run an already-degraded command, but it guarantees such a run is **refused, never reported
+  as a clean pass** (fail-closed). **bwrap** does not fail open — it fails *loudly* (`No permissions to
+  create new namespace`, nonzero exit, command not run) — but its probe was upgraded to a real
+  namespacing check for the same reason (skip it where it cannot isolate instead of erroring on every
+  run). See `crates/jitgen-sandbox/src/{backend,detect,run,sandbox}.rs` and Residual risks.
 - **Environment is a jitgen-owned hardcoded allowlist**, NOT inherited: a **synthetic `HOME`**, no
   `GITHUB_TOKEN`/`AWS_*`/`SSH_AUTH_SOCK`/`*_TOKEN`/`*_API_KEY`/npm·pip·cargo creds; deny-patterns
   applied even to trusted additions. argv-only execution; shell only via trusted `shell: true`.
@@ -260,8 +289,8 @@ These MUST exist and pass before the relevant phase is complete (built security-
   Real-LLM mode is opt-in and off by default.
 - **Sandbox resource limits (F7) are backend-dependent.** Docker/Podman (`--memory` / `--pids-limit`
   / `--cpus`) and firejail (`--rlimit-*`) enforce CPU/memory/process caps in-kernel. **bwrap** and
-  macOS **`sandbox-exec`** (and the opt-in constrained-local tier) have no flag-level rlimit
-  primitive, and a `setrlimit` pre-exec would require `unsafe` (forbidden crate-wide); on those tiers
+  macOS **`sandbox-exec`** (and the opt-in netns-helper and constrained-local tiers) have no
+  flag-level rlimit primitive, and a `setrlimit` pre-exec would require `unsafe` (forbidden crate-wide); on those tiers
   jitgen applies a **`ulimit` shell preamble** (`sh -c 'ulimit -t …; ulimit -v …; exec "$@"'`)
   that enforces **CPU-time and address-space** (address-space is unenforced on macOS). The preamble
   re-execs the untrusted argv via plain `exec "$@"` (no `--`: dash's `exec` has no `--` terminator, so
@@ -274,6 +303,35 @@ These MUST exist and pass before the relevant phase is complete (built security-
   Relatedly, the OS-sandbox tiers allow broad `file-read*` (so toolchains load), so a sandboxed
   process can read host files its uid permits; the primary mitigation is no-network + output redaction
   + synthetic `HOME` (see `sbpl.rs`).
+- **firejail silent-degradation detection is a behavioral + stderr heuristic.** firejail 0.9.x runs a
+  command **unsandboxed and exits 0** when it detects an existing sandbox/container, announcing it only
+  via a stderr warning. jitgen defends in three layers (threat #1): a detect-time real-sandboxing probe
+  (`firejail --net=none -- /bin/true`) excludes a degrading firejail from selection; a **pre-execution**
+  re-probe in `Sandbox::run` refuses **before the untrusted command is ever spawned**; and a
+  post-execution backstop refuses any run whose launcher **first non-empty stderr line** carries the
+  warning (the stderr capture is floored so a small `output_cap_bytes` cannot truncate the marker).
+  Three residuals remain — **all fail-closed** (a refusal, never a clean pass of an unsandboxed run).
+  (a) **Inherent post-hoc window:** if firejail degraded only for the real command in the tiny window
+  after the pre-execution probe passed, that one command has already run unsandboxed before layer 3
+  refuses it — layer 3 prevents *misreporting* (fail-closed result), not that single execution.
+  (b) **String fragility:** distinguishing "sandboxed" from "degraded passthrough" relies on the warning
+  **string**, which is **version/locale-fragile** — a future firejail that reworded the message *and*
+  still exited 0 while degrading could slip past the string match (the behavioral probe-success check
+  still runs, but it cannot tell a real sandbox from a passthrough without the string). (c) **Merged
+  stderr / forgeable layer-3 marker:** layer 3 scans the *combined* launcher+child stderr (one pipe),
+  which can't be split by stream. On a firejail configured *banner-quiet* (e.g. `quiet-by-default` in
+  firejail.config), a repo's own test could print the marker as the first line and **force** a
+  `SandboxDegraded` refusal of its own run — a self-inflicted, *visible* denial, never an escape. We
+  keep layer 3 anyway because failing closed here is strictly safer than dropping it (which would widen
+  residual (a) into a fail-open micro-window); the un-forgeable guard is the pre-execution probe, which
+  runs `/bin/true` with no untrusted output. Mitigations for (b): two independent substrings of the
+  message are matched (case-insensitive), and the text has been stable across firejail 0.9.x. All three
+  residuals are narrow because the realistic deployment is the **container tier** (the jitgen image ships no firejail) and
+  bwrap is preferred above firejail in AUTO order; firejail is the fallback OS-sandbox on bare-metal
+  Linux hosts that lack bwrap, where it does **not** degrade. If you must run on firejail inside another
+  sandbox, prefer the container tier or `--unsafe-local-execution` with a jitgen-owned ephemeral
+  container (threat #1). bwrap has **no** analogous fail-open mode — it
+  fails loudly (nonzero exit) when it cannot create a namespace — so it needs no stderr backstop.
 - **Secret redaction heuristic (F5, `jitgen-context::redact`):** runs before any prompt/log/report
   on a **size-bounded** input window (256 KiB/item, with a fail-closed drop of a window-split
   trailing token), using the linear-time `regex` engine (no catastrophic backtracking). It covers

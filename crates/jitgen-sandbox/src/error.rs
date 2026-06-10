@@ -21,6 +21,15 @@ pub enum SandboxError {
     #[error("requested sandbox backend {0:?} is not available on this host")]
     BackendUnavailable(&'static str),
 
+    /// The netns helper was requested without the unsafe-local opt-in. It adds a kernel network
+    /// cut but does **not** confine the filesystem, so it requires the same explicit acceptance as
+    /// the constrained-local tier ([ADR-0013]).
+    #[error(
+        "sandbox backend \"netns-helper\" denies network but does NOT confine the filesystem; \
+         it requires the explicit --unsafe-local-execution opt-in"
+    )]
+    NetnsRequiresUnsafeLocal,
+
     /// A `shell: true` command was supplied but the trusted config did not permit a shell. Refused
     /// rather than silently downgraded (security §5).
     #[error("shell command requires trusted shell_allowed=true; refusing")]
@@ -103,6 +112,18 @@ pub enum SandboxError {
         source: std::io::Error,
     },
 
+    /// The selected sandbox launcher reported (on stderr) that it ran the command **without applying
+    /// any isolation** while still exiting 0. firejail does this when it detects it is already inside
+    /// a sandbox/container: it prints a warning and executes the command unconfined (full network +
+    /// filesystem). Reporting that as a clean run would silently **fail open**, so the result is
+    /// refused. Carries only the static backend id — never the captured stderr — per the secret-free
+    /// policy above. The detect-time functional probe ([`crate::detect`]) is the primary guard; this
+    /// is the run-time backstop (`docs/security.md` threat #1, [ADR-0003]).
+    #[error(
+        "sandbox backend {0:?} ran the command without isolation (silent degradation detected); refusing"
+    )]
+    SandboxDegraded(&'static str),
+
     /// An I/O error occurred while preparing or running the sandbox (Stage 2).
     #[error("sandbox io error: {0}")]
     Io(#[from] std::io::Error),
@@ -126,5 +147,27 @@ mod tests {
     fn backend_unavailable_names_the_backend() {
         let msg = SandboxError::BackendUnavailable("docker").to_string();
         assert!(msg.contains("docker"));
+    }
+
+    #[test]
+    fn netns_opt_in_message_names_backend_remedy_and_limit() {
+        let msg = SandboxError::NetnsRequiresUnsafeLocal.to_string();
+        assert!(msg.contains("netns-helper"), "must name the backend: {msg}");
+        assert!(
+            msg.contains("--unsafe-local-execution"),
+            "must name the remedy flag: {msg}"
+        );
+        assert!(
+            msg.contains("does NOT confine the filesystem"),
+            "must state the limitation that makes the opt-in required: {msg}"
+        );
+    }
+
+    #[test]
+    fn sandbox_degraded_names_backend_and_is_actionable() {
+        let msg = SandboxError::SandboxDegraded("firejail").to_string();
+        assert!(msg.contains("firejail"));
+        assert!(msg.contains("without isolation"));
+        assert!(msg.contains("refusing"));
     }
 }

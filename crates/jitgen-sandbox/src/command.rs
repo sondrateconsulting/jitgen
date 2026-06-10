@@ -172,7 +172,7 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
 
 /// Wrap an inner argv in a `/bin/sh` preamble that applies **best-effort** rlimits and then `exec`s
 /// the real command. Used only for tiers with no native rlimit mechanism (sandbox-exec, bwrap,
-/// constrained-local); firejail uses `--rlimit-*` and containers use cgroup flags.
+/// netns-helper, constrained-local); firejail uses `--rlimit-*` and containers use cgroup flags.
 ///
 /// The untrusted argv is passed as positional parameters and re-exec'd via `exec "$@"`, so it is
 /// **never** parsed by the shell — this adds no command-injection surface (the shell script is a fixed
@@ -221,7 +221,7 @@ pub fn build_plan(input: PlanInput) -> Result<SandboxPlan> {
     // Best-effort rlimits for tiers with no native mechanism (no-op for firejail/containers).
     if matches!(
         input.backend,
-        Backend::SandboxExec | Backend::Bwrap | Backend::ConstrainedLocal
+        Backend::SandboxExec | Backend::Bwrap | Backend::NetnsHelper | Backend::ConstrainedLocal
     ) {
         inner = with_rlimit_preamble(inner, &input.policy.limits);
     }
@@ -230,6 +230,7 @@ pub fn build_plan(input: PlanInput) -> Result<SandboxPlan> {
         Backend::Bwrap => plan_bwrap(&input, cwd, inner),
         Backend::Firejail => plan_firejail(&input, cwd, inner),
         Backend::Docker | Backend::Podman => plan_container(&input, cwd, inner)?,
+        Backend::NetnsHelper => plan_netns_helper(&input, cwd, inner),
         Backend::ConstrainedLocal => plan_local(&input, cwd, inner),
     };
     // Carry the adapter's build-vs-test hints to the runtime (set centrally, not per-backend).
@@ -299,8 +300,13 @@ fn plan_bwrap(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPla
 fn plan_firejail(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPlan {
     let overlay = input.overlay_root.to_string_lossy().into_owned();
     let l = &input.policy.limits;
+    // NOTE: deliberately **no `--quiet`**. firejail silently degrades to a no-sandbox passthrough
+    // (runs the command unconfined, exits 0) when it detects it is already inside a sandbox/container,
+    // announcing it only via a stderr warning — and `--quiet` suppresses that warning. Keeping it
+    // visible lets the run-time backstop in `crate::run` catch a degraded launcher
+    // (`SandboxError::SandboxDegraded`) instead of reporting an unsandboxed run as a clean pass. The
+    // detect-time functional probe is the primary guard; this is defense in depth. (security threat #1)
     let mut args = vec![
-        "--quiet".into(),
         "--net=none".into(),
         "--read-only=/".into(),
         format!("--read-write={overlay}"),
@@ -424,6 +430,40 @@ fn plan_container(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result
         new_process_group: false,
         build_signal: BuildSignal::default(),
     })
+}
+
+fn plan_netns_helper(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPlan {
+    // Constrained-local hardened with a kernel network cut ([ADR-0013]). The launcher is util-linux
+    // `unshare` (resolved from a trusted system dir at spawn, like every launcher): a new **user**
+    // namespace (mapping the invoking uid to root inside it — what makes the net namespace creatable
+    // without privileges) plus a new **network** namespace with no path to the outside: every
+    // external destination — DNS, TCP/UDP, IPv6, the host's loopback services — is unreachable
+    // in-kernel. (The mapped root holds CAP_NET_ADMIN only *inside* its own namespace: a test can
+    // re-up the namespace-private loopback and talk to itself, which reaches nothing outside;
+    // attaching an interface to the parent would need CAP_NET_ADMIN in the parent namespace.)
+    // The apparent-root
+    // uid grants nothing outside the namespace: host file access is still checked against the real
+    // uid. Everything else matches the constrained-local tier — env allowlist, overlay cwd, rlimit
+    // preamble (applied by `build_plan`), fresh process group for teardown. Filesystem confinement
+    // is still NOT kernel-enforced, which is why selection demands the unsafe-local opt-in.
+    let mut args = vec![
+        "--user".into(),
+        "--map-root-user".into(),
+        "--net".into(),
+        "--".into(),
+    ];
+    args.extend(inner);
+    SandboxPlan {
+        backend: input.backend,
+        program: "unshare".into(),
+        args,
+        cwd,
+        env: input.env.clone(),
+        container_name: None,
+        cleanup: None,
+        new_process_group: true,
+        build_signal: BuildSignal::default(),
+    }
 }
 
 fn plan_local(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPlan {
@@ -704,9 +744,9 @@ mod tests {
         // it is rejected at the boundary instead. The guard lives in `inner_argv`, which runs *before*
         // the backend dispatch (and before the container image/user checks), so it fires for EVERY
         // backend — both the preamble-wrapped tiers where argv[0] would otherwise reach `exec "$@"`
-        // (constrained-local, bwrap, sandbox-exec) and the non-preamble tiers that never option-parse
-        // the inner argv (firejail, docker, podman — defense in depth). Enumerate all of them so a
-        // future per-backend code path can't silently drop the guard.
+        // (constrained-local, netns-helper, bwrap, sandbox-exec) and the non-preamble tiers that
+        // never option-parse the inner argv (firejail, docker, podman — defense in depth).
+        // Enumerate all of them so a future per-backend code path can't silently drop the guard.
         let r = SpawnRequest::argv("-c", ["evil".into()]);
         for backend in [
             Backend::Bwrap,
@@ -714,6 +754,7 @@ mod tests {
             Backend::SandboxExec,
             Backend::Docker,
             Backend::Podman,
+            Backend::NetnsHelper,
             Backend::ConstrainedLocal,
         ] {
             assert!(
@@ -775,6 +816,39 @@ mod tests {
     }
 
     #[test]
+    fn netns_helper_unshares_user_and_net_and_wraps_inner() {
+        let r = req();
+        let policy = ExecPolicy::default();
+        let plan = build_plan(input(Backend::NetnsHelper, &r, &policy)).unwrap();
+        assert_eq!(plan.program, "unshare");
+        // The exact namespace flags, in order, before the option terminator: a user namespace (with
+        // the root mapping that makes it unprivileged-creatable) and the network namespace that is
+        // the whole point of the tier.
+        let dd = plan.args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(
+            &plan.args[..dd],
+            &["--user", "--map-root-user", "--net"],
+            "namespace flags must precede `--`"
+        );
+        // After `--`: the rlimit preamble shell, exec'ing the untrusted inner command as the tail —
+        // identical to the other preamble tiers (the netns tier has no native rlimit mechanism).
+        let after = &plan.args[dd + 1..];
+        assert_eq!(after.first().map(String::as_str), Some("/bin/sh"));
+        assert!(after.iter().any(|a| a.contains("ulimit -t")));
+        assert!(plan
+            .args
+            .ends_with(&["cargo".into(), "test".into(), "--quiet".into()]));
+        // Constrained-local execution model: env allowlist applied, fresh process group, no
+        // container bookkeeping.
+        assert_eq!(
+            plan.env.get("HOME").map(String::as_str),
+            Some("/state/home")
+        );
+        assert!(plan.container_name.is_none() && plan.cleanup.is_none());
+        assert!(plan.new_process_group);
+    }
+
+    #[test]
     fn firejail_disables_network_and_sets_rlimits() {
         let r = req();
         let policy = ExecPolicy::default();
@@ -782,6 +856,16 @@ mod tests {
         assert_eq!(plan.program, "firejail");
         assert!(plan.args.contains(&"--net=none".to_string()));
         assert!(plan.args.iter().any(|a| a.starts_with("--rlimit-nproc=")));
+        // `--quiet` must NOT be a firejail *wrapper* flag: it would suppress firejail's "existing
+        // sandbox was detected" warning, blinding the run-time silent-degradation backstop (security
+        // threat #1). Scope the check to the wrapper flags (before `--`); the inner argv legitimately
+        // carries `cargo test --quiet`.
+        let dd = plan.args.iter().position(|a| a == "--").unwrap();
+        let wrapper = &plan.args[..dd];
+        assert!(
+            !wrapper.contains(&"--quiet".to_string()),
+            "firejail wrapper must not pass --quiet (it hides the degradation warning): {wrapper:?}"
+        );
     }
 
     #[test]
