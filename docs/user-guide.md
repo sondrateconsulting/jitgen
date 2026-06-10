@@ -372,9 +372,11 @@ though filesystem confinement still relies on the surrounding container (the cut
 IP-family sockets only; pathname AF_UNIX sockets are not blocked). `--sandbox netns-helper`
 requests it by name (still requires the opt-in; fails closed when the kernel blocks user
 namespaces), and `--sandbox local` pins plain constrained-local with no upgrade — use it if your
-tests need loopback networking, or refuse to run as the namespace's apparent-root uid. The sandbox
-enforces no-network, an env allowlist with synthetic `HOME`, overlay-confined writes, timeouts,
-output caps, and per-backend resource limits. See
+tests need loopback networking, or refuse to run as the namespace's apparent-root uid. Every tier
+enforces an env allowlist with synthetic `HOME`, timeouts, output caps, and per-backend resource
+limits; **no-network and overlay-confined writes are isolating-tier guarantees** — on the opt-in
+tiers, netns-helper restores the network cut (IP families) but write confinement still comes from
+the surrounding container, and plain constrained-local enforces neither. See
 [ADR-0003](decisions/0003-sandbox-strategy.md) and
 [ADR-0013](decisions/0013-netns-helper-backend.md).
 
