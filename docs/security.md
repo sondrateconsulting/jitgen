@@ -308,19 +308,25 @@ These MUST exist and pass before the relevant phase is complete (built security-
   via a stderr warning. jitgen defends in three layers (threat #1): a detect-time real-sandboxing probe
   (`firejail --net=none -- /bin/true`) excludes a degrading firejail from selection; a **pre-execution**
   re-probe in `Sandbox::run` refuses **before the untrusted command is ever spawned**; and a
-  post-execution backstop refuses any run whose launcher **first stderr line** carries the warning
-  (first-line scoping catches the real degradation while stopping a hostile repo from forging the marker
-  in its own later test output; the stderr capture is floored so a small `output_cap_bytes` cannot
-  truncate the marker). Two residuals remain. (a) **Inherent post-hoc window:** if firejail degraded
-  only for the real command in the tiny window after the pre-execution probe passed, that one command
-  has already run unsandboxed before layer 3 refuses it — layer 3 prevents *misreporting* (fail-closed
-  result), not that single execution. (b) **String fragility:** distinguishing "sandboxed" from
-  "degraded passthrough" relies on the warning **string**, which is **version/locale-fragile** — a
-  future firejail that reworded the message *and* still exited 0 while degrading could slip past the
-  string match (the behavioral probe-success check still runs, but it cannot tell a real sandbox from a
-  passthrough without the string). Mitigations: two independent substrings of the message are matched
-  (case-insensitive), and the text has been stable across firejail 0.9.x. Both residuals are narrow
-  because the realistic deployment is the **container tier** (the jitgen image ships no firejail) and
+  post-execution backstop refuses any run whose launcher **first non-empty stderr line** carries the
+  warning (the stderr capture is floored so a small `output_cap_bytes` cannot truncate the marker).
+  Three residuals remain — **all fail-closed** (a refusal, never a clean pass of an unsandboxed run).
+  (a) **Inherent post-hoc window:** if firejail degraded only for the real command in the tiny window
+  after the pre-execution probe passed, that one command has already run unsandboxed before layer 3
+  refuses it — layer 3 prevents *misreporting* (fail-closed result), not that single execution.
+  (b) **String fragility:** distinguishing "sandboxed" from "degraded passthrough" relies on the warning
+  **string**, which is **version/locale-fragile** — a future firejail that reworded the message *and*
+  still exited 0 while degrading could slip past the string match (the behavioral probe-success check
+  still runs, but it cannot tell a real sandbox from a passthrough without the string). (c) **Merged
+  stderr / forgeable layer-3 marker:** layer 3 scans the *combined* launcher+child stderr (one pipe),
+  which can't be split by stream. On a firejail configured *banner-quiet* (e.g. `quiet-by-default` in
+  firejail.config), a repo's own test could print the marker as the first line and **force** a
+  `SandboxDegraded` refusal of its own run — a self-inflicted, *visible* denial, never an escape. We
+  keep layer 3 anyway because failing closed here is strictly safer than dropping it (which would widen
+  residual (a) into a fail-open micro-window); the un-forgeable guard is the pre-execution probe, which
+  runs `/bin/true` with no untrusted output. Mitigations for (b): two independent substrings of the
+  message are matched (case-insensitive), and the text has been stable across firejail 0.9.x. All three
+  residuals are narrow because the realistic deployment is the **container tier** (the jitgen image ships no firejail) and
   bwrap is preferred above firejail in AUTO order; firejail is the fallback OS-sandbox on bare-metal
   Linux hosts that lack bwrap, where it does **not** degrade. If you must run on firejail inside another
   sandbox, prefer the container tier or `--unsafe-local-execution` with a jitgen-owned ephemeral

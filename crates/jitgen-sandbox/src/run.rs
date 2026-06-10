@@ -113,17 +113,25 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     // already run unsandboxed, so this cannot prevent that run — it ensures we **refuse rather than
     // report it as a clean pass** (fail-closed), and surfaces it as an error.
     //
-    // Scan only the FIRST stderr line: firejail emits this warning as its first output, before the
-    // child is exec'd, so the inner (untrusted) command's output is always on later lines. Scoping to
-    // the first line keeps a hostile repo from forging the marker in its own test stderr to
-    // force-refuse every firejail-tier run. The stderr capture is floored (see `err_capture_cap`) so a
-    // small `output_cap_bytes` cannot truncate the marker away. The marker is fixed jitgen-known text
-    // matched on the raw (pre-redaction) bytes, so nothing untrusted or secret leaks. (security threat #1)
+    // Scan the FIRST NON-EMPTY stderr line. firejail normally emits its warning/banner as its first
+    // output (before the child is exec'd), so scanning the first line catches a real degradation while
+    // a hostile repo's forged marker — which firejail's own output precedes — lands on a later line and
+    // is ignored. The stderr capture is floored (see `err_capture_cap`) so a small `output_cap_bytes`
+    // cannot truncate the marker away. The marker is fixed jitgen-known text matched on the raw
+    // (pre-redaction) bytes, so nothing untrusted or secret leaks.
+    //
+    // LIMITATION (deliberate, fail-closed): the launcher's stderr and the child's stderr share one
+    // pipe, so the streams can't be separated at the byte level. On a firejail configured *banner-quiet*
+    // (e.g. `quiet-by-default` in firejail.config, which suppresses pre-exec output) the child's first
+    // line is the first line we see — so a repo could forge the marker there and force this refusal.
+    // We accept that as the safe direction: it is **fail-closed** (the worst case is a *visible*
+    // `SandboxDegraded` refusal of the repo's OWN run — never a sandbox escape or a clean pass of an
+    // unsandboxed run), and refusing here is strictly safer than dropping the backstop (which would
+    // leave a fail-OPEN micro-window). The AUTHORITATIVE degradation detector is the pre-execution
+    // probe in `Sandbox::run`, which runs `/bin/true` with no untrusted output and cannot be forged;
+    // this post-execution check is only the residual-race net. (security threat #1; see Residual risks.)
     {
         let stderr_lossy = String::from_utf8_lossy(&stderr_raw);
-        // First NON-EMPTY line: firejail emits its warning as its first output (before the child is
-        // exec'd), so a leading blank/CRLF must not hide it, while the untrusted inner command's output
-        // still lands on later lines and can't forge a refusal.
         let launcher_first_line = stderr_lossy
             .lines()
             .map(str::trim)
@@ -912,6 +920,28 @@ mod tests {
             assert!(
                 matches!(err, SandboxError::SandboxDegraded("firejail")),
                 "a tiny output cap must not disable the degradation backstop, got {err:?}"
+            );
+        }
+
+        #[test]
+        fn firejail_first_line_marker_is_refused_fail_closed_even_if_forged() {
+            // DECIDED BEHAVIOR (codex round-3 finding): the post-execution backstop scans the merged
+            // launcher+child stderr, which can't be split by stream. When the marker is the FIRST
+            // non-empty line — whether it is firejail's real warning OR a banner-quiet firejail running
+            // a hostile child that forged it — we REFUSE (fail-closed). This is intentional: the worst
+            // case is a visible SandboxDegraded refusal of the repo's OWN run (no escape, no clean pass
+            // of an unsandboxed run), which is strictly safer than dropping the backstop. The
+            // authoritative, un-forgeable detector is the pre-execution probe in `Sandbox::run`.
+            let forged = "an existing sandbox was detected ... without any additional sandboxing";
+            let script = format!("echo '{forged}' >&2; exit 0");
+            let err = run(
+                &sh_plan_backend(Backend::Firejail, &script),
+                &ExecPolicy::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SandboxError::SandboxDegraded("firejail")),
+                "a first-line marker must fail closed (refuse), got {err:?}"
             );
         }
 
