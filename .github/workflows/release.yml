@@ -341,9 +341,10 @@ jobs:
           # with "expected a signed timestamp to verify an expired certificate" (the tlog SignedEntryTimestamp
           # is what normally provides that, but the SBOM is not in the tlog). We instead request an RFC3161
           # timestamp from the Sigstore public-good TSA; it is tiny (just a signed hash + time) regardless of
-          # SBOM size, and its TSA cert ships in cosign's default trusted root, so consumers verify with no
-          # extra flags. The image SIGNATURES (above) DO go to the tlog (small entries), so normal `cosign
-          # verify` is unaffected; only `verify-attestation` needs --insecure-ignore-tlog (the TSA timestamp,
+          # SBOM size, and its TSA cert ships in cosign's default trusted root — but cosign only checks
+          # RFC3161 timestamps when the verifier passes --use-signed-timestamps. The image SIGNATURES
+          # (above) DO go to the tlog (small entries), so normal `cosign verify` is unaffected; only
+          # `verify-attestation` needs --insecure-ignore-tlog --use-signed-timestamps (the TSA timestamp,
           # not a tlog entry, anchors the signing time). All documented in docs/ci.md.
           TSA=https://timestamp.sigstore.dev/api/v1/timestamp
           cosign attest --recursive --tlog-upload=false --timestamp-server-url "$TSA" --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"

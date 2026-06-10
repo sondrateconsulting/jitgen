@@ -42,6 +42,41 @@ flake-filter, the strong-catch assessment, and reporting) **offline** — but **
 > per-target progress in a SQLite run-state DB and continues from the last safe checkpoint after an
 > interruption (`jitgen resume`).
 
+## What jitgen is — and what it isn't
+
+**It is:**
+
+- **A PR-time test generator.** It reads one diff and produces targeted, runnable tests for the code
+  that changed: `harden` tests that pass and can land with the change, and `catch` reports when a
+  generated test fails on your change while passing on its parent — evidence of a likely regression,
+  assessed before it's called a **strong catch**.
+- **Self-proving before you trust it.** The demo above shows the full pipeline catch a real (seeded)
+  bug, offline; `jitgen analyze` previews the plan for *your* diff with no API key, no sandbox, and no
+  execution. You can watch jitgen work end to end before it touches anything or spends anything.
+- **Advisory-first in CI.** The intended deployment is a SARIF/JUnit report on the PR — surface
+  findings, block nothing — until its strong-catch calls earn trust on your codebase. The findings
+  gate (`--fail-on-catch`) is opt-in, thresholded, and has a baseline file for known catches.
+- **Plain open source.** Apache-2.0. No SaaS backend, no account, no telemetry (the sandbox even
+  strips `SENTRY_DSN`/token-style vars from every command it runs). Diff context goes to the one LLM
+  provider *you* configure — or to no network at all in the default mock mode.
+
+**It isn't:**
+
+- **A test suite, or a replacement for one.** jitgen targets the diff in front of it. Coverage of
+  unchanged code, integration breadth, and long-term suite curation stay your job.
+- **A verdict.** A run with no catches means no *generated* test demonstrated a regression — not that
+  none exists. Generation quality depends on the model, the language, and how testable the changed
+  code is; treat findings as "a reviewer should look here".
+- **Free to run for real.** Mock mode (the default everywhere, including the demo) costs nothing but
+  proves the pipeline, not generation quality. Real runs make provider API calls you pay for — bounded
+  by `--max-tests` (default 20) and hard timeouts, with no automatic retries
+  ([user guide → cost, data, and egress](docs/user-guide.md#operating-a-real-provider-cost-data-and-egress)).
+  You choose the provider and hold the key.
+- **Network-isolated on every host.** The isolating sandbox backends (bwrap / firejail /
+  `sandbox-exec` / container) enforce no-network and are conformance-tested; the opt-in
+  `constrained-local` tier does **not** cut the network itself — the surrounding container must
+  ([docs/security.md](docs/security.md), [ADR-0003](docs/decisions/0003-sandbox-strategy.md)).
+
 ## Highlights
 
 - **First-class adapters:** TypeScript, Java, Python, Rust — plus a generic `.jitgen.yaml` adapter

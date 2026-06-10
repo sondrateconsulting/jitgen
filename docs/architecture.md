@@ -144,7 +144,8 @@ model; full `openat`/`O_NOFOLLOW` dirfd traversal is the F7 hardening.
 Runs the adapter's `test_command` under a **fail-closed** sandbox: untrusted execution **requires** an
 OS sandbox (bubblewrap/firejail on Linux; `sandbox-exec` on macOS) or container (Docker/Podman); if
 none is available, execution is **refused** unless the trusted user passes `--unsafe-local-execution`
-(loud, recorded). **No network by default** (conformance-tested per backend); **hardcoded env
+(loud, recorded). **No network by default** (live conformance tests per backend; Podman shares the
+Docker invocation plan); **hardcoded env
 allowlist** with synthetic `HOME` (no inherited tokens/creds); cwd pinned to the overlay; mandatory
 timeouts, output caps, and **per-backend** resource limits (containers via cgroup flags
 `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/constrained-local via a

@@ -33,8 +33,11 @@ constrained-local tier is **never auto-selected**; it runs only when the trusted
 `--unsafe-local-execution`, which warns loudly and is recorded in run state + reports.
 
 **Invariants across all tiers (enforced in Rust, not delegated to the backend):**
-- **No network by default**, and **conformance-tested per backend** (DNS/TCP/loopback/IPv6/unix
-  socket all denied); a backend that cannot prove network denial is treated as unavailable.
+- **No network by default** — each backend cuts the network wholesale (bwrap `--unshare-all`,
+  firejail `--net=none`, sandbox-exec SBPL `(deny network*)`, containers `--network=none`), and
+  live `#[ignore]`d conformance tests (`crates/jitgen-sandbox/tests/conformance.rs`) probe
+  outbound-connect denial per backend: sandbox-exec, bwrap, firejail, and Docker (Podman shares
+  the Docker invocation plan).
 - **Environment is a hardcoded allowlist**, not inherited — synthetic `HOME`; no token/credential/
   socket vars; trusted additions only, still subject to deny-patterns.
 - **argv-based execution only** — never pass commands as shell strings. `shell: true` is
