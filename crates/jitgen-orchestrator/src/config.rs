@@ -233,6 +233,7 @@ pub fn parse_backend(s: &str) -> Option<SandboxBackend> {
         "sandbox-exec" => Some(SandboxBackend::SandboxExec),
         "docker" => Some(SandboxBackend::Docker),
         "podman" => Some(SandboxBackend::Podman),
+        "netns-helper" => Some(SandboxBackend::NetnsHelper),
         "local" => Some(SandboxBackend::Local),
         _ => None,
     }
@@ -444,5 +445,11 @@ mod tests {
             parse_backend("sandbox-exec"),
             Some(SandboxBackend::SandboxExec)
         );
+        // Env/CLI form is kebab-case; the snake_case serde spelling is config-file-only.
+        assert_eq!(
+            parse_backend("netns-helper"),
+            Some(SandboxBackend::NetnsHelper)
+        );
+        assert!(parse_backend("netns_helper").is_none());
     }
 }

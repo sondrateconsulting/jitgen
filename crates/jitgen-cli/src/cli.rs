@@ -237,6 +237,8 @@ enum SandboxArg {
     SandboxExec,
     Docker,
     Podman,
+    /// Linux network-denying helper (`unshare` user+net namespaces); needs --unsafe-local-execution.
+    NetnsHelper,
     Local,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -300,6 +302,7 @@ impl From<SandboxArg> for SandboxBackend {
             SandboxArg::SandboxExec => SandboxBackend::SandboxExec,
             SandboxArg::Docker => SandboxBackend::Docker,
             SandboxArg::Podman => SandboxBackend::Podman,
+            SandboxArg::NetnsHelper => SandboxBackend::NetnsHelper,
             SandboxArg::Local => SandboxBackend::Local,
         }
     }
@@ -1481,6 +1484,33 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::Run(a) => assert_eq!(a.sandbox, Some(SandboxArg::SandboxExec)),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn netns_helper_value_uses_kebab_case_and_maps_to_core() {
+        let cli = Cli::try_parse_from([
+            "jitgen",
+            "run",
+            "--repo",
+            "/r",
+            "--base",
+            "a",
+            "--head",
+            "b",
+            "--sandbox",
+            "netns-helper",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run(a) => {
+                assert_eq!(a.sandbox, Some(SandboxArg::NetnsHelper));
+                assert_eq!(
+                    SandboxBackend::from(SandboxArg::NetnsHelper),
+                    SandboxBackend::NetnsHelper
+                );
+            }
             _ => panic!(),
         }
     }

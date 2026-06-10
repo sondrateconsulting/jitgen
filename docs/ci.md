@@ -142,7 +142,10 @@ jitgen doctor --config "$CFG" --require-real-llm
   pass on bare constrained-local: you must add **`--unsafe-local-execution`** to assert "this is a
   throwaway, jitgen-owned container." When it passes that way, doctor prints a note that the pass rests
   on the weak tier, not a real sandbox — so a strict preflight can never silently bless an unisolated
-  runner.
+  runner. The note also records whether the run will be auto-upgraded to the **netns-helper** tier
+  (a kernel network cut via `unshare` user+net namespaces, where the kernel permits them —
+  [ADR-0013](decisions/0013-netns-helper-backend.md)); the upgrade never changes the verdict, only
+  the note.
 - **`--require-real-llm`** exits non-zero unless a **real** (non-mock) provider with its API-key env var
   set is configured (it implies `--real-llm` for the check). Use it before a billed real-provider run so
   an unset key fails the preflight, not the run. It checks **key presence, not reachability**: a keyless
@@ -516,16 +519,20 @@ especially on pull requests from forks — must preserve that boundary. The rule
   network isolation the test tier itself does not (next bullet). The trust assumption is therefore
   "**anyone who can push a branch to this repo**" — if that set is broad, add **required reviewers** to
   the `jitgen-llm` Environment so a maintainer approves before the key-bearing run starts.
-- **Network isolation comes from the container, not the constrained-local tier.** Inside a job
-  container you pass `--unsafe-local-execution` to select the **constrained-local** tier, which bounds
-  the test command with a process group, rlimits, and output caps but has **no kernel-enforced network
-  or filesystem isolation** ([ADR-0003](decisions/0003-sandbox-strategy.md), `lib.rs` is
-  `#![forbid(unsafe_code)]` so it can't `unshare`/`setns`). Only jitgen's `os-sandbox` and container
-  *backends* conformance-test network denial; constrained-local is the no-OS-sandbox fallback. So in
-  the "container is the sandbox" model the **ephemeral, jitgen-owned container** provides the network/
-  filesystem boundary — which is exactly why it must be throwaway and jitgen-owned, never a shared or
-  long-lived runner. (On a runner with `bubblewrap`, jitgen selects the network-denying `os-sandbox`
-  tier with no flag, and that tier *does* cut the network itself.)
+- **Network isolation comes from the container — or, where user namespaces work, from the netns
+  helper.** Inside a job container you pass `--unsafe-local-execution`; the bare **constrained-local**
+  tier bounds the test command with a process group, rlimits, and output caps but has **no
+  kernel-enforced network or filesystem isolation**
+  ([ADR-0003](decisions/0003-sandbox-strategy.md), `lib.rs` is `#![forbid(unsafe_code)]` so it can't
+  call `unshare`/`setns` directly). On kernels/runtimes that permit unprivileged user namespaces,
+  jitgen **auto-upgrades** the opted-in run to the **netns-helper** tier
+  ([ADR-0013](decisions/0013-netns-helper-backend.md)): the command is wrapped with util-linux
+  `unshare` (user+net namespaces), so the **network** cut becomes kernel-enforced inside the job
+  container too — check `jitgen doctor`, which reports whether the helper is usable. The
+  **filesystem** boundary still comes from the **ephemeral, jitgen-owned container** in either case —
+  which is exactly why it must be throwaway and jitgen-owned, never a shared or long-lived runner.
+  (On a runner with `bubblewrap`, jitgen selects the network-denying `os-sandbox` tier with no flag,
+  and that tier *does* cut the network itself.)
 - **Keep the key in a protected Environment / masked protected variable** (defense-in-depth), so a
   workflow-logic mistake still cannot leak it. The Environment sits on the same-repo job only, so fork
   PRs never touch it; if you add required reviewers to it, same-repo runs pause for approval before the

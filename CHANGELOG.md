@@ -8,6 +8,26 @@ run state and report formats.
 
 ## [Unreleased]
 
+### Added
+- **`netns-helper` sandbox backend — a kernel-enforced network cut for the unsafe-local path
+  (GP15, [ADR-0013](docs/decisions/0013-netns-helper-backend.md)).** A new Linux-only tier that wraps
+  the test command with util-linux `unshare --user --map-root-user --net` (a helper *process* — no
+  `unsafe` code), so connectivity to everything outside the namespace — DNS/TCP/UDP/IPv6 and the
+  host's loopback services — fails in-kernel even inside an ordinary CI job container (scope: a
+  test can re-up its namespace-private loopback and talk to itself, which reaches nothing outside;
+  pathname AF_UNIX sockets are filesystem objects and are not cut). It is **not** an isolating sandbox (filesystem confinement still comes from the
+  surrounding container), so it can never satisfy the fail-closed gate: it requires the same
+  `--unsafe-local-execution` opt-in as constrained-local. Under `--sandbox auto` an opted-in run is
+  **auto-upgraded** from constrained-local to the helper when a functional probe (real user+net
+  namespace creation) passes — explicit `--sandbox local` is never upgraded, and explicit
+  `--sandbox netns-helper` fails closed where the kernel blocks unprivileged user namespaces.
+  `jitgen doctor` reports the helper's availability (new `netns_helper` JSON field, serde-defaulted)
+  and `--require-sandbox`'s pass-note records the upgrade. Conformance gates assert the
+  tier-defining pair — the command cannot open a network connection AND still executes — plus
+  loopback denial; a probe-gated (not `#[ignore]`d) end-to-end test gives plain
+  `cargo test`/`bazel test` live coverage on Linux hosts that permit user namespaces. This is the
+  real isolation boundary that gates the named GitHub Action (GP12).
+
 ### Fixed
 - **The documented SBOM verify command now actually verifies after the signing certificate expires.**
   `cosign verify-attestation` only consults RFC3161 timestamps when the verifier passes

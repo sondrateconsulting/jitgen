@@ -56,7 +56,16 @@ impl Sandbox {
 
     /// Detect available backends on this host and select one (fail-closed).
     pub fn detect_and_select(policy: ExecPolicy) -> Result<Self> {
-        Self::new(&crate::detect::detect(), policy)
+        let mut available = crate::detect::detect();
+        // The netns helper is never part of `detect()` (it is not an isolating sandbox); probe it
+        // only when the policy could actually select it — the unsafe-local opt-in (Auto upgrade)
+        // or an explicit request — so other runs never spawn the extra probe.
+        if (policy.allow_unsafe_local || policy.backend == jitgen_core::SandboxBackend::NetnsHelper)
+            && crate::detect::netns_helper_available()
+        {
+            available.push(Backend::NetnsHelper);
+        }
+        Self::new(&available, policy)
     }
 
     /// The backend this sandbox will use.
@@ -72,6 +81,30 @@ impl Sandbox {
 
     /// Build the env + plan and execute, returning a redacted/capped/classified result.
     pub fn run(&self, req: &RunRequest) -> Result<ExecutionResult> {
+        self.run_with_degradation_probe(req, crate::detect::backend_silently_degrades)
+    }
+
+    /// [`run`](Self::run) with the pre-execution degradation probe injected, so the refusal path is
+    /// unit-testable offline (no live containerized firejail needed). Production always goes
+    /// through [`run`](Self::run), which passes [`crate::detect::backend_silently_degrades`].
+    fn run_with_degradation_probe(
+        &self,
+        req: &RunRequest,
+        backend_silently_degrades: fn(Backend) -> bool,
+    ) -> Result<ExecutionResult> {
+        // PRE-EXECUTION guard for a silently-degrading launcher (firejail). firejail runs the command
+        // with NO sandboxing (exit 0, warning on stderr) when it detects it is already inside a
+        // sandbox/container. Re-probe its isolation RIGHT NOW, before building/spawning anything, so a
+        // degrading firejail is refused **without ever executing** the untrusted command — closing the
+        // window between detection (at construction) and this run, and covering an explicitly-selected
+        // backend. Detection already excludes such a firejail from `Auto`; the post-execution stderr
+        // backstop in `crate::run` is the third layer. Only a degradation-capable backend pays for the
+        // probe, and it short-circuits with no spawn when the launcher can't be trusted-resolved.
+        // (security threat #1, fail-closed.)
+        if self.backend.has_silent_degradation_mode() && backend_silently_degrades(self.backend) {
+            return Err(SandboxError::SandboxDegraded(self.backend.id()));
+        }
+
         // Canonicalize the overlay + state roots so the SBPL `subpath` / container bind paths match
         // the kernel-resolved path (macOS `/tmp`→`/private/tmp`) and PATH filtering compares real
         // paths. `canonicalize` also yields absolute paths and requires both roots to already exist.
@@ -242,6 +275,81 @@ mod tests {
         assert!(!sb.warnings().iter().any(|w| w.contains("RUSTUP_HOME")));
     }
 
+    // A RunRequest whose roots don't exist: anything that gets PAST the pre-execution guard fails
+    // at root canonicalization with `Io`, so the guard's refusal (`SandboxDegraded`) is cleanly
+    // distinguishable from "the run proceeded".
+    fn nonexistent_roots_request(cmd: &SpawnRequest) -> RunRequest<'_> {
+        RunRequest {
+            command: cmd,
+            overlay_root: Path::new("/nonexistent/jitgen-overlay"),
+            state_root: Path::new("/nonexistent/jitgen-state"),
+            instance: "t-degradation-guard",
+            run_as: None,
+        }
+    }
+
+    #[test]
+    fn degrading_firejail_is_refused_before_anything_runs() {
+        // The PRE-execution guard must fire before the roots are even canonicalized: with
+        // nonexistent roots, anything past the guard fails with `Io` — so `SandboxDegraded` here
+        // proves the refusal precedes all run work and the untrusted command was never built or
+        // spawned. The probe is injected, so no live degrading firejail is needed.
+        let policy = ExecPolicy {
+            backend: SandboxBackend::Firejail,
+            ..ExecPolicy::default()
+        };
+        let sb = Sandbox::new(&[Backend::Firejail], policy).unwrap();
+        let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "true".into()]);
+        let req = nonexistent_roots_request(&cmd);
+        let err = sb.run_with_degradation_probe(&req, |_| true).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::SandboxDegraded("firejail")),
+            "a degrading probe must refuse the run up front, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn healthy_firejail_probe_lets_the_run_proceed() {
+        // probe = not degrading → the guard passes and the run proceeds to root canonicalization,
+        // which fails with `Io` for these nonexistent roots — proving the guard did not refuse.
+        let policy = ExecPolicy {
+            backend: SandboxBackend::Firejail,
+            ..ExecPolicy::default()
+        };
+        let sb = Sandbox::new(&[Backend::Firejail], policy).unwrap();
+        let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "true".into()]);
+        let req = nonexistent_roots_request(&cmd);
+        let err = sb.run_with_degradation_probe(&req, |_| false).unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Io(_)),
+            "a healthy probe must let the run proceed past the guard, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn degradation_probe_is_not_consulted_for_a_backend_without_that_mode() {
+        // Only a degradation-capable backend (firejail) pays for the pre-execution probe; for every
+        // other backend `has_silent_degradation_mode()` short-circuits and the probe must never run.
+        let policy = ExecPolicy {
+            backend: SandboxBackend::Local,
+            allow_unsafe_local: true,
+            ..ExecPolicy::default()
+        };
+        let sb = Sandbox::new(&[], policy).unwrap();
+        assert_eq!(sb.backend(), Backend::ConstrainedLocal);
+        let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "true".into()]);
+        let req = nonexistent_roots_request(&cmd);
+        let err = sb
+            .run_with_degradation_probe(&req, |_| {
+                panic!("the degradation probe must not be consulted for constrained-local")
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Io(_)),
+            "the run must proceed past the guard without probing, got {err:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn constrained_local_runs_end_to_end() {
@@ -273,6 +381,84 @@ mod tests {
         let res = sb.run(&req).unwrap();
         assert_eq!(res.outcome, jitgen_core::ExecOutcome::Passed);
         assert_eq!(res.stdout, "hi");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netns_local_runs_end_to_end_and_denies_network() {
+        // Probe-gated, NOT `#[ignore]`d: unlike the OS-sandbox/container tiers, the netns helper
+        // nests fine inside build sandboxes wherever unprivileged user namespaces are permitted —
+        // and where they aren't, the functional probe says so and the test skips loudly. This gives
+        // plain `cargo test`/`bazel test` on a capable Linux host live coverage of the
+        // tier-defining property (GP15): the command executes AND cannot reach the network.
+        if !crate::detect::netns_helper_available() {
+            eprintln!("SKIP netns_local_runs_end_to_end: unshare user+net namespaces not usable");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("jitgen-netns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let overlay = base.join("overlay");
+        let state = base.join("state");
+        std::fs::create_dir_all(&overlay).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        // Auto + the unsafe-local opt-in upgrades to the netns helper (the production CI path).
+        let policy = ExecPolicy {
+            backend: SandboxBackend::Auto,
+            allow_unsafe_local: true,
+            ..ExecPolicy::default()
+        };
+        let sb = Sandbox::new(&[Backend::NetnsHelper], policy).unwrap();
+        assert_eq!(sb.backend(), Backend::NetnsHelper);
+
+        // Executes: an ordinary command passes and produces output.
+        let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "printf hi".into()]);
+        let res = sb
+            .run(&RunRequest {
+                command: &cmd,
+                overlay_root: &overlay,
+                state_root: &state,
+                instance: "netns-exec",
+                run_as: None,
+            })
+            .unwrap();
+        assert_eq!(res.outcome, jitgen_core::ExecOutcome::Passed, "{res:?}");
+        assert_eq!(res.stdout, "hi");
+
+        // Denies network: the same sentinel probe the conformance suite uses. A toolless host
+        // (no nc/bash) skips LOUDLY below — never silently green without the denial assertion.
+        let script = "\
+            if command -v nc >/dev/null 2>&1; then \
+                nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+            elif command -v bash >/dev/null 2>&1; then \
+                bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+            else echo NO_PROBE_TOOL; fi";
+        let overlay2 = base.join("overlay2");
+        std::fs::create_dir_all(&overlay2).unwrap();
+        let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script.into()]);
+        let res = sb
+            .run(&RunRequest {
+                command: &cmd,
+                overlay_root: &overlay2,
+                state_root: &state,
+                instance: "netns-net",
+                run_as: None,
+            })
+            .unwrap();
+        if res.stdout.contains("NO_PROBE_TOOL") {
+            eprintln!(
+                "SKIP netns network-denial check: host has neither nc nor bash to probe with \
+                 (execution half already verified)"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert!(
+            res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+            "netns helper must deny network; got {res:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
