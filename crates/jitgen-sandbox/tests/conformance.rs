@@ -484,6 +484,19 @@ fn netns_helper_denies_loopback() {
     let Some(sb) = netns_sandbox() else {
         return;
     };
+
+    // Execution half first (same sandbox), so a wrapper that executes nothing fails here with a
+    // clear diagnosis instead of a confusing "must deny loopback" message on empty output.
+    let fx = Fixture::new("netns-lo-exec");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "printf hi".into()]);
+    let res = exec(&sb, &cmd, &fx);
+    assert_eq!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "a plain command must still execute under the netns helper: {res:?}"
+    );
+    assert_eq!(res.stdout, "hi");
+
     let script = "\
         if command -v nc >/dev/null 2>&1; then \
             nc -w 3 127.0.0.1 65530 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
