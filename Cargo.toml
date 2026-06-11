@@ -58,7 +58,7 @@ sigpipe = "0.1"
 # backend runs a build script (cc + pregenerated asm), which Bazel crate_universe handles. Pinned to the
 # 3.2.x line: pinned for build stability. (ureq >=3.3 needs rustc 1.85, now within the workspace MSRV
 # of 1.85 — adopting a newer ureq is a separate, deliberate change.)
-ureq = "~3.2.1"
+ureq = "~3.3.0"
 
 # Intra-workspace (path-based).
 jitgen-core = { path = "crates/jitgen-core" }
