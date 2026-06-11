@@ -45,9 +45,9 @@ const COLLECT_GRACE: Duration = Duration::from_secs(2);
 /// must not let cleanup hang `run()` past the wall-clock watchdog (T2/F7 P3).
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Floor on the stderr capture for a plan whose stderr carries a trusted jitgen-known marker that a
-/// security check must be able to see: the firejail *degradation* marker (the launcher's first stderr
-/// line, scanned by the fail-closed backstop below) or the preamble *start sentinel* (whose absence
-/// witnesses a wrapper failure). Either signal must not be defeatable by a small trusted
+/// security check must be able to see: the firejail *degradation* marker (scanned anywhere in the
+/// bounded capture by the fail-closed backstop below) or the preamble *start sentinel* (whose
+/// absence witnesses a wrapper failure). Either signal must not be defeatable by a small trusted
 /// `output_cap_bytes`, so we always capture at least this much stderr for such a plan. Comfortably
 /// larger than either marker plus any launcher banner line. The returned stderr is still re-trimmed
 /// to the user cap before redaction — the floor only widens the window the marker scans see.
@@ -152,40 +152,38 @@ pub(crate) fn run_reporting(
     // Third-layer backstop for a silently-degrading launcher, checked BEFORE we trust the exit status
     // (so it fires even on the rare path where `wait_with_timeout` itself errored). The PRIMARY guards
     // are earlier and *prevent* the unsandboxed run: detection at `Sandbox` construction never selects
-    // a degrading firejail, and the pre-execution re-probe above refuses one before the command is
-    // spawned. This post-execution check is a net for the residual case where firejail degraded only
-    // for the real command (a tight detect→run race the pre-probe didn't observe): the command has
-    // already run unsandboxed, so this cannot prevent that run — it ensures we **refuse rather than
-    // report it as a clean pass** (fail-closed), and surfaces it as an error.
+    // a degrading firejail (behavioral loopback-listener probe, wording-independent), and the
+    // pre-execution re-probe above refuses one before the command is spawned. This post-execution
+    // check is a net for the residual case where firejail degraded only for the real command (a tight
+    // detect→run race the pre-probe didn't observe): the command has already run unsandboxed, so this
+    // cannot prevent that run — it ensures we **refuse rather than report it as a clean pass**
+    // (fail-closed), and surfaces it as an error.
     //
-    // Scan the FIRST NON-EMPTY stderr line. firejail normally emits its warning/banner as its first
-    // output (before the child is exec'd), so scanning the first line catches a real degradation while
-    // a hostile repo's forged marker — which firejail's own output precedes — lands on a later line and
-    // is ignored. The stderr capture is floored (see `err_capture_cap`) so a small `output_cap_bytes`
-    // cannot truncate the marker away. The marker is fixed jitgen-known text matched on the raw
-    // (pre-redaction) bytes, so nothing untrusted or secret leaks.
+    // Scan the WHOLE bounded stderr capture, not just the first line. firejail emits its warning
+    // before exec'ing the child, so the marker always precedes child output in the pipe — but its
+    // LINE position is not contractual: other launcher warnings/banner lines (cgroup, AppArmor,
+    // profile notices, version/config dependent) can land before it, and a first-line-only scan
+    // turned any such banner into a fail-OPEN bypass of this backstop. Scanning everything is
+    // position-independent and strictly fail-closed. The stderr capture is floored (see
+    // `err_capture_cap`) so a small `output_cap_bytes` cannot truncate the launcher's early warning
+    // away; bytes beyond the cap are unscanned, which only ever drops *forged* markers (the real one
+    // is the launcher's pre-exec output, within the floor). The marker is fixed jitgen-known text
+    // matched on the raw (pre-redaction) bytes, so nothing untrusted or secret leaks.
     //
     // LIMITATION (deliberate, fail-closed): the launcher's stderr and the child's stderr share one
-    // pipe, so the streams can't be separated at the byte level. On a firejail configured *banner-quiet*
-    // (e.g. `quiet-by-default` in firejail.config, which suppresses pre-exec output) the child's first
-    // line is the first line we see — so a repo could forge the marker there and force this refusal.
-    // We accept that as the safe direction: it is **fail-closed** (the worst case is a *visible*
+    // pipe, so the streams can't be separated at the byte level — a hostile repo can print the marker
+    // in its own output and force this refusal. That was already true of the first-line scan on a
+    // firejail configured *banner-quiet* (e.g. `quiet-by-default` in firejail.config, which
+    // suppresses pre-exec output); the whole-capture scan widens it from "first line under a quiet
+    // config" to "anywhere", and we accept that as the safe direction: the worst case is a *visible*
     // `SandboxDegraded` refusal of the repo's OWN run — never a sandbox escape or a clean pass of an
-    // unsandboxed run), and refusing here is strictly safer than dropping the backstop (which would
-    // leave a fail-OPEN micro-window). The AUTHORITATIVE degradation detector is the pre-execution
-    // probe in `Sandbox::run`, which runs `/bin/true` with no untrusted output and cannot be forged;
-    // this post-execution check is only the residual-race net. (security threat #1; see Residual risks.)
+    // unsandboxed run — while the first-line scope traded that nuisance for a real fail-open. The
+    // AUTHORITATIVE degradation detector is the pre-execution behavioral probe in `Sandbox::run`,
+    // which runs a trusted sentinel script with no untrusted output and cannot be forged; this
+    // post-execution check is only the residual-race net. (security threat #1; see Residual risks.)
     {
         let stderr_lossy = String::from_utf8_lossy(&stderr_raw);
-        let launcher_first_line = stderr_lossy
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("");
-        if plan
-            .backend
-            .stderr_shows_silent_degradation(launcher_first_line)
-        {
+        if plan.backend.stderr_shows_silent_degradation(&stderr_lossy) {
             return Err(SandboxError::SandboxDegraded(plan.backend.id()));
         }
     }
@@ -1111,12 +1109,12 @@ mod tests {
         #[test]
         fn firejail_first_line_marker_is_refused_fail_closed_even_if_forged() {
             // DECIDED BEHAVIOR (codex round-3 finding): the post-execution backstop scans the merged
-            // launcher+child stderr, which can't be split by stream. When the marker is the FIRST
-            // non-empty line — whether it is firejail's real warning OR a banner-quiet firejail running
-            // a hostile child that forged it — we REFUSE (fail-closed). This is intentional: the worst
-            // case is a visible SandboxDegraded refusal of the repo's OWN run (no escape, no clean pass
-            // of an unsandboxed run), which is strictly safer than dropping the backstop. The
-            // authoritative, un-forgeable detector is the pre-execution probe in `Sandbox::run`.
+            // launcher+child stderr, which can't be split by stream. When the marker appears —
+            // whether it is firejail's real warning OR a hostile child forging it — we REFUSE
+            // (fail-closed). This is intentional: the worst case is a visible SandboxDegraded
+            // refusal of the repo's OWN run (no escape, no clean pass of an unsandboxed run), which
+            // is strictly safer than dropping the backstop. The authoritative, un-forgeable detector
+            // is the pre-execution behavioral probe in `Sandbox::run`.
             let forged = "an existing sandbox was detected ... without any additional sandboxing";
             let script = format!("echo '{forged}' >&2; exit 0");
             let err = run(
@@ -1131,22 +1129,26 @@ mod tests {
         }
 
         #[test]
-        fn firejail_marker_only_on_a_later_stderr_line_is_not_refused() {
-            // A genuinely-sandboxing firejail prints its banner first (line 1); if the inner
-            // (untrusted) test then emits the marker phrase on a LATER line, that must NOT be mistaken
-            // for firejail degrading — the backstop scans only firejail's own first line. This stops a
-            // hostile repo from forging the warning in its test stderr to force-refuse every
-            // firejail-tier run.
+        fn firejail_marker_on_a_later_stderr_line_is_still_refused() {
+            // The degradation warning's LINE position is not contractual: firejail can print other
+            // banner/warning lines before it (version/config dependent), so the backstop scans the
+            // WHOLE bounded capture — a marker preceded by a banner line must still refuse. (The old
+            // first-line-only scan returned Passed here: any leading banner was a fail-OPEN bypass.)
+            // The flip side — a hostile repo forging the marker in its own later output forces a
+            // visible refusal of its own run — is the accepted fail-closed direction, same decision
+            // as the first-line forgery case above.
             let script = "echo 'Parent pid 2, child pid 3' >&2; \
                           echo 'an existing sandbox was detected ... without any additional sandboxing' >&2; \
                           printf ok";
-            let r = run(
+            let err = run(
                 &sh_plan_backend(Backend::Firejail, script),
                 &ExecPolicy::default(),
             )
-            .unwrap();
-            assert_eq!(r.outcome, ExecOutcome::Passed);
-            assert_eq!(r.stdout, "ok");
+            .unwrap_err();
+            assert!(
+                matches!(err, SandboxError::SandboxDegraded("firejail")),
+                "a marker after a banner line must still refuse (fail-closed), got {err:?}"
+            );
         }
 
         #[test]
