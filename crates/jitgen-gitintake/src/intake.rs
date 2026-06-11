@@ -27,8 +27,8 @@ const MAX_REFS_WALK: usize = 100_000;
 /// Cap on head-side hunks materialized for a single file; fail closed beyond (pre-sandbox DoS
 /// bound). With `context_lines(0)` a hostile near-1MiB file of alternating changed/unchanged lines
 /// would otherwise materialize ~260k `LineRange`s. Aligned with the downstream per-file `MAX_HUNKS`
-/// in `jitgen-adapters` (which silently truncates beyond it), so intake never materializes hunk
-/// lists no consumer could use anyway.
+/// in `jitgen-adapters`, beyond which the grammar path demotes hunks to line-range fallback targets
+/// rather than symbol targets — so past this point each extra hunk only adds bulk, not precision.
 const MAX_HUNKS_PER_FILE: usize = 1000;
 /// Aggregate cap on hunk callbacks across the whole diff walk; fail closed beyond (pre-sandbox DoS
 /// bound). Counts EVERY hunk the walk produces — including pure-deletion hunks that materialize
@@ -1134,6 +1134,53 @@ mod tests {
     }
 
     #[test]
+    fn per_file_hunk_cap_names_only_the_offending_file() {
+        // One file under the cap plus one over it: the walk must fail closed naming the file that
+        // tripped the cap (repo-relative, per the GitError contract). A mis-attributed index
+        // lookup would either suppress the error or blame the innocent file.
+        let dir = temp_dir("hunkcap-multi");
+        let repo = Repository::init(&dir).unwrap();
+        let alternating = |n: usize, tag: &str| -> String {
+            (0..n).map(|i| format!("keep{i}\n{tag}{i}\n")).collect()
+        };
+        std::fs::write(
+            dir.join("file_a.txt"),
+            alternating(MAX_HUNKS_PER_FILE - 1, "old"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("file_b.txt"),
+            alternating(MAX_HUNKS_PER_FILE + 1, "old"),
+        )
+        .unwrap();
+        let base_oid = commit_all(&repo, &dir, "c1", None);
+        std::fs::write(
+            dir.join("file_a.txt"),
+            alternating(MAX_HUNKS_PER_FILE - 1, "new"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("file_b.txt"),
+            alternating(MAX_HUNKS_PER_FILE + 1, "new"),
+        )
+        .unwrap();
+        let head_oid = commit_all(&repo, &dir, "c2", Some(base_oid));
+
+        let err = diff_revisions(&repo, &base_oid.to_string(), &head_oid.to_string()).unwrap_err();
+        assert!(matches!(err, GitError::TooManyHunks(_)), "got: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("file_b.txt"),
+            "must name the offending file, got: {msg}"
+        );
+        assert!(
+            !msg.contains("file_a.txt"),
+            "must not blame the under-cap file, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn aggregate_hunk_budget_counts_every_hunk_callback() {
         // Pure-deletion hunks materialize NOTHING (new_lines == 0), so the per-file cap alone never
         // trips — yet each one still costs a Myers-diff hunk callback (the pure-CPU DoS vector). The
@@ -1157,6 +1204,32 @@ mod tests {
 
         let err = diff_revisions(&repo, &base_oid.to_string(), &head_oid.to_string()).unwrap_err();
         assert!(matches!(err, GitError::TooManyHunks(_)), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aggregate_hunk_budget_accepts_exactly_at_cap() {
+        // The aggregate boundary is exclusive (`>`): a diff producing exactly MAX_TOTAL_HUNKS hunk
+        // callbacks must succeed. Pins the fence-post — flipping the budget check to `>=` would
+        // reject this legitimate diff and fail this test.
+        let dir = temp_dir("hunkbudget-ok");
+        let repo = Repository::init(&dir).unwrap();
+        const PAIRS_PER_FILE: usize = 20_000;
+        let files = MAX_TOTAL_HUNKS / PAIRS_PER_FILE; // exactly the budget
+        let base_content = "k\nd\n".repeat(PAIRS_PER_FILE);
+        let head_content = "k\n".repeat(PAIRS_PER_FILE); // every `d` line: isolated deletion hunk
+        for i in 0..files {
+            std::fs::write(dir.join(format!("f{i}.txt")), &base_content).unwrap();
+        }
+        let base_oid = commit_all(&repo, &dir, "c1", None);
+        for i in 0..files {
+            std::fs::write(dir.join(format!("f{i}.txt")), &head_content).unwrap();
+        }
+        let head_oid = commit_all(&repo, &dir, "c2", Some(base_oid));
+
+        let cs = diff_revisions(&repo, &base_oid.to_string(), &head_oid.to_string())
+            .expect("exactly MAX_TOTAL_HUNKS hunk callbacks must not trip the aggregate budget");
+        assert_eq!(cs.files.len(), files);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
