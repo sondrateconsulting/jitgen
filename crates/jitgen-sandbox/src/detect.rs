@@ -32,8 +32,11 @@ const SANITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// [`net_probe_verdict`]. These are the **entire** shell→Rust channel of the behavioral probe, so
 /// the word the script emits and the word the verdict matches MUST be the same literal — single-sourced
 /// here so the two cannot drift (a drift would silently collapse every verdict to `Inconclusive`,
-/// fail-closed at detect but never a refusal at pre-exec). The live conformance gate and the netns
-/// unit test reference these same constants for the same reason.
+/// fail-closed at detect but never a refusal at pre-exec). The netns network-denial **unit** test
+/// (`crate::sandbox`) reuses these same constants for its own emit/match. The live **conformance**
+/// suite is a separate integration binary that sees only the crate's public surface, so it keeps a
+/// deliberately independent, self-consistent sentinel vocabulary (bare literals pinned by its own
+/// `net_probe_script_is_structurally_sound`); it does **not** reference these `pub(crate)` constants.
 pub(crate) const SENTINEL_NET_OK: &str = "NET_OK";
 pub(crate) const SENTINEL_NET_DENIED: &str = "NET_DENIED";
 pub(crate) const SENTINEL_NO_PROBE_TOOL: &str = "NO_PROBE_TOOL";
@@ -130,14 +133,6 @@ pub(crate) fn backend_silently_degrades(backend: Backend) -> bool {
             .is_some_and(|p| behavioral_probe_shows_degradation(backend, &p))
 }
 
-/// Pure: does this probe outcome show the backend silently degraded — i.e. it **ran** (exit 0) yet its
-/// stderr carries the degradation marker? Split out so the refusal decision is unit-tested with
-/// injected outcomes, without a live containerized firejail. (Mirror of [`probe_is_available`],
-/// which is `success && !marker`.)
-fn outcome_shows_silent_degradation(backend: Backend, outcome: &ProbeOutcome) -> bool {
-    outcome.success && backend.stderr_shows_silent_degradation(&outcome.stderr)
-}
-
 /// The outcome of running a backend's probe: whether it exited 0 within the timeout, its captured
 /// stdout (the behavioral probe's sentinel words), and its captured stderr (for backends whose
 /// silent-degradation signal is a warning string).
@@ -205,8 +200,7 @@ fn loopback_probe_body(port: u16) -> String {
 
 /// The full trusted `/bin/sh` sentinel script for the behavioral net probe: [`loopback_probe_body`]
 /// prefixed with a `PATH` of trusted system dirs only. The probe spawns env-cleared, so the script
-/// must set its own `PATH` for the `command -v` lookups; the conformance gate runs the body directly
-/// because its run plan already supplies a `PATH`.
+/// must set its own `PATH` for the `command -v` lookups.
 fn net_probe_script(port: u16) -> String {
     format!(
         "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; {}",
@@ -301,13 +295,19 @@ fn behavioral_probe_confirms_isolation(backend: Backend, p: &BehavioralProbe) ->
 /// Decide the PRE-execution refusal from a behavioral probe (**pure** — unit-tested with injected
 /// outcomes): positive evidence of a degraded passthrough is the legacy stderr marker OR the
 /// sentinel script reaching the parent listener from inside the cut (`isolated == Open`), regardless
-/// of wording — and `NET_OK` counts even on a nonzero exit (the connect was observed; the exit status
-/// adds nothing). The control does not gate this: a positive `isolated == Open` (or marker) stands on
-/// its own — if the tool reached the listener from *inside* the cut, the network plainly was not cut.
-/// `Inconclusive` alone never refuses: there is no evidence, detection already required positive
-/// proof of isolation, and the post-execution stderr backstop still stands behind this guard.
+/// of wording. **Both arms are exit-status-independent.** `NET_OK` counts even on a nonzero exit (the
+/// connect was observed; the exit status adds nothing), and the **marker** likewise refuses on any
+/// exit — it is trusted launcher output (no untrusted code runs in the probe) announcing the launcher
+/// is not isolating, so we distrust a launcher that *says* it degraded whatever its exit code (the
+/// same defense-in-depth detect applies via `probe_is_available`'s `!marker`; firejail degrades by
+/// running the inner command and exiting with ITS code, so the warning is not tied to exit 0). The
+/// control does not gate this: a positive `isolated == Open` (or marker) stands on its own — if the
+/// tool reached the listener from *inside* the cut, the network plainly was not cut. `Inconclusive`
+/// alone never refuses: there is no evidence, detection already required positive proof of isolation,
+/// and the post-execution stderr backstop still stands behind this guard.
 fn behavioral_probe_shows_degradation(backend: Backend, p: &BehavioralProbe) -> bool {
-    outcome_shows_silent_degradation(backend, &p.outcome) || p.isolated_verdict == NetVerdict::Open
+    backend.stderr_shows_silent_degradation(&p.outcome.stderr)
+        || p.isolated_verdict == NetVerdict::Open
 }
 
 /// Spawn `program args` with stdout and stderr captured (each bounded) and a wall-clock bound;
@@ -515,31 +515,39 @@ mod tests {
     }
 
     #[test]
-    fn outcome_shows_silent_degradation_decides_the_pre_execution_refusal() {
-        // The PRE-execution guard (`Sandbox::run` → `backend_silently_degrades`) refuses iff the probe
-        // RAN (exit 0) and its stderr carries the marker. Exercised purely with injected outcomes so
-        // the positive "firejail degraded → refuse" decision is covered without a live firejail.
+    fn pre_execution_marker_arm_refuses_independent_of_exit_status() {
+        // The PRE-execution guard (`Sandbox::run` → `backend_silently_degrades`) refuses on the
+        // launcher's degradation marker as POSITIVE evidence — exit-status-independent: we distrust a
+        // launcher that *says* it degraded whatever its exit code (firejail degrades by running the
+        // inner command and exiting with ITS code, so the warning is not tied to exit 0). The marker
+        // is trusted launcher output (no untrusted code runs in the probe), so it cannot be forged.
         let warning = "an existing sandbox was detected ... without any additional sandboxing";
-        // Ran + marker → degraded (refuse before executing the untrusted command).
-        assert!(outcome_shows_silent_degradation(
+        // Marker on exit 0 → refuse.
+        assert!(behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(true, warning)
+            &behavioral(true, warning, NetVerdict::Open, NetVerdict::Inconclusive)
         ));
-        // Ran + clean → not degraded (genuinely sandboxing).
-        assert!(!outcome_shows_silent_degradation(
+        // Marker on a NONZERO exit → still refuse (the change from the old success-gated helper: a
+        // marker with no positive `NET_OK` must NOT slip the pre-exec layer onto the post-exec
+        // backstop). Non-vacuous: re-gating the marker arm on `outcome.success` flips this to false.
+        assert!(behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(true, "Child process initialized")
+            &behavioral(false, warning, NetVerdict::Open, NetVerdict::Inconclusive)
         ));
-        // Did not run (nonzero/failed probe) → not "silently degraded" (that path is a loud failure,
-        // handled by the launcher refusing to spawn or `select` excluding it).
-        assert!(!outcome_shows_silent_degradation(
+        // Clean stderr + no positive isolated NET_OK → not degraded (genuinely sandboxing).
+        assert!(!behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(false, warning)
+            &behavioral(
+                true,
+                "Child process initialized",
+                NetVerdict::Open,
+                NetVerdict::Denied
+            )
         ));
         // A backend with no degradation mode never counts as degraded, whatever its stderr.
-        assert!(!outcome_shows_silent_degradation(
+        assert!(!behavioral_probe_shows_degradation(
             Backend::Docker,
-            &outcome(true, warning)
+            &behavioral(true, warning, NetVerdict::Open, NetVerdict::Denied)
         ));
     }
 
