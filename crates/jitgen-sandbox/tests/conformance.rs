@@ -1046,6 +1046,9 @@ fn netns_runtime_unshare_failure_is_not_a_test_failure() {
     // Build the sandbox FIRST (selection-time probe must pass), so the failure we induce is strictly
     // a post-selection, run-time one — the exact race the fix targets.
     let Some(sb) = netns_sandbox() else {
+        // The helper already printed its generic skip; name THIS gate too, so a conformance log
+        // shows the signal-integrity invariant specifically was not exercised (never a silent pass).
+        eprintln!("SKIP netns runtime-failure gate: netns helper unavailable at selection time");
         return;
     };
 

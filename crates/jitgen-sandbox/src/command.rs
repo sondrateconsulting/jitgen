@@ -54,10 +54,12 @@ pub struct SandboxPlan {
 /// Trusted line the rlimit preamble prints to stderr **immediately before** `exec "$@"` — i.e. after
 /// the launcher (`unshare`/`bwrap`/`sandbox-exec`) and the preamble have run, but before control passes
 /// to the untrusted inner command. Its presence is an **unforgeable** witness that execution reached
-/// the inner command: the only writers to the shared stderr pipe, in order, are the trusted launcher,
-/// the trusted preamble (which emits this), then the untrusted command — so a command cannot erase a
-/// sentinel already in the pipe, and a wrapper that failed before `exec` never emitted one (no
-/// attacker code ran to forge it). The runtime keys "inner never started" off its *absence*. A fixed
+/// the inner command: every stderr writer before the untrusted command is trusted — the launcher on
+/// the tiers that have one (`unshare`/`bwrap`/`sandbox-exec`), then the preamble (which emits this);
+/// the constrained-local tier spawns the `/bin/sh` preamble directly, so the preamble is its first and
+/// only trusted writer — and the untrusted command only runs after. A command cannot erase a sentinel
+/// already in the pipe, and a wrapper that failed before `exec` never emitted one (no attacker code
+/// ran to forge it). The runtime keys "inner never started" off its *absence*. A fixed
 /// string (not a nonce) suffices: there is no forgery a nonce would prevent — an attacker re-printing
 /// it only adds a cosmetic duplicate line, never a false absence. Kept in sync with the emitter in
 /// [`with_rlimit_preamble`] and the detector in [`crate::run`]; this is the single source.

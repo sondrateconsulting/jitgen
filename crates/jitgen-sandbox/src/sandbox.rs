@@ -84,14 +84,14 @@ impl Sandbox {
     pub fn run(&self, req: &RunRequest) -> Result<ExecutionResult> {
         self.run_with_probes(
             req,
-            crate::detect::backend_silently_degrades,
-            crate::detect::backend_available_now,
+            DegradationProbe(crate::detect::backend_silently_degrades),
+            AvailabilityProbe(crate::detect::backend_available_now),
         )
     }
 
     /// [`run`](Self::run) with the two trusted probes injected, so both refusal paths are
-    /// unit-testable offline: `backend_silently_degrades` drives the firejail PRE-execution
-    /// degradation guard (no live containerized firejail needed) and `backend_available_now` drives
+    /// unit-testable offline: the [`DegradationProbe`] drives the firejail PRE-execution
+    /// degradation guard (no live containerized firejail needed) and the [`AvailabilityProbe`] drives
     /// the netns mid-run availability re-probe (no live broken kernel needed). Production always goes
     /// through [`run`](Self::run), which passes the real `crate::detect` probes. Both probes live
     /// here at the capstone — not in the pure executor — so `crate::run` stays free of backend
@@ -99,8 +99,8 @@ impl Sandbox {
     fn run_with_probes(
         &self,
         req: &RunRequest,
-        backend_silently_degrades: fn(Backend) -> bool,
-        backend_available_now: fn(Backend) -> bool,
+        DegradationProbe(backend_silently_degrades): DegradationProbe,
+        AvailabilityProbe(backend_available_now): AvailabilityProbe,
     ) -> Result<ExecutionResult> {
         // PRE-EXECUTION guard for a silently-degrading launcher (firejail). firejail runs the command
         // with NO sandboxing (exit 0, warning on stderr) when it detects it is already inside a
@@ -153,8 +153,9 @@ impl Sandbox {
         let (result, inner_never_started) = run_reporting(&plan, &self.policy)?;
 
         // If the sandbox wrapper failed before the test command started (no start sentinel), decide
-        // whether the breakage is persistent. The result already classifies `Errored` (→ `Broken`), so
-        // a single blip costs one candidate and the run continues — no false catch. Only if a fresh
+        // whether the breakage is persistent. The result already classifies `Errored` — or `Timeout`
+        // when the watchdog killed a hung (not failed) wrapper — never a test `Failed`, so a single
+        // blip costs one candidate and the run continues — no false catch. Only if a fresh
         // functional probe ALSO fails do we abort loudly (the environment can no longer create
         // namespaces — it changed after selection), rather than churn every remaining candidate to
         // Broken. The command never ran unconfined on either path (fail-closed; the netns wrapper never
@@ -166,12 +167,27 @@ impl Sandbox {
     }
 }
 
+/// Injected probe asking "is this backend silently degrading to a no-sandbox passthrough RIGHT NOW?"
+/// — `true` ⇒ refuse the run up front (`SandboxDegraded`). A newtype rather than a bare
+/// `fn(Backend) -> bool` so it can never be positionally swapped with [`AvailabilityProbe`] at a
+/// `run_with_probes` call site: the two probes' polarities are opposite (degrading=`true` refuses;
+/// available=`true` continues), so a transposition would wave a degrading firejail through and abort
+/// a healthy netns run — and it would compile. The newtypes make that a type error.
+struct DegradationProbe(fn(Backend) -> bool);
+
+/// Injected probe asking "can this backend still isolate RIGHT NOW?" — `false` after a wrapper
+/// failure ⇒ the breakage is persistent ⇒ abort (`BackendUnavailableMidRun`). See
+/// [`DegradationProbe`] for why this is a newtype.
+struct AvailabilityProbe(fn(Backend) -> bool);
+
 /// Whether a finished run is a **persistent** mid-run wrapper failure that must abort the run, rather
 /// than a per-candidate `Broken`. True iff the inner command never started (no start sentinel), the
 /// backend re-probes on that (only the netns helper today), AND a fresh trusted probe confirms the
 /// backend can no longer isolate. Pure + short-circuiting so the escalation is unit-tested offline
 /// with injected inputs — and so `backend_available_now` (which spawns a probe) is **not** consulted
-/// unless the first two cheap conditions hold. The probe argv is trusted (`unshare … /bin/sh -c true`)
+/// unless the first two cheap conditions hold. (Takes the bare `fn` rather than the
+/// [`AvailabilityProbe`] newtype: with a single fn param there is nothing to transpose, and the
+/// injected-closure tests stay noise-free.) The probe argv is trusted (`unshare … /bin/sh -c true`)
 /// with no attacker code, so this decision cannot be forged by the repo.
 fn is_persistent_wrapper_failure(
     backend: Backend,
@@ -390,7 +406,11 @@ mod tests {
         let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "true".into()]);
         let req = nonexistent_roots_request(&cmd);
         let err = sb
-            .run_with_probes(&req, |_| true, unreached_probe)
+            .run_with_probes(
+                &req,
+                DegradationProbe(|_| true),
+                AvailabilityProbe(unreached_probe),
+            )
             .unwrap_err();
         assert!(
             matches!(err, SandboxError::SandboxDegraded("firejail")),
@@ -410,7 +430,11 @@ mod tests {
         let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "true".into()]);
         let req = nonexistent_roots_request(&cmd);
         let err = sb
-            .run_with_probes(&req, |_| false, unreached_probe)
+            .run_with_probes(
+                &req,
+                DegradationProbe(|_| false),
+                AvailabilityProbe(unreached_probe),
+            )
             .unwrap_err();
         assert!(
             matches!(err, SandboxError::Io(_)),
@@ -434,8 +458,10 @@ mod tests {
         let err = sb
             .run_with_probes(
                 &req,
-                |_| panic!("the degradation probe must not be consulted for constrained-local"),
-                unreached_probe,
+                DegradationProbe(|_| {
+                    panic!("the degradation probe must not be consulted for constrained-local")
+                }),
+                AvailabilityProbe(unreached_probe),
             )
             .unwrap_err();
         assert!(

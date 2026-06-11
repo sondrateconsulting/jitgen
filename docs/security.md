@@ -348,10 +348,11 @@ These MUST exist and pass before the relevant phase is complete (built security-
   #1, where the command runs unsandboxed): here a nonzero *launcher* exit could be **misread as a
   nonzero *test* exit**, and in catch mode base-pass + head-"fail" would mint a **false catch**.
   Defense: the rlimit preamble prints a fixed start sentinel to stderr immediately before `exec "$@"`;
-  its **presence** is an unforgeable witness that control reached the inner command (the only stderr
-  writers, in order, are the trusted launcher, the trusted preamble, then the untrusted command — a
-  command cannot erase a sentinel already in the pipe, and a wrapper that failed before `exec` ran no
-  attacker code to emit one). The runtime keys "the inner command never started" off the sentinel's
+  its **presence** is an unforgeable witness that control reached the inner command (every stderr
+  writer before the untrusted command is trusted — the launcher on the tiers that have one
+  (`unshare`/`bwrap`/`sandbox-exec`; constrained-local spawns the `/bin/sh` preamble directly), then
+  the preamble — so a command cannot erase a sentinel already in the pipe, and a wrapper that failed
+  before `exec` ran no attacker code to emit one). The runtime keys "the inner command never started" off the sentinel's
   **absence** and classifies such a run `Errored` (→ `CatchClass::Broken`: *could not run*), never a
   test `Failed`. A fixed string (not a nonce) suffices — an attacker re-printing it only adds a
   cosmetic duplicate line, never a false absence; and the detector deliberately does **not** key off

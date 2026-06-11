@@ -69,9 +69,10 @@ fail-closed for *confinement* (nothing ran unconfined) but a **signal-integrity*
 false catch. Two layers fix this, both Linux-tier-agnostic where the preamble runs:
 
 1. The rlimit preamble prints a fixed trusted **start sentinel** to stderr immediately before
-   `exec "$@"`. Its *presence* unforgeably witnesses that control reached the inner command (the only
-   stderr writers, in order, are the trusted launcher, the trusted preamble, then the untrusted
-   command). The runtime keys "inner never started" off its **absence** and classifies the run
+   `exec "$@"`. Its *presence* unforgeably witnesses that control reached the inner command (every
+   stderr writer before the untrusted command is trusted — the launcher on the tiers that have one
+   (`unshare`/`bwrap`/`sandbox-exec`; constrained-local spawns the `/bin/sh` preamble directly), then
+   the preamble). The runtime keys "inner never started" off its **absence** and classifies the run
    `Errored` (→ `CatchClass::Broken`: *could not run*), never a test `Failed`. The detector keys off
    the trusted sentinel, **not** the launcher's forgeable error text.
 2. On a netns wrapper failure the capstone re-runs the trusted functional probe; if it now *also*
