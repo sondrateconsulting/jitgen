@@ -60,6 +60,30 @@ asserted separately. Unlike the OS-sandbox/container gates, the netns gates also
 (not `#[ignore]`d) under plain `cargo test`/`bazel test` on Linux hosts that permit user namespaces,
 because the helper nests fine inside build sandboxes there.
 
+**Run-time signal integrity (the probe→run race).** Availability is a probe at *selection* time, but
+`unshare` can fail at *run* time after a passing probe — `user.max_user_namespaces` exhausted between
+probe and run, AppArmor `apparmor_restrict_unprivileged_userns` toggled, a seccomp policy applied to
+the job. It then exits nonzero **before** exec'ing the inner command, so the test never ran. That is
+fail-closed for *confinement* (nothing ran unconfined) but a **signal-integrity** hazard: a nonzero
+*launcher* exit must not be read as a nonzero *test* exit, or base-pass + head-"fail" would mint a
+false catch. Two layers fix this, both Linux-tier-agnostic where the preamble runs:
+
+1. The rlimit preamble prints a fixed trusted **start sentinel** to stderr immediately before
+   `exec "$@"`. Its *presence* unforgeably witnesses that control reached the inner command (every
+   stderr writer before the untrusted command is trusted — the launcher on the tiers that have one
+   (`unshare`/`bwrap`/`sandbox-exec`; constrained-local spawns the `/bin/sh` preamble directly), then
+   the preamble). The runtime keys "inner never started" off its **absence** and classifies the run
+   `Errored` (→ `CatchClass::Broken`: *could not run*), never a test `Failed`. The detector keys off
+   the trusted sentinel, **not** the launcher's forgeable error text.
+2. On a netns wrapper failure the capstone re-runs the trusted functional probe; if it now *also*
+   fails the breakage is persistent, so the run aborts with `SandboxError::BackendUnavailableMidRun`
+   rather than churn every candidate to `Broken`. A transient flip leaves the `Errored` result and
+   continues. This re-probe is the netns counterpart of the firejail pre-execution probe; it lives at
+   the capstone, keeping the pure executor free of selection/`detect` logic. The opposite direction —
+   firejail's silent fail-*open* — is handled by its own stderr-marker + pre-exec probe (threat #1),
+   the divergence justified because a sentinel cannot witness *confinement* (firejail runs the inner
+   command), only *that the inner command ran* (which is exactly the netns question).
+
 ## Alternatives considered
 
 - **Landlock** (the other candidate named in the plan): needs direct syscalls (libc/`unsafe` or a
