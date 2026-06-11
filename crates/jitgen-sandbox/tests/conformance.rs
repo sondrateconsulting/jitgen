@@ -123,8 +123,8 @@ fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
 const PROBE_CONNECT_TIMEOUT_SECS: u32 = 3;
 
 /// Gate-1 probe shared by the sandbox-exec, bwrap, firejail, and Docker network-denial gates (the
-/// netns-helper gates use their own inline probes — see "Gate 1 (netns-helper)" below). Picks a
-/// connect tool that actually EXISTS in the probed
+/// netns-helper gates use their own inline probes, which predate this script's `-z` hardening —
+/// see "Gate 1 (netns-helper)" below). Picks a connect tool that actually EXISTS in the probed
 /// environment, then attempts an outbound TCP connect. Distinguishes "denied" from "no probe tool"
 /// so a toolless environment can't masquerade as a passing network-denial test (T1/F7 P3). Emits a
 /// sentinel word; callers assert on it (not on exit).
@@ -241,9 +241,10 @@ fn net_probe_script_emits_exactly_one_sentinel_line() {
 /// OUTSIDE the sandbox, on the same filesystem the sandboxed probe will see (the script resolves
 /// its own tools by absolute path, so both runs use the identical binaries).
 enum ControlProbe<'a> {
-    /// Directly on the host: sandbox-exec, bwrap, and firejail all confine the host's own
-    /// filesystem (SBPL `(allow file-read*)` / `--ro-bind / /` / `--read-only=/`), so a host
-    /// control probes the very same tool binaries.
+    /// Directly on the host: bwrap and firejail expose the host's own filesystem read-only inside
+    /// the sandbox (`--ro-bind / /` / `--read-only=/`), and sandbox-exec runs in place on the host
+    /// filesystem with reads broadly allowed (SBPL `(allow file-read*)`), so for all three a host
+    /// control probes the very same tool binaries the sandboxed run will resolve.
     Host,
     /// Inside the same digest-pinned image with Docker's default (unrestricted) networking,
     /// mirroring `plan_container`'s discipline: pinned `--entrypoint` (an image `ENTRYPOINT` must
@@ -474,6 +475,18 @@ fn assert_network_denied(
 
     let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), net_probe_script()]);
     let res = exec_as(sb, &cmd, fx, run_as);
+    // Every branch of the probe script ends in `echo <sentinel>` (exit 0), so anything but
+    // `Passed` means the probe never ran to completion (launcher/preamble/spawn failure — exactly
+    // how a broken `exec` preamble once surfaced as exit 127). Without this check such a failure
+    // would fall through to the sentinel assert below and read as a CONFINEMENT failure,
+    // misdirecting the operator at sandbox policy instead of the probe execution.
+    assert_eq!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "{what}: the sandboxed probe did not execute to completion; this is a probe-EXECUTION \
+         failure (check the sandbox launcher install and preamble), NOT a network-confinement \
+         verdict; got {res:?}"
+    );
     assert!(
         !res.stdout.contains("NO_PROBE_TOOL"),
         "{what}: no nc/bash probe tool in the sandboxed environment, so network denial cannot \
