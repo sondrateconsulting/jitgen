@@ -63,7 +63,9 @@ impl LineRange {
 pub struct FileChange {
     /// Repo-relative path in the head revision (forward-slash separated).
     pub path: String,
-    /// Previous path, for renames.
+    /// Previous path, for renames. Also `None` for a rename whose source path matched the
+    /// secret/vendored filter: the destination remains a valid target, but the source name
+    /// must never surface in context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_path: Option<String>,
     /// The kind of change.
