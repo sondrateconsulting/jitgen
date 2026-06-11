@@ -247,6 +247,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # Pin the cosign CLI to the final v2 release. The v4 installer defaults to cosign v3,
+          # which removes `attest --tlog-upload` and flips --new-bundle-format /
+          # --use-signing-config on by default — that changes where and how signatures are stored,
+          # which would break the attest step below AND the documented verify commands in
+          # docs/ci.md. Migrating to cosign v3 is a deliberate follow-up that must re-validate the
+          # whole sign/attest/verify flow, not a drive-by installer bump.
+          cosign-release: 'v2.6.1'
 
       - name: Assemble + push the multi-arch manifest lists from the smoked per-arch digests
         shell: bash
@@ -324,17 +332,22 @@ jobs:
           COSIGN_YES: "true"
         run: |
           set -euo pipefail
-          # --recursive attaches the attestation to the index AND each per-arch child, so
-          # `cosign verify-attestation` succeeds whether a consumer pins the multi-arch tag/index digest
-          # or a per-arch digest. The SBOM is scanned on the amd64 runner; the OS/package inventory is
-          # arch-identical (same Dockerfile + multi-arch base), so it represents both arches — only the
-          # per-arch jitgen binary hash is not separately attested.
+          # The attestation is bound to the manifest-list (index) digest ONLY — `cosign
+          # verify-attestation` must target the multi-arch digest the release reports, not a per-arch
+          # child digest (children carry signatures, not attestations; see the sign step above).
+          # `cosign attest` once accepted a --recursive flag, but it was parsed and never wired —
+          # upstream removed it as unused in cosign v2.5.1 (sigstore/cosign#4187), and the published
+          # v0.2.2 images confirm per-arch digests have no attestation. The SBOM is scanned on the
+          # amd64 runner; the OS/package inventory is arch-identical (same Dockerfile + multi-arch
+          # base), so it represents both arches — only the per-arch jitgen binary hash is not
+          # separately attested.
           #
           # --tlog-upload=false: the fat image's SBOM (all four toolchains) is multi-MB and exceeds the
           # public Rekor transparency-log entry the DSSE/intoto upload tries to write, so the upload times
-          # out. (`cosign attest` uses --tlog-upload, NOT sign's --no-tlog-upload flag.) The attestation
-          # is a real DSSE envelope signed by the ephemeral Fulcio cert and stored alongside the image in
-          # GHCR, bound to the digest. It is NOT in the public transparency log.
+          # out. (Not to be confused with attest's `--no-upload`, which skips the registry upload
+          # entirely.) The attestation is a real DSSE envelope signed by the ephemeral Fulcio cert and
+          # stored alongside the image in GHCR, bound to the digest. It is NOT in the public
+          # transparency log.
           #
           # --timestamp-server-url: a Fulcio cert is short-lived (~10 min), so without a trusted timestamp
           # `verify-attestation` cannot prove the cert was valid at signing time once it expires — it fails
@@ -347,8 +360,8 @@ jobs:
           # `verify-attestation` needs --insecure-ignore-tlog --use-signed-timestamps (the TSA timestamp,
           # not a tlog entry, anchors the signing time). All documented in docs/ci.md.
           TSA=https://timestamp.sigstore.dev/api/v1/timestamp
-          cosign attest --recursive --tlog-upload=false --timestamp-server-url "$TSA" --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
-          cosign attest --recursive --tlog-upload=false --timestamp-server-url "$TSA" --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
+          cosign attest --tlog-upload=false --timestamp-server-url "$TSA" --predicate sbom-fat.spdx.json  --type spdxjson "${FAT_IMAGE}@${FAT_DIGEST}"
+          cosign attest --tlog-upload=false --timestamp-server-url "$TSA" --predicate sbom-slim.spdx.json --type spdxjson "${SLIM_IMAGE}@${SLIM_DIGEST}"
 
   # Publish the GitHub Release. `needs:` the binary builds AND the image publish, so this runs only when
   # every binary smoke passed AND both multi-arch images were built, smoked, pushed, signed, and SBOM'd

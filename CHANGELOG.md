@@ -53,6 +53,18 @@ run state and report formats.
   The flag is now part of the documented command, and the "no extra flags are needed" wording in
   `docs/ci.md`, `release.yml`, and the 0.2.2 changelog entry has been corrected. Docs only — the
   v0.2.2 attestations themselves are valid and verify with the corrected command.
+- **The SBOM attestation verifies against the multi-arch (index) digest only — docs no longer claim
+  per-arch digests work.** `release.yml` passed `cosign attest --recursive`, but upstream that flag
+  was parsed and never wired (removed as unused in cosign v2.5.1, sigstore/cosign#4187), so
+  attestations have only ever been attached to the index digest — confirmed against the published
+  v0.2.2 images (`verify-attestation` against a per-arch child digest fails with "no matching
+  attestations"; image *signatures* still verify against index and per-arch digests alike, since
+  `cosign sign --recursive` is real). `docs/ci.md` and the workflow comments now scope the claim
+  correctly, and the no-op flag is dropped. Alongside the cosign-installer v4 bump, the workflow now
+  pins `cosign-release: v2.6.1` (the final cosign v2 release): the installer's new default, cosign
+  v3, removes `attest --tlog-upload` and changes the default signature storage format, which would
+  have broken the next tag release and the documented verify commands. Migrating to cosign v3 is a
+  deliberate follow-up.
 
 ## [0.2.2] — 2026-06-09
 
