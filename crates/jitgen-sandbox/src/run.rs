@@ -13,12 +13,13 @@
 //!   is dropped before redaction so a secret split across the cap boundary cannot leak (S2/F7 P2).
 
 use crate::classify::{classify, Disposition};
-use crate::command::SandboxPlan;
+use crate::command::{SandboxPlan, START_SENTINEL};
 use crate::error::{Result, SandboxError};
 use crate::policy::ExecPolicy;
 use crate::spawn::BuildSignal;
 use crate::which::resolve_trusted;
 use jitgen_core::ExecutionResult;
+use std::borrow::Cow;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,15 +44,36 @@ const COLLECT_GRACE: Duration = Duration::from_secs(2);
 /// Max time to wait for a teardown command (`docker kill …`) before killing it. A stalled daemon
 /// must not let cleanup hang `run()` past the wall-clock watchdog (T2/F7 P3).
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
-/// Floor on the stderr capture for a backend that can *silently degrade* (firejail). The degradation
-/// marker is the launcher's first stderr line (≤ a few hundred bytes); the security signal must not
-/// be defeatable by a small trusted `output_cap_bytes`, so we always capture at least this much stderr
-/// for such a backend (the user-facing result is still redacted/capped — this only widens the window
-/// the degradation scan sees). Comfortably larger than firejail's warning + any banner line.
-const DEGRADATION_SCAN_FLOOR: usize = 4096;
+/// Floor on the stderr capture for a plan whose stderr carries a trusted jitgen-known marker that a
+/// security check must be able to see: the firejail *degradation* marker (the launcher's first stderr
+/// line, scanned by the fail-closed backstop below) or the preamble *start sentinel* (whose absence
+/// witnesses a wrapper failure). Either signal must not be defeatable by a small trusted
+/// `output_cap_bytes`, so we always capture at least this much stderr for such a plan. Comfortably
+/// larger than either marker plus any launcher banner line. The returned stderr is still re-trimmed
+/// to the user cap before redaction — the floor only widens the window the marker scans see.
+const STDERR_MARKER_SCAN_FLOOR: usize = 4096;
 
-/// Spawn and run a fully-resolved plan, returning a redacted, capped, classified result.
+/// Spawn and run a fully-resolved plan, returning a redacted, capped, classified result. Production
+/// goes through [`run_reporting`] (so the capstone sees `inner_never_started`); this thin wrapper that
+/// drops the flag exists for the executor's own in-crate unit tests, which assert on the
+/// `ExecutionResult` only. It is `#[cfg(test)]` (not crate-public): integration tests and external
+/// callers go through [`crate::sandbox::Sandbox::run`], the only production entry point.
+#[cfg(test)]
 pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
+    run_reporting(plan, policy).map(|(result, _inner_never_started)| result)
+}
+
+/// `run` plus the `inner_never_started` signal: `true` when the plan expected the start sentinel but
+/// none was captured, i.e. the sandbox **wrapper** (launcher + rlimit preamble) failed before `exec`'ing
+/// the inner command (a run-time `unshare`/`bwrap` failure). The result already classifies such a run
+/// [`jitgen_core::ExecOutcome::Errored`] (never a test `Failed`); this extra bool lets the capstone
+/// [`crate::sandbox::Sandbox::run`] escalate a *persistent* wrapper failure into a hard error after a
+/// trusted re-probe. This executor stays free of any backend-*selection*/`detect` logic — the re-probe
+/// and escalation live one layer up, mirroring the firejail pre-execution probe.
+pub(crate) fn run_reporting(
+    plan: &SandboxPlan,
+    policy: &ExecPolicy,
+) -> Result<(ExecutionResult, bool)> {
     let start = Instant::now();
     let cap = REDACT_WINDOW.min(policy.output_cap_bytes as usize);
 
@@ -79,12 +101,30 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
     })?;
     let pid = child.id();
 
-    // Capture stdout at the user cap; capture stderr at a floor for a degradation-capable backend so a
-    // small `output_cap_bytes` can never truncate the marker away and silently disable the backstop.
-    let err_capture_cap = if plan.backend.has_silent_degradation_mode() {
-        cap.max(DEGRADATION_SCAN_FLOOR)
+    // Capture stdout at the user cap. Widen the stderr capture when a trusted marker scan needs it:
+    //  - floor it to STDERR_MARKER_SCAN_FLOOR for a degradation-capable backend (firejail) or a
+    //    sentinel-expecting plan (the preamble tiers), so a tiny `output_cap_bytes` can't truncate the
+    //    degradation marker / start sentinel out of its scan and silently disable that check; and
+    //  - for a sentinel-expecting plan, ALSO add room for the sentinel line itself (`START_SENTINEL` +
+    //    its `\n`) ON TOP of the scan budget, so that after the sentinel is stripped a full `cap` bytes
+    //    of *test* stderr still remain. Without this addend, the sentinel would consume part of the
+    //    user's cap, shrinking the build-marker scan window (and the returned stderr) by ~27 bytes
+    //    versus the pre-sentinel behavior — a marker in that tail window would be missed
+    //    (BuildError→Failed). The captured stderr is stripped and then re-trimmed to `cap` before
+    //    redaction, so the REDACT_WINDOW ceiling is never exceeded by the returned bytes.
+    // The two flags are disjoint today (firejail takes no preamble), but each adjustment is keyed to
+    // its own flag so neither check silently loses its window if backend membership ever shifts.
+    let scans_stderr_marker =
+        plan.backend.has_silent_degradation_mode() || plan.expects_start_sentinel;
+    let floored_cap = if scans_stderr_marker {
+        cap.max(STDERR_MARKER_SCAN_FLOOR)
     } else {
         cap
+    };
+    let err_capture_cap = if plan.expects_start_sentinel {
+        floored_cap.saturating_add(START_SENTINEL.len() + 1)
+    } else {
+        floored_cap
     };
     let out_cap = child.stdout.take().map(|p| spawn_capture(p, cap));
     let err_cap = child
@@ -146,7 +186,35 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
         }
     }
 
+    // Strip the trusted start sentinel from stderr BEFORE any downstream consumer reads it (the
+    // build-marker scan, redaction, and the returned result), so its presence is invisible and a
+    // `BuildSignal` marker can't collide with it. `inner_never_started` = the plan emits a sentinel
+    // but none was captured ⟹ the wrapper failed before exec'ing the inner command. Sequencing:
+    // collect → strip → set flag → detect_build_failure(stripped) → classify → re-trim+redact(stripped).
+    let (stderr_clean, inner_never_started): (Cow<[u8]>, bool) = if plan.expects_start_sentinel {
+        let (cleaned, found) = strip_marker_line(&stderr_raw, START_SENTINEL);
+        (Cow::Owned(cleaned), !found)
+    } else {
+        (Cow::Borrowed(&stderr_raw), false)
+    };
+
     let (status, timed_out) = wait_result?;
+
+    // Re-trim the (possibly floor-widened) stderr back to the user's `output_cap_bytes` BEFORE it
+    // feeds anything else. The floor widens the capture **only** so the trusted marker scans above
+    // (degradation backstop / sentinel) stay reliable under a tiny cap; it must NOT widen what
+    // `detect_build_failure` sees, or a `BuildSignal` marker landing in the `[cap, floor)` window —
+    // bytes the user's cap excludes — could flip a healthy run's classification (e.g. `Failed` →
+    // `BuildError` → `Broken`, suppressing a real catch). Trimming here restores the pre-floor
+    // marker-visibility semantics: both the build scan and the returned stderr observe exactly the
+    // user-cap window. With a sub-floor cap this can leave the returned stderr empty after
+    // `redact_capped`'s tail guard — acceptable: the diagnosis is the outcome. Without a floor
+    // (`stderr_clean` already ≤ cap) the branch is a no-op.
+    let (stderr_capped, stderr_trunc): (&[u8], bool) = if stderr_clean.len() > cap {
+        (&stderr_clean[..cap], true)
+    } else {
+        (&stderr_clean, err_trunc)
+    };
 
     let disp = Disposition {
         exit_code: status.code(),
@@ -156,28 +224,66 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
             &plan.build_signal,
             status.code(),
             &stdout_raw,
-            &stderr_raw,
+            stderr_capped,
         ),
+        inner_never_started,
     };
 
-    // Honor the user's `output_cap_bytes` for the returned stderr even though we may have captured more
-    // (`err_capture_cap` floor) to keep the degradation scan reliable. Only narrows in the degenerate
-    // case where a degradation-capable backend ran under a sub-floor cap; normally `cap >= floor` so
-    // this is a no-op.
-    let (stderr_for_result, stderr_trunc) = if stderr_raw.len() > cap {
-        (&stderr_raw[..cap], true)
-    } else {
-        (&stderr_raw[..], err_trunc)
-    };
-
-    Ok(ExecutionResult {
+    let result = ExecutionResult {
         outcome: classify(disp),
         exit_code: status.code(),
         duration_ms: start.elapsed().as_millis() as u64,
         truncated: out_trunc || stderr_trunc,
         stdout: redact_capped(&stdout_raw, out_trunc),
-        stderr: redact_capped(stderr_for_result, stderr_trunc),
-    })
+        stderr: redact_capped(stderr_capped, stderr_trunc),
+    };
+    Ok((result, inner_never_started))
+}
+
+/// Find the first stderr line whose content bytes exactly equal `marker`, returning the captured
+/// stderr with that one line **and its trailing `\n`** removed, plus whether it was found. Used to drop
+/// the trusted start sentinel before stderr reaches any downstream consumer. (The firejail degradation
+/// backstop above scans but never strips — its marker is launcher output, not jitgen-injected.)
+///
+/// **Byte-preserving** by design: it operates on the raw bytes (a line is the run of bytes between
+/// buffer start / a `\n` and the next `\n` / end) and splices out only the matched line, leaving every
+/// other byte — CR, CRLF terminators, trailing newline, offsets — **verbatim**. This matters because
+/// the caller caps the result at the user's `output_cap_bytes` by *byte* slice: a lossy
+/// decode-and-rejoin (which collapses `\r\n`→`\n`) would shift later bytes earlier and could pull a
+/// `BuildSignal` marker that was beyond the user's byte cap *inside* it, flipping a healthy run's
+/// classification. The trusted preamble emits the sentinel as a clean `printf '%s\n'` line, so an exact
+/// LF-terminated line match is reliable.
+///
+/// Scans **all** lines (not just the first) so a launcher banner before the sentinel doesn't cause a
+/// false "not found", and removes only the **first** match (a hostile inner command re-printing the
+/// marker after `exec` leaves its later copies as ordinary stderr). The compare is **exact** content
+/// equality, failing in the **safe** direction — a line that merely resembles the marker (extra
+/// whitespace, a trailing `\r`, a substring of a longer line) does NOT count as "started", so the worst
+/// case is a spurious `Errored`/`Broken`, never a wrapper failure slipping back to a test `Failed`.
+/// When the marker is absent the original bytes are returned unchanged.
+fn strip_marker_line(stderr: &[u8], marker: &str) -> (Vec<u8>, bool) {
+    let m = marker.as_bytes();
+    let mut start = 0;
+    while start <= stderr.len() {
+        let (line_end, has_nl) = match stderr[start..].iter().position(|&b| b == b'\n') {
+            Some(rel) => (start + rel, true),
+            None => (stderr.len(), false),
+        };
+        if &stderr[start..line_end] == m {
+            // Splice out the matched line plus its single `\n` terminator (if any); keep all other
+            // bytes verbatim so the byte offsets the user cap relies on are preserved.
+            let cut_end = if has_nl { line_end + 1 } else { line_end };
+            let mut out = Vec::with_capacity(stderr.len() - (cut_end - start));
+            out.extend_from_slice(&stderr[..start]);
+            out.extend_from_slice(&stderr[cut_end..]);
+            return (out, true);
+        }
+        if !has_nl {
+            break;
+        }
+        start = line_end + 1;
+    }
+    (stderr.to_vec(), false)
 }
 
 /// Poll the child to completion or the deadline. On timeout, kill it and (for container backends)
@@ -717,6 +823,7 @@ mod tests {
             cleanup: None,
             new_process_group: true,
             build_signal: BuildSignal::default(),
+            expects_start_sentinel: false,
         };
         assert!(matches!(
             run(&plan, &ExecPolicy::default()),
@@ -745,6 +852,9 @@ mod tests {
                 cleanup: None,
                 new_process_group: true,
                 build_signal: BuildSignal::default(),
+                // Hand-built executor plans default to no sentinel; tests that exercise the
+                // wrapper-failure path set this true explicitly (see `sh_plan_sentinel`).
+                expects_start_sentinel: false,
             }
         }
 
@@ -1040,6 +1150,350 @@ mod tests {
                 start.elapsed() < Duration::from_secs(30),
                 "CPU rlimit did not stop the spinner promptly"
             );
+        }
+
+        // A hand-built plan that EXPECTS the start sentinel (a preamble tier). `/bin/sh -c <script>`
+        // stands in for the wrapper: a healthy run's script prints the sentinel itself before its
+        // output; a wrapper-failure script omits it (simulating `unshare` dying before exec'ing the
+        // preamble). Built by hand so the classification path is exercised without a live netns.
+        fn sh_plan_sentinel(script: &str) -> SandboxPlan {
+            SandboxPlan {
+                expects_start_sentinel: true,
+                ..sh_plan(script)
+            }
+        }
+
+        #[test]
+        fn wrapper_failure_without_sentinel_is_errored_not_failed() {
+            // THE signal-integrity regression: a netns-style wrapper that fails BEFORE exec'ing the
+            // inner command exits nonzero and emits NO start sentinel. The run must classify Errored
+            // (→ CatchClass::Broken), NEVER Failed — otherwise base-pass + head-"fail" would mint a
+            // false catch. The launcher's own error text on stderr must NOT rescue it into Failed.
+            //
+            // FORGERY NOTE: this detector relies on the sentinel's ABSENCE, which is unforgeable in the
+            // bug direction — a wrapper that failed before exec ran no attacker code, so nothing emitted
+            // the sentinel. (The stderr marker the launcher prints is attacker-influenceable once the
+            // command runs, which is exactly why we do NOT key off it; see `firejail_*` for the
+            // fail-OPEN case that must.)
+            let script = "echo 'unshare: unshare failed: Operation not permitted' >&2; exit 1";
+            let (result, inner_never_started) =
+                run_reporting(&sh_plan_sentinel(script), &ExecPolicy::default()).unwrap();
+            assert!(
+                inner_never_started,
+                "missing sentinel ⇒ inner never started"
+            );
+            assert_eq!(
+                result.outcome,
+                ExecOutcome::Errored,
+                "wrapper failure must be Errored, not a test Failed: {result:?}"
+            );
+        }
+
+        #[test]
+        fn healthy_run_with_sentinel_classifies_normally_and_strips_it() {
+            // A genuinely-started run prints the sentinel (as the real preamble would) before the test
+            // output. A FAILING test (exit 101) must stay Failed — the sentinel must not turn an honest
+            // test failure into Errored — and the sentinel line must be stripped from the returned
+            // stderr while the real assertion text survives.
+            let script = format!("printf '%s\\n' '{START_SENTINEL}' >&2; echo 'assertion failed: 1 != 2' >&2; exit 101");
+            let (result, inner_never_started) =
+                run_reporting(&sh_plan_sentinel(&script), &ExecPolicy::default()).unwrap();
+            assert!(!inner_never_started, "sentinel present ⇒ inner started");
+            assert_eq!(result.outcome, ExecOutcome::Failed, "{result:?}");
+            assert!(
+                !result.stderr.contains(START_SENTINEL),
+                "sentinel must be stripped from returned stderr: {:?}",
+                result.stderr
+            );
+            assert!(
+                result.stderr.contains("assertion failed"),
+                "real test stderr must survive stripping: {:?}",
+                result.stderr
+            );
+        }
+
+        #[test]
+        fn forged_marker_after_genuine_sentinel_stays_a_test_failure() {
+            // Defeat the marker-forgery attack through the REAL preamble (build_plan): the trusted
+            // preamble emits the genuine sentinel before exec, then the untrusted inner command prints
+            // a forged `unshare:` failure line and exits 1. Because the genuine sentinel precedes the
+            // forgery, `inner_never_started` is false and the run is a normal Failed — a hostile repo
+            // cannot disguise its own failing test as a wrapper failure to suppress a catch.
+            use crate::command::{build_plan, PlanInput};
+            use crate::spawn::SpawnRequest;
+            let overlay = std::env::temp_dir();
+            let req = SpawnRequest::argv(
+                "/bin/sh",
+                [
+                    "-c".into(),
+                    "echo 'unshare: unshare failed: forged' >&2; exit 1".into(),
+                ],
+            );
+            let plan = build_plan(PlanInput {
+                backend: Backend::ConstrainedLocal,
+                req: &req,
+                overlay_root: &overlay,
+                synthetic_tmp: &overlay,
+                env: BTreeMap::new(),
+                policy: &ExecPolicy::default(),
+                instance: "forge",
+                run_as: None,
+            })
+            .unwrap();
+            assert!(
+                plan.expects_start_sentinel,
+                "preamble tier expects sentinel"
+            );
+            let (result, inner_never_started) =
+                run_reporting(&plan, &ExecPolicy::default()).unwrap();
+            assert!(
+                !inner_never_started,
+                "genuine preamble sentinel precedes the forged line ⇒ inner DID start"
+            );
+            assert_eq!(
+                result.outcome,
+                ExecOutcome::Failed,
+                "a forged marker must not reclassify a real test failure: {result:?}"
+            );
+        }
+
+        #[test]
+        fn exit_zero_without_sentinel_is_errored_fail_closed() {
+            // A wrapper that claims success (exit 0) yet emitted no sentinel never provably exec'd the
+            // inner command — fail-closed: Errored, never a green Passed baseline (trade-off 4).
+            let (result, inner_never_started) =
+                run_reporting(&sh_plan_sentinel("exit 0"), &ExecPolicy::default()).unwrap();
+            assert!(inner_never_started);
+            assert_eq!(result.outcome, ExecOutcome::Errored, "{result:?}");
+        }
+
+        #[test]
+        fn sentinel_survives_a_tiny_output_cap() {
+            // The detector must not be defeatable by a small trusted output cap. With an 8-byte cap
+            // (far smaller than the sentinel) the floored stderr capture still scans the sentinel, so a
+            // healthy failing run stays Failed (not misclassified Errored). The RETURNED stderr is
+            // re-trimmed to the user cap — which, combined with redact_capped's tail guard, can leave
+            // it empty; that is acceptable (the outcome is the diagnosis, not the stderr).
+            let script = format!(
+                "printf '%s\\n' '{START_SENTINEL}' >&2; echo 'assertion failed' >&2; exit 101"
+            );
+            let policy = ExecPolicy {
+                output_cap_bytes: 8,
+                ..ExecPolicy::default()
+            };
+            let (result, inner_never_started) =
+                run_reporting(&sh_plan_sentinel(&script), &policy).unwrap();
+            assert!(
+                !inner_never_started,
+                "the floor must keep the sentinel scannable under a tiny cap"
+            );
+            assert_eq!(result.outcome, ExecOutcome::Failed, "{result:?}");
+            assert!(
+                result.stderr.len() <= 8,
+                "returned stderr honors the user cap"
+            );
+        }
+
+        #[test]
+        fn build_marker_beyond_the_user_cap_does_not_flip_the_outcome() {
+            // No-regression guard for the floor: widening the stderr capture for sentinel scanning must
+            // NOT widen what `detect_build_failure` sees. A healthy failing run whose BuildSignal marker
+            // lands AFTER the user's `output_cap_bytes` but within STDERR_MARKER_SCAN_FLOOR must stay
+            // `Failed` (the marker is outside the user's window) — not flip to `BuildError` (which, in
+            // catch mode, would become `Broken` and suppress a real weak catch). The sentinel sits on
+            // line 1 (within any cap), then filler pushes the marker past the 64-byte cap.
+            let filler = "x".repeat(80);
+            let script = format!(
+                "printf '%s\\n' '{START_SENTINEL}' >&2; printf '%s' '{filler}' >&2; \
+                 printf 'could not compile\\n' >&2; exit 101"
+            );
+            let mut plan = sh_plan_sentinel(&script);
+            plan.build_signal = BuildSignal {
+                exit_codes: vec![],
+                markers: vec!["could not compile".into()],
+            };
+            let policy = ExecPolicy {
+                output_cap_bytes: 64,
+                ..ExecPolicy::default()
+            };
+            let (result, inner_never_started) = run_reporting(&plan, &policy).unwrap();
+            assert!(!inner_never_started, "sentinel present ⇒ inner started");
+            assert_eq!(
+                result.outcome,
+                ExecOutcome::Failed,
+                "a marker beyond the user cap must not flip Failed→BuildError: {result:?}"
+            );
+
+            // Control: the SAME marker within the cap (no filler) IS seen → BuildError. Proves the test
+            // distinguishes the cap window, not that the marker is simply never matched.
+            let script_in = format!(
+                "printf '%s\\n' '{START_SENTINEL}' >&2; printf 'could not compile\\n' >&2; exit 101"
+            );
+            let mut plan_in = sh_plan_sentinel(&script_in);
+            plan_in.build_signal = BuildSignal {
+                exit_codes: vec![],
+                markers: vec!["could not compile".into()],
+            };
+            let (result_in, _) = run_reporting(&plan_in, &policy).unwrap();
+            assert_eq!(
+                result_in.outcome,
+                ExecOutcome::BuildError,
+                "a marker within the user cap is still seen: {result_in:?}"
+            );
+        }
+
+        #[test]
+        fn crlf_stderr_does_not_shift_a_beyond_cap_marker_inside_the_cap() {
+            // Byte-preservation guard: strip_marker_line must NOT normalize CRLF→LF before the user-cap
+            // slice. 23 lines of `x\r\n` = 69 raw bytes precede the marker, so it sits past a 64-byte
+            // cap and must stay Failed. A lossy decode+rejoin would collapse each `\r\n`→`\n` (46 bytes),
+            // pulling the marker inside the cap and flipping it to BuildError→Broken — the exact
+            // regression this pins. The sentinel (LF-terminated, line 1) is still found and stripped.
+            let crlf_pad = "x\\r\\n".repeat(23); // printf format → 23× "x\r\n" = 69 raw bytes
+            let script = format!(
+                "printf '%s\\n' '{START_SENTINEL}' >&2; printf '{crlf_pad}' >&2; \
+                 printf 'could not compile\\n' >&2; exit 101"
+            );
+            let mut plan = sh_plan_sentinel(&script);
+            plan.build_signal = BuildSignal {
+                exit_codes: vec![],
+                markers: vec!["could not compile".into()],
+            };
+            let policy = ExecPolicy {
+                output_cap_bytes: 64,
+                ..ExecPolicy::default()
+            };
+            let (result, inner_never_started) = run_reporting(&plan, &policy).unwrap();
+            assert!(!inner_never_started, "sentinel present ⇒ inner started");
+            assert_eq!(
+                result.outcome,
+                ExecOutcome::Failed,
+                "CRLF normalization must not pull a beyond-cap marker into view: {result:?}"
+            );
+        }
+
+        #[test]
+        fn build_marker_within_the_clean_cap_is_seen_when_cap_exceeds_the_floor() {
+            // The sentinel must not eat into the user's stderr budget. With cap == STDERR_MARKER_SCAN_FLOOR
+            // and a marker at test-output byte 4070 — inside the user's 4096-byte clean window but past
+            // the raw capture once the 27-byte sentinel is counted — the marker MUST still be seen
+            // (BuildError). Without the capture addend (`+ START_SENTINEL.len() + 1`) the sentinel would
+            // shrink the clean window to ~4069 bytes and the marker would be missed (Failed) — the
+            // regression this pins. (In catch mode that miss would turn a head build failure into a
+            // false WeakCatch.)
+            let cap = 4096usize;
+            let filler = "x".repeat(4070);
+            let script = format!(
+                "printf '%s\\n' '{START_SENTINEL}' >&2; printf '%s' '{filler}' >&2; \
+                 printf 'could not compile\\n' >&2; exit 101"
+            );
+            let mut plan = sh_plan_sentinel(&script);
+            plan.build_signal = BuildSignal {
+                exit_codes: vec![],
+                markers: vec!["could not compile".into()],
+            };
+            let policy = ExecPolicy {
+                output_cap_bytes: cap as u64,
+                ..ExecPolicy::default()
+            };
+            let (result, inner_never_started) = run_reporting(&plan, &policy).unwrap();
+            assert!(!inner_never_started, "sentinel present ⇒ inner started");
+            assert_eq!(
+                result.outcome,
+                ExecOutcome::BuildError,
+                "a marker within the user's clean cap must be seen even when cap >= floor: {result:?}"
+            );
+        }
+
+        #[test]
+        fn sentinel_is_detected_when_not_on_the_first_stderr_line() {
+            // A launcher may emit a banner line before the preamble's sentinel on a successful launch.
+            // Detection scans ALL lines, so the sentinel on line 2 is still found and the run is not
+            // misclassified as a wrapper failure.
+            let script = format!(
+                "echo 'unshare: setting up namespaces' >&2; printf '%s\\n' '{START_SENTINEL}' >&2; printf ok"
+            );
+            let (result, inner_never_started) =
+                run_reporting(&sh_plan_sentinel(&script), &ExecPolicy::default()).unwrap();
+            assert!(
+                !inner_never_started,
+                "sentinel on a later line must still be detected"
+            );
+            assert_eq!(result.outcome, ExecOutcome::Passed, "{result:?}");
+            assert_eq!(result.stdout, "ok");
+        }
+
+        #[test]
+        fn no_sentinel_expected_means_no_wrapper_failure_signal() {
+            // A non-preamble plan (expects_start_sentinel = false) must never report inner_never_started,
+            // whatever its stderr — only the preamble tiers carry the sentinel contract.
+            let (_result, inner_never_started) = run_reporting(
+                &sh_plan("echo whatever >&2; exit 1"),
+                &ExecPolicy::default(),
+            )
+            .unwrap();
+            assert!(!inner_never_started);
+        }
+
+        #[test]
+        fn strip_marker_line_removes_only_a_full_line_match() {
+            // Unit-level guard for the helper: a line exactly equal to the marker is removed WITH its
+            // `\n` and all other bytes (incl. the surrounding lines' newlines) are preserved verbatim;
+            // a line merely CONTAINING the marker as a substring is preserved (no over-stripping); a
+            // marker absent leaves the bytes untouched.
+            let (out, found) =
+                strip_marker_line(b"a\njitgen-sandbox: inner-exec\nb\n", START_SENTINEL);
+            assert!(found);
+            assert_eq!(
+                out, b"a\nb\n",
+                "only the matched line + its \\n are spliced out"
+            );
+
+            let (out, found) = strip_marker_line(
+                b"prefix jitgen-sandbox: inner-exec suffix\n",
+                START_SENTINEL,
+            );
+            assert!(!found, "a substring match must not strip");
+            assert_eq!(out, b"prefix jitgen-sandbox: inner-exec suffix\n");
+
+            let (out, found) = strip_marker_line(b"nothing here\n", START_SENTINEL);
+            assert!(!found);
+            assert_eq!(out, b"nothing here\n");
+
+            // Byte-preserving: CR bytes around other lines survive (no CRLF→LF normalization), so a
+            // later byte-cap slice sees the true offsets. Only the LF-terminated sentinel line goes.
+            let (out, found) =
+                strip_marker_line(b"x\r\njitgen-sandbox: inner-exec\ny\r\n", START_SENTINEL);
+            assert!(found);
+            assert_eq!(
+                out, b"x\r\ny\r\n",
+                "CRLF bytes of other lines are preserved verbatim"
+            );
+        }
+
+        #[test]
+        fn strip_marker_line_removes_only_the_first_occurrence() {
+            // A hostile inner command can re-print the sentinel string after `exec` (its code runs
+            // only after the genuine preamble sentinel is already in the pipe). Only the FIRST match —
+            // the trusted one — is stripped; later forged copies stay as ordinary stderr. This pins the
+            // `!found &&` first-match-only semantics so a regression to "remove all" can't slip in.
+            let input = format!("{START_SENTINEL}\n{START_SENTINEL}\nafter\n");
+            let (out, found) = strip_marker_line(input.as_bytes(), START_SENTINEL);
+            assert!(found);
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("{START_SENTINEL}\nafter\n")
+            );
+
+            // Trimmed-but-not-exact lines are NOT stripped (exact-match contract): a leading-space
+            // variant is preserved, so it neither false-strips nor counts as the started witness.
+            let padded = format!("  {START_SENTINEL}\n");
+            let (out, found) = strip_marker_line(padded.as_bytes(), START_SENTINEL);
+            assert!(
+                !found,
+                "an indented near-match must not count as the sentinel"
+            );
+            assert_eq!(out, padded.as_bytes());
         }
     }
 }

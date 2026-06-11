@@ -22,8 +22,10 @@ use std::path::{Component, Path, PathBuf};
 pub struct SandboxPlan {
     /// Chosen backend.
     pub backend: Backend,
-    /// Program to spawn (the launcher: `sandbox-exec`/`bwrap`/`docker`/…, or the test program itself
-    /// for the constrained-local tier).
+    /// Program to spawn: the launcher (`sandbox-exec`/`bwrap`/`firejail`/`docker`/`podman`/`unshare`),
+    /// or — for the **constrained-local** tier, which has no separate launcher — the `/bin/sh` rlimit
+    /// preamble itself. On the other preamble tiers (sandbox-exec/bwrap/netns-helper) the launcher is
+    /// the program and the `/bin/sh` preamble + inner command follow in [`SandboxPlan::args`].
     pub program: String,
     /// Full argv for `program` (wrapper flags + the inner command).
     pub args: Vec<String>,
@@ -41,7 +43,44 @@ pub struct SandboxPlan {
     pub new_process_group: bool,
     /// Build-vs-test classification hints, applied to the captured output by the runtime.
     pub build_signal: BuildSignal,
+    /// Whether this plan's launcher is wrapped by the rlimit preamble, which emits [`START_SENTINEL`]
+    /// to stderr immediately before `exec`'ing the inner command. When `true`, the runtime treats
+    /// *absence* of the sentinel in captured stderr as proof the inner command never started — a
+    /// wrapper (e.g. `unshare`) failure — and classifies the run [`jitgen_core::ExecOutcome::Errored`]
+    /// rather than a test failure (see [`crate::run`]). Set for exactly the preamble-wrapped tiers.
+    pub expects_start_sentinel: bool,
 }
+
+/// Trusted line the rlimit preamble prints to stderr **immediately before** `exec "$@"` — i.e. after
+/// the launcher (`unshare`/`bwrap`/`sandbox-exec`) and the preamble have run, but before control passes
+/// to the untrusted inner command. Its presence is an **unforgeable** witness that execution reached
+/// the inner command: the only writers to the shared stderr pipe, in order, are the trusted launcher,
+/// the trusted preamble (which emits this), then the untrusted command — so a command cannot erase a
+/// sentinel already in the pipe, and a wrapper that failed before `exec` never emitted one (no
+/// attacker code ran to forge it). The runtime keys "inner never started" off its *absence*. A fixed
+/// string (not a nonce) suffices: there is no forgery a nonce would prevent — an attacker re-printing
+/// it only adds a cosmetic duplicate line, never a false absence. Kept in sync with the emitter in
+/// [`with_rlimit_preamble`] and the detector in [`crate::run`]; this is the single source.
+pub(crate) const START_SENTINEL: &str = "jitgen-sandbox: inner-exec";
+
+// `with_rlimit_preamble` embeds the sentinel inside a **single-quoted** shell literal
+// (`printf '%s\n' '<START_SENTINEL>'`). A single quote in the value would close that literal and turn
+// the preamble into a syntax error — the wrapper would then fail before `exec`, classifying EVERY
+// preamble-tier run as `inner_never_started` (Errored). That is fail-closed (no false catch) but a
+// silent, total regression of sandboxed execution, so reject the offending edit at compile time. A
+// newline would likewise split the sentinel across two captured lines and break detection.
+const _: () = {
+    let bytes = START_SENTINEL.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(
+            bytes[i] != b'\'' && bytes[i] != b'\n' && bytes[i] != b'\r',
+            "START_SENTINEL must not contain a single quote or newline (it is single-quoted into the \
+             preamble and matched as one stderr line)"
+        );
+        i += 1;
+    }
+};
 
 /// Inputs to [`build_plan`]. Grouped into a struct to keep the call site readable.
 pub struct PlanInput<'a> {
@@ -192,11 +231,20 @@ fn inner_argv(req: &SpawnRequest, policy: &ExecPolicy) -> Result<Vec<String>> {
 /// per-process-tree: a per-run cap either fails outright on a busy host (observed on macOS) or fails
 /// to constrain a single run. The container `--pids-limit` is the real fork-bomb control
 /// (see `docs/security.md`). The wall-clock timeout is the cross-tier backstop.
+///
+/// The preamble prints [`START_SENTINEL`] to stderr as its **last** action before `exec "$@"`, so its
+/// presence in captured stderr witnesses that the launcher + preamble ran and control reached the
+/// inner command. The runtime keys "the wrapper failed before the test started" off its absence and
+/// classifies such a run **Errored**, never a test failure (signal integrity; see [`crate::run`]). The
+/// sentinel is single-quoted as a fixed jitgen-authored literal (no single quote inside), so it adds no
+/// shell-injection surface; printed via `printf` (POSIX, no `echo -e` portability traps).
 fn with_rlimit_preamble(inner: Vec<String>, limits: &ResourceLimits) -> Vec<String> {
     let script = format!(
-        "ulimit -t {} 2>/dev/null || true; ulimit -v {} 2>/dev/null || true; exec \"$@\"",
+        "ulimit -t {} 2>/dev/null || true; ulimit -v {} 2>/dev/null || true; \
+         printf '%s\\n' '{}' >&2; exec \"$@\"",
         limits.cpu_seconds,
         limits.address_space_bytes / 1024,
+        START_SENTINEL,
     );
     let mut v = vec![
         "/bin/sh".to_string(),
@@ -218,11 +266,15 @@ pub fn build_plan(input: PlanInput) -> Result<SandboxPlan> {
     if inner.is_empty() {
         return Err(SandboxError::EmptyCommand);
     }
-    // Best-effort rlimits for tiers with no native mechanism (no-op for firejail/containers).
-    if matches!(
+    // Best-effort rlimits for tiers with no native mechanism (no-op for firejail/containers). The
+    // SAME predicate decides whether the start sentinel is expected (the preamble is its only
+    // emitter), bound once so the two can never drift: every preamble-wrapped tier emits the sentinel
+    // and every sentinel-expecting tier is preamble-wrapped.
+    let uses_preamble = matches!(
         input.backend,
         Backend::SandboxExec | Backend::Bwrap | Backend::NetnsHelper | Backend::ConstrainedLocal
-    ) {
+    );
+    if uses_preamble {
         inner = with_rlimit_preamble(inner, &input.policy.limits);
     }
     let mut plan = match input.backend {
@@ -235,6 +287,7 @@ pub fn build_plan(input: PlanInput) -> Result<SandboxPlan> {
     };
     // Carry the adapter's build-vs-test hints to the runtime (set centrally, not per-backend).
     plan.build_signal = input.req.build_signal.clone();
+    plan.expects_start_sentinel = uses_preamble;
     Ok(plan)
 }
 
@@ -252,6 +305,8 @@ fn plan_sandbox_exec(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Res
         cleanup: None,
         new_process_group: true,
         build_signal: BuildSignal::default(),
+        // `build_plan` overrides this centrally from `uses_preamble`; the per-backend default is false.
+        expects_start_sentinel: false,
     })
 }
 
@@ -294,6 +349,8 @@ fn plan_bwrap(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPla
         cleanup: None,
         new_process_group: true,
         build_signal: BuildSignal::default(),
+        // `build_plan` overrides this centrally from `uses_preamble`; the per-backend default is false.
+        expects_start_sentinel: false,
     }
 }
 
@@ -332,6 +389,8 @@ fn plan_firejail(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Sandbox
         cleanup: None,
         new_process_group: true,
         build_signal: BuildSignal::default(),
+        // `build_plan` overrides this centrally from `uses_preamble`; the per-backend default is false.
+        expects_start_sentinel: false,
     }
 }
 
@@ -429,6 +488,8 @@ fn plan_container(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> Result
         cleanup: Some(cleanup),
         new_process_group: false,
         build_signal: BuildSignal::default(),
+        // `build_plan` overrides this centrally from `uses_preamble`; the per-backend default is false.
+        expects_start_sentinel: false,
     })
 }
 
@@ -463,12 +524,16 @@ fn plan_netns_helper(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> San
         cleanup: None,
         new_process_group: true,
         build_signal: BuildSignal::default(),
+        // `build_plan` overrides this centrally from `uses_preamble`; the per-backend default is false.
+        expects_start_sentinel: false,
     }
 }
 
 fn plan_local(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPlan {
-    // No wrapper: best-effort isolation only. The inner command is spawned directly with the env
-    // allowlist, cwd pinned to the overlay, in a fresh process group for timeout teardown.
+    // No backend launcher: best-effort isolation only. `inner` already carries the rlimit preamble
+    // (applied centrally in `build_plan` for this tier), so the spawned program is that preamble shell;
+    // this fn just splits `inner` into program + args, with the env allowlist, cwd pinned to the
+    // overlay, and a fresh process group for timeout teardown.
     let mut it = inner.into_iter();
     let program = it.next().unwrap_or_default();
     let args: Vec<String> = it.collect();
@@ -482,6 +547,8 @@ fn plan_local(input: &PlanInput, cwd: PathBuf, inner: Vec<String>) -> SandboxPla
         cleanup: None,
         new_process_group: true,
         build_signal: BuildSignal::default(),
+        // `build_plan` overrides this centrally from `uses_preamble`; the per-backend default is false.
+        expects_start_sentinel: false,
     }
 }
 
@@ -897,10 +964,13 @@ mod tests {
 
     #[test]
     fn firejail_and_docker_are_not_preamble_wrapped() {
-        // firejail has --rlimit-*; containers use cgroup flags — neither gets the shell preamble.
+        // firejail has --rlimit-*; containers use cgroup flags — neither gets the shell preamble, so
+        // neither emits the start sentinel and neither expects one.
         let r = req();
         let fj = build_plan(input(Backend::Firejail, &r, &ExecPolicy::default())).unwrap();
         assert!(!fj.args.iter().any(|a| a.contains("ulimit -t")));
+        assert!(!fj.args.iter().any(|a| a.contains(START_SENTINEL)));
+        assert!(!fj.expects_start_sentinel);
         assert!(fj
             .args
             .ends_with(&["cargo".into(), "test".into(), "--quiet".into()]));
@@ -912,6 +982,51 @@ mod tests {
         };
         let dk = build_plan(input(Backend::Docker, &r, &policy)).unwrap();
         assert!(!dk.args.iter().any(|a| a.contains("ulimit -t")));
+        assert!(!dk.args.iter().any(|a| a.contains(START_SENTINEL)));
+        assert!(!dk.expects_start_sentinel);
+    }
+
+    #[test]
+    fn preamble_tiers_emit_the_start_sentinel_before_exec_and_expect_it() {
+        // Every preamble-wrapped tier must (a) set `expects_start_sentinel` and (b) print the sentinel
+        // to stderr AFTER the ulimits and immediately BEFORE `exec "$@"` — so its presence witnesses
+        // that the wrapper completed and control reached the inner command. Non-preamble tiers must do
+        // neither (asserted in `firejail_and_docker_are_not_preamble_wrapped`).
+        let r = req();
+        for backend in [
+            Backend::SandboxExec,
+            Backend::Bwrap,
+            Backend::NetnsHelper,
+            Backend::ConstrainedLocal,
+        ] {
+            let plan = build_plan(input(backend, &r, &ExecPolicy::default())).unwrap();
+            assert!(
+                plan.expects_start_sentinel,
+                "{backend:?} is preamble-wrapped and must expect the sentinel"
+            );
+            let script = plan
+                .args
+                .iter()
+                .find(|a| a.contains("exec \"$@\""))
+                .unwrap_or_else(|| {
+                    panic!("{backend:?} preamble script not found in {:?}", plan.args)
+                });
+            // Sentinel printed within the script, ordered: ulimits … sentinel … exec.
+            let sentinel_at = script
+                .find(START_SENTINEL)
+                .unwrap_or_else(|| panic!("{backend:?} script missing sentinel: {script}"));
+            let exec_at = script.find("exec \"$@\"").unwrap();
+            let ulimit_at = script.find("ulimit -t").unwrap();
+            assert!(
+                ulimit_at < sentinel_at && sentinel_at < exec_at,
+                "{backend:?} must print the sentinel after ulimits and before exec: {script}"
+            );
+            // The sentinel is emitted to stderr (so it shares the launcher/inner stderr ordering).
+            assert!(
+                script.contains(&format!("'{START_SENTINEL}' >&2")),
+                "{backend:?} must print the sentinel to stderr: {script}"
+            );
+        }
     }
 
     #[test]

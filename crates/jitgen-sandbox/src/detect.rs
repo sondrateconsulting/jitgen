@@ -46,6 +46,19 @@ pub fn netns_helper_available() -> bool {
     }
 }
 
+/// Re-run `backend`'s functional availability probe **right now**, returning whether it can still
+/// isolate. Used by [`crate::sandbox::Sandbox::run`] to escalate a mid-run wrapper failure (the inner
+/// command never started) into a hard [`crate::error::SandboxError::BackendUnavailableMidRun`] only
+/// when the breakage is *persistent* — a fresh probe failing confirms the environment changed after
+/// selection (e.g. `user.max_user_namespaces` exhausted), distinguishing it from a transient blip.
+/// This is the netns counterpart of the firejail pre-execution re-probe, and lives in `detect` (not
+/// the pure executor) so the executor stays free of backend-selection logic. For [`Backend::NetnsHelper`]
+/// the probe is functional (creates a real user+net namespace pair); the `&'static str` callers see is
+/// the backend id only.
+pub(crate) fn backend_available_now(backend: Backend) -> bool {
+    available(backend)
+}
+
 fn available(backend: Backend) -> bool {
     match probe_backend(backend) {
         Some(outcome) => probe_is_available(backend, &outcome),

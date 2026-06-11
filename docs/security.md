@@ -78,7 +78,11 @@ Test commands and build scripts are attacker-controlled.
   namespace — DNS/TCP/UDP/IPv6 and the host's loopback services — kernel-denied,
   conformance-tested; a test may re-up its namespace-private loopback to talk to itself, which
   reaches nothing outside, and it is **not** a unix-socket boundary: pathname AF_UNIX sockets
-  cross network namespaces; [ADR-0013](decisions/0013-netns-helper-backend.md)). cwd pinned
+  cross network namespaces; [ADR-0013](decisions/0013-netns-helper-backend.md)). A `unshare` failure
+  that appears *after* selection (kernel/policy change mid-run) is detected via the preamble **start
+  sentinel** and classified `Errored`/`Broken`, never a test failure — so it can't mint a false catch
+  — with a trusted re-probe escalating persistent breakage to a loud abort (see "Run-time wrapper
+  failure" under Residual risks). cwd pinned
   to overlay; resource limits **per backend** (containers via cgroup flags
   `--memory`/`--pids-limit`/`--cpus`; firejail via `--rlimit-*`; OS-sandbox/netns-local/constrained-
   local via a `ulimit` preamble applying CPU-time + address-space only — process-count is omitted by
@@ -296,7 +300,9 @@ These MUST exist and pass before the relevant phase is complete (built security-
   re-execs the untrusted argv via plain `exec "$@"` (no `--`: dash's `exec` has no `--` terminator, so
   `exec -- "$@"` would try to run a file literally named `--`); the leading-dash defense the `--` once
   provided — a program beginning with `-` parsed by a bash-family `exec` as an option — now lives at the
-  `inner_argv` boundary (`SandboxError::OptionLikeProgram`). **Process-count
+  `inner_argv` boundary (`SandboxError::OptionLikeProgram`). The preamble also prints a fixed trusted
+  **start sentinel** to stderr as its last action before `exec "$@"` — see the signal-integrity
+  residual below. **Process-count
   is intentionally omitted** (`ulimit -u` is per-UID, not per-process-tree): the container
   `--pids-limit` plus the wall-clock timeout are the fork-bomb controls, and the whole-process-group
   kill bounds escapees. Network egress, write-confinement, and the env allowlist are unaffected.
@@ -332,6 +338,37 @@ These MUST exist and pass before the relevant phase is complete (built security-
   sandbox, prefer the container tier or `--unsafe-local-execution` with a jitgen-owned ephemeral
   container (threat #1). bwrap has **no** analogous fail-open mode — it
   fails loudly (nonzero exit) when it cannot create a namespace — so it needs no stderr backstop.
+- **Run-time wrapper failure is a signal-integrity, not a confinement, hazard (netns + preamble
+  tiers).** A backend's availability is probed at *selection* time, but a launcher can fail at *run*
+  time after a passing probe — most realistically the **netns helper**'s `unshare` when unprivileged
+  user namespaces become unavailable mid-run (`user.max_user_namespaces` exhausted, AppArmor
+  `apparmor_restrict_unprivileged_userns` toggled, a seccomp policy applied to the job). The launcher
+  then exits nonzero **before** exec'ing the inner command, so the command never ran (fail-closed for
+  confinement — nothing ran unconfined). The danger is the opposite of firejail's fail-*open* (threat
+  #1, where the command runs unsandboxed): here a nonzero *launcher* exit could be **misread as a
+  nonzero *test* exit**, and in catch mode base-pass + head-"fail" would mint a **false catch**.
+  Defense: the rlimit preamble prints a fixed start sentinel to stderr immediately before `exec "$@"`;
+  its **presence** is an unforgeable witness that control reached the inner command (the only stderr
+  writers, in order, are the trusted launcher, the trusted preamble, then the untrusted command — a
+  command cannot erase a sentinel already in the pipe, and a wrapper that failed before `exec` ran no
+  attacker code to emit one). The runtime keys "the inner command never started" off the sentinel's
+  **absence** and classifies such a run `Errored` (→ `CatchClass::Broken`: *could not run*), never a
+  test `Failed`. A fixed string (not a nonce) suffices — an attacker re-printing it only adds a
+  cosmetic duplicate line, never a false absence; and the detector deliberately does **not** key off
+  the launcher's *error text* (which the repo can forge once its code runs), only off the trusted
+  sentinel it cannot pre-empt. For the netns tier specifically, a wrapper failure additionally triggers
+  a **trusted re-probe** (`unshare … /bin/sh -c true`, no attacker code): if that fresh probe also
+  fails the breakage is persistent, so the run aborts loudly with `SandboxError::BackendUnavailableMidRun`
+  rather than churn every remaining candidate to `Broken`; a transient flip leaves the `Errored`
+  result standing and continues. **Residuals (all fail-closed):** (a) a wrapper failure in the tiny
+  window *after* the re-probe passed has already produced an `Errored`/`Broken` candidate — never a
+  false catch — for that one candidate; (b) the re-probe could be pushed to fail by a prior run's
+  **process-group escapee** (`setsid`) holding a namespace reference and keeping the slot count
+  elevated across the re-probe window — this is within the documented escapee residual above, and the
+  outcome is a *visible abort* of the run, never an escape or a clean pass; (c) a repo cannot forge the
+  abort beyond what it already controls (it can suppress its own catches with `exit 0` regardless).
+  See `crates/jitgen-sandbox/src/{command,classify,run,sandbox,backend}.rs` and
+  [ADR-0013](decisions/0013-netns-helper-backend.md).
 - **Secret redaction heuristic (F5, `jitgen-context::redact`):** runs before any prompt/log/report
   on a **size-bounded** input window (256 KiB/item, with a fail-closed drop of a window-split
   trailing token), using the linear-time `regex` engine (no catastrophic backtracking). It covers

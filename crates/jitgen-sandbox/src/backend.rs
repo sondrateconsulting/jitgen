@@ -70,6 +70,28 @@ impl Backend {
         }
     }
 
+    /// Whether a mid-run **wrapper failure** (the launcher failed before the inner command started,
+    /// detected via the missing start sentinel) should trigger a trusted **re-probe** and, if that
+    /// fresh probe also fails, a hard [`crate::error::SandboxError::BackendUnavailableMidRun`] —
+    /// rather than only a per-candidate `Errored`/`Broken`. True **only** for the netns helper today:
+    /// it is the one tier with a *functional* probe (creating a user+net namespace) that can pass at
+    /// selection and then fail at run time (`user.max_user_namespaces` exhaustion, AppArmor/seccomp
+    /// toggles) — a re-probe there is meaningful. The OS-sandbox/local tiers either have presence-only
+    /// probes (a re-probe would always pass and be useless) or no probe at all. Enumerated without a
+    /// wildcard so adding a backend forces an explicit decision; generalizing to bwrap/sandbox-exec is
+    /// a follow-up once their probes become functional ([ADR-0013], `docs/security.md` threat #1).
+    pub(crate) fn reprobes_on_inner_never_started(self) -> bool {
+        match self {
+            Backend::NetnsHelper => true,
+            Backend::Bwrap
+            | Backend::Firejail
+            | Backend::SandboxExec
+            | Backend::Docker
+            | Backend::Podman
+            | Backend::ConstrainedLocal => false,
+        }
+    }
+
     /// Isolation tier.
     pub fn tier(self) -> Tier {
         match self {
@@ -508,6 +530,37 @@ mod tests {
                 !b.stderr_shows_silent_degradation(warning),
                 "{b:?} must not have a silent-degradation mode"
             );
+        }
+    }
+
+    #[test]
+    fn only_netns_helper_reprobes_on_inner_never_started() {
+        // The mid-run re-probe escalation (run-time wrapper failure → trusted re-probe → hard error)
+        // applies to the netns helper ONLY today. Pin the exact set so adding a backend forces an
+        // explicit decision, and so a future maintainer can't silently widen/narrow it.
+        for b in [
+            Backend::Bwrap,
+            Backend::Firejail,
+            Backend::SandboxExec,
+            Backend::Docker,
+            Backend::Podman,
+            Backend::NetnsHelper,
+            Backend::ConstrainedLocal,
+        ] {
+            assert_eq!(
+                b.reprobes_on_inner_never_started(),
+                b == Backend::NetnsHelper,
+                "{b:?}: only the netns helper re-probes on a mid-run wrapper failure"
+            );
+            // Invariant: a tier that re-probes MUST have a probe to re-run (a re-probe is meaningless
+            // otherwise). The netns probe is functional — see `availability_probe`'s netns arm — which
+            // is what makes a re-probe meaningful (it can pass at selection then fail at run time).
+            if b.reprobes_on_inner_never_started() {
+                assert!(
+                    b.availability_probe().is_some(),
+                    "{b:?} re-probes but has no probe to re-run"
+                );
+            }
         }
     }
 

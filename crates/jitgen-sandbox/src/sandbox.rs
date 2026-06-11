@@ -2,15 +2,16 @@
 //!
 //! [`Sandbox`] ties the layer together — [`crate::backend::select`] (fail-closed) →
 //! [`crate::env::build_env`] (allowlist + synthetic `HOME`/`TMPDIR`) → [`crate::command::build_plan`]
-//! (per-backend argv) → [`crate::run::run`] (spawn + timeout + caps + redact + classify). The
-//! orchestrator (F8/F9) maps an adapter `TestCommand` into a [`SpawnRequest`] and calls [`Sandbox::run`].
+//! (per-backend argv) → [`crate::run::run_reporting`] (spawn + timeout + caps + redact + classify,
+//! plus the wrapper-failure signal the capstone escalates). The orchestrator (F8/F9) maps an adapter
+//! `TestCommand` into a [`SpawnRequest`] and calls [`Sandbox::run`].
 
 use crate::backend::{select, Backend};
 use crate::command::{build_plan, PlanInput};
 use crate::env::{build_env, process_env};
 use crate::error::{Result, SandboxError};
 use crate::policy::ExecPolicy;
-use crate::run::run as run_plan;
+use crate::run::run_reporting;
 use crate::spawn::SpawnRequest;
 use jitgen_core::ExecutionResult;
 use std::path::Path;
@@ -81,16 +82,25 @@ impl Sandbox {
 
     /// Build the env + plan and execute, returning a redacted/capped/classified result.
     pub fn run(&self, req: &RunRequest) -> Result<ExecutionResult> {
-        self.run_with_degradation_probe(req, crate::detect::backend_silently_degrades)
+        self.run_with_probes(
+            req,
+            crate::detect::backend_silently_degrades,
+            crate::detect::backend_available_now,
+        )
     }
 
-    /// [`run`](Self::run) with the pre-execution degradation probe injected, so the refusal path is
-    /// unit-testable offline (no live containerized firejail needed). Production always goes
-    /// through [`run`](Self::run), which passes [`crate::detect::backend_silently_degrades`].
-    fn run_with_degradation_probe(
+    /// [`run`](Self::run) with the two trusted probes injected, so both refusal paths are
+    /// unit-testable offline: `backend_silently_degrades` drives the firejail PRE-execution
+    /// degradation guard (no live containerized firejail needed) and `backend_available_now` drives
+    /// the netns mid-run availability re-probe (no live broken kernel needed). Production always goes
+    /// through [`run`](Self::run), which passes the real `crate::detect` probes. Both probes live
+    /// here at the capstone — not in the pure executor — so `crate::run` stays free of backend
+    /// selection/detection logic.
+    fn run_with_probes(
         &self,
         req: &RunRequest,
         backend_silently_degrades: fn(Backend) -> bool,
+        backend_available_now: fn(Backend) -> bool,
     ) -> Result<ExecutionResult> {
         // PRE-EXECUTION guard for a silently-degrading launcher (firejail). firejail runs the command
         // with NO sandboxing (exit 0, warning on stderr) when it detects it is already inside a
@@ -140,8 +150,37 @@ impl Sandbox {
             instance: req.instance,
             run_as: req.run_as,
         })?;
-        run_plan(&plan, &self.policy)
+        let (result, inner_never_started) = run_reporting(&plan, &self.policy)?;
+
+        // If the sandbox wrapper failed before the test command started (no start sentinel), decide
+        // whether the breakage is persistent. The result already classifies `Errored` (→ `Broken`), so
+        // a single blip costs one candidate and the run continues — no false catch. Only if a fresh
+        // functional probe ALSO fails do we abort loudly (the environment can no longer create
+        // namespaces — it changed after selection), rather than churn every remaining candidate to
+        // Broken. The command never ran unconfined on either path (fail-closed; the netns wrapper never
+        // ran it at all). (threat #1, [ADR-0013].)
+        if is_persistent_wrapper_failure(self.backend, inner_never_started, backend_available_now) {
+            return Err(SandboxError::BackendUnavailableMidRun(self.backend.id()));
+        }
+        Ok(result)
     }
+}
+
+/// Whether a finished run is a **persistent** mid-run wrapper failure that must abort the run, rather
+/// than a per-candidate `Broken`. True iff the inner command never started (no start sentinel), the
+/// backend re-probes on that (only the netns helper today), AND a fresh trusted probe confirms the
+/// backend can no longer isolate. Pure + short-circuiting so the escalation is unit-tested offline
+/// with injected inputs — and so `backend_available_now` (which spawns a probe) is **not** consulted
+/// unless the first two cheap conditions hold. The probe argv is trusted (`unshare … /bin/sh -c true`)
+/// with no attacker code, so this decision cannot be forged by the repo.
+fn is_persistent_wrapper_failure(
+    backend: Backend,
+    inner_never_started: bool,
+    backend_available_now: fn(Backend) -> bool,
+) -> bool {
+    inner_never_started
+        && backend.reprobes_on_inner_never_started()
+        && !backend_available_now(backend)
 }
 
 /// Create `dir` fresh, refusing to follow or reuse a pre-existing entry at that leaf. The parent
@@ -162,6 +201,55 @@ fn create_fresh_dir(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use jitgen_core::SandboxBackend;
+
+    fn unreached_probe(_: Backend) -> bool {
+        panic!("backend_available_now must not be consulted here (short-circuit failed)")
+    }
+
+    #[test]
+    fn persistent_wrapper_failure_escalates_only_for_netns_with_a_failing_reprobe() {
+        // The netns escalation decision, exercised purely (no live broken kernel): abort iff the inner
+        // command never started AND the backend re-probes AND a fresh probe now fails.
+        // Persistent breakage → escalate.
+        assert!(is_persistent_wrapper_failure(
+            Backend::NetnsHelper,
+            true,
+            |_| false
+        ));
+        // Transient blip: the inner never started, but the probe passes again → do NOT escalate (the
+        // per-candidate `Errored`/`Broken` result stands; the run continues — no worse than today).
+        assert!(!is_persistent_wrapper_failure(
+            Backend::NetnsHelper,
+            true,
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn no_escalation_when_inner_started_or_backend_does_not_reprobe() {
+        // Inner DID start (sentinel seen) → never escalate; the probe must not even be consulted
+        // (a panicking probe proves the `inner_never_started` short-circuit fires first).
+        assert!(!is_persistent_wrapper_failure(
+            Backend::NetnsHelper,
+            false,
+            unreached_probe
+        ));
+        // A backend with no re-probe (constrained-local, every OS-sandbox/container tier) never
+        // escalates, and the probe must not run (the `reprobes_on_inner_never_started` short-circuit).
+        for b in [
+            Backend::ConstrainedLocal,
+            Backend::Bwrap,
+            Backend::Firejail,
+            Backend::SandboxExec,
+            Backend::Docker,
+            Backend::Podman,
+        ] {
+            assert!(
+                !is_persistent_wrapper_failure(b, true, unreached_probe),
+                "{b:?} must not escalate (and must not consult the probe)"
+            );
+        }
+    }
 
     #[test]
     fn new_is_fail_closed_with_no_backend() {
@@ -301,7 +389,9 @@ mod tests {
         let sb = Sandbox::new(&[Backend::Firejail], policy).unwrap();
         let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "true".into()]);
         let req = nonexistent_roots_request(&cmd);
-        let err = sb.run_with_degradation_probe(&req, |_| true).unwrap_err();
+        let err = sb
+            .run_with_probes(&req, |_| true, unreached_probe)
+            .unwrap_err();
         assert!(
             matches!(err, SandboxError::SandboxDegraded("firejail")),
             "a degrading probe must refuse the run up front, got {err:?}"
@@ -319,7 +409,9 @@ mod tests {
         let sb = Sandbox::new(&[Backend::Firejail], policy).unwrap();
         let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "true".into()]);
         let req = nonexistent_roots_request(&cmd);
-        let err = sb.run_with_degradation_probe(&req, |_| false).unwrap_err();
+        let err = sb
+            .run_with_probes(&req, |_| false, unreached_probe)
+            .unwrap_err();
         assert!(
             matches!(err, SandboxError::Io(_)),
             "a healthy probe must let the run proceed past the guard, got {err:?}"
@@ -340,9 +432,11 @@ mod tests {
         let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "true".into()]);
         let req = nonexistent_roots_request(&cmd);
         let err = sb
-            .run_with_degradation_probe(&req, |_| {
-                panic!("the degradation probe must not be consulted for constrained-local")
-            })
+            .run_with_probes(
+                &req,
+                |_| panic!("the degradation probe must not be consulted for constrained-local"),
+                unreached_probe,
+            )
             .unwrap_err();
         assert!(
             matches!(err, SandboxError::Io(_)),
