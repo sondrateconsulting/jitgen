@@ -663,14 +663,24 @@ fn resolve_test_uid_gid_invalid_override_quotes_the_rejected_value() {
 #[test]
 #[ignore = "live sandbox; run with --ignored on the host"]
 fn sandbox_exec_denies_network() {
-    // Skipping is honest only when the backend itself is absent (non-macOS host). Once
-    // sandbox-exec IS available, a missing probe tool or a no-egress host must fail loudly via
-    // `assert_network_denied`'s control + NO_PROBE_TOOL guards — an unverifiable gate must not
-    // read as a passing one.
-    if !jitgen_sandbox::detect().contains(&Backend::SandboxExec) {
-        eprintln!("SKIP sandbox_exec_denies_network: sandbox-exec not available on this host");
+    // Skipping is honest only when the backend itself is absent — and sandbox-exec exists on
+    // macOS only, so the skip keys on the OS, NOT on `detect()`: `detect()` means "present AND
+    // its functional probe passed", so using it as the skip predicate would skip-green an
+    // installed-but-degraded sandbox-exec — exactly the unverified-confinement skip this gate
+    // must not take. On a macOS host the backend must be detected (loud assert below); a missing
+    // probe tool or a no-egress host then fails loudly via `assert_network_denied`'s control +
+    // NO_PROBE_TOOL guards — an unverifiable gate must not read as a passing one.
+    if cfg!(not(target_os = "macos")) {
+        eprintln!("SKIP sandbox_exec_denies_network: sandbox-exec is macOS-only");
         return;
     }
+    assert!(
+        jitgen_sandbox::detect().contains(&Backend::SandboxExec),
+        "sandbox_exec_denies_network: this is a macOS host but the sandbox-exec backend is \
+         unavailable (launcher missing from the trusted bin dirs, or its functional probe \
+         failed), so network denial cannot be verified; fix the sandbox-exec installation and \
+         rerun — a degraded backend must fail this gate loudly, not skip it"
+    );
     assert_network_denied(
         &sandbox_exec(),
         &Fixture::new("net"),
