@@ -8,7 +8,8 @@ use crate::error::{GitError, Result};
 use crate::filter::is_ignored;
 use git2::{Delta, DiffDelta, DiffFile, DiffHunk, DiffOptions, Oid, Repository};
 use jitgen_core::{ChangeKind, ChangeSet, FileChange, LineRange, RevisionId};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
@@ -23,6 +24,17 @@ const MAX_BLOB_BYTES: usize = 2 * 1024 * 1024;
 /// Cap on entries walked when rejecting symlinks under `refs/` (refs are normally few; bound the
 /// walk so a hostile repo cannot turn intake into an unbounded directory traversal).
 const MAX_REFS_WALK: usize = 100_000;
+/// Cap on head-side hunks materialized for a single file; fail closed beyond (pre-sandbox DoS
+/// bound). With `context_lines(0)` a hostile near-1MiB file of alternating changed/unchanged lines
+/// would otherwise materialize ~260k `LineRange`s. Aligned with the downstream per-file `MAX_HUNKS`
+/// in `jitgen-adapters`, beyond which the grammar path demotes hunks to line-range fallback targets
+/// rather than symbol targets — so past this point each extra hunk only adds bulk, not precision.
+const MAX_HUNKS_PER_FILE: usize = 1000;
+/// Aggregate cap on hunk callbacks across the whole diff walk; fail closed beyond (pre-sandbox DoS
+/// bound). Counts EVERY hunk the walk produces — including pure-deletion hunks that materialize
+/// nothing — so it bounds both total hunk memory and the per-hunk diff work a hostile base..head
+/// can force (`MAX_CHANGED_FILES` × per-file hunks would otherwise admit millions).
+const MAX_TOTAL_HUNKS: usize = 100_000;
 
 /// Open a git repository at exactly `path` (the repo root). Uses `NO_SEARCH` so intake never walks
 /// up to a parent repository (F3/S1 review #4). Intake never runs repo hooks/filters — only reads
@@ -542,29 +554,62 @@ fn file_change_from_delta(delta: &DiffDelta<'_>) -> Option<FileChange> {
 
 fn collect_file_changes(diff: &git2::Diff<'_>) -> Result<Vec<FileChange>> {
     let acc: RefCell<Vec<FileChange>> = RefCell::new(Vec::new());
-    {
+    // path → position in `acc`, so each hunk attributes in O(1). libgit2 emits a file's hunks right
+    // after its file callback, so a forward linear scan always matched the LAST element —
+    // O(files × hunks) on hostile diffs.
+    let index: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+    // Hunk-cap state: a tripped cap records its typed error here and aborts the walk (callback
+    // returns `false`), failing loud like MAX_CHANGED_FILES rather than materializing further work.
+    let total_hunks = Cell::new(0usize);
+    let cap_err: RefCell<Option<GitError>> = RefCell::new(None);
+    let walk = {
         let mut file_cb = |delta: DiffDelta<'_>, _progress: f32| -> bool {
             if let Some(fc) = file_change_from_delta(&delta) {
-                acc.borrow_mut().push(fc);
+                let mut files = acc.borrow_mut();
+                let pos = files.len();
+                // First insert wins, preserving the first-match semantics of the previous scan.
+                index.borrow_mut().entry(fc.path.clone()).or_insert(pos);
+                files.push(fc);
             }
             true
         };
         let mut hunk_cb = |delta: DiffDelta<'_>, hunk: DiffHunk<'_>| -> bool {
+            // The aggregate budget counts EVERY hunk — before the pure-deletion early-return — so
+            // it bounds the walk itself, not just materialized memory (see MAX_TOTAL_HUNKS).
+            let seen = total_hunks.get() + 1;
+            total_hunks.set(seen);
+            if seen > MAX_TOTAL_HUNKS {
+                *cap_err.borrow_mut() = Some(GitError::TooManyHunks(format!(
+                    "more than {MAX_TOTAL_HUNKS} hunks across the diff exceeds the intake cap"
+                )));
+                return false;
+            }
             if hunk.new_lines() == 0 {
                 return true; // pure deletion hunk: no head-side lines
             }
             if let Some(path) = delta_head_path(&delta) {
                 let start = hunk.new_start();
                 if let Ok(range) = LineRange::new(start, start + hunk.new_lines() - 1) {
-                    let mut files = acc.borrow_mut();
-                    if let Some(fc) = files.iter_mut().find(|f| f.path == path) {
-                        fc.hunks.push(range);
+                    if let Some(&i) = index.borrow().get(&path) {
+                        let mut files = acc.borrow_mut();
+                        if files[i].hunks.len() >= MAX_HUNKS_PER_FILE {
+                            *cap_err.borrow_mut() = Some(GitError::TooManyHunks(format!(
+                                "{path} exceeds the {MAX_HUNKS_PER_FILE}-hunk per-file intake cap"
+                            )));
+                            return false;
+                        }
+                        files[i].hunks.push(range);
                     }
                 }
             }
             true
         };
-        diff.foreach(&mut file_cb, None, Some(&mut hunk_cb), None)?;
+        diff.foreach(&mut file_cb, None, Some(&mut hunk_cb), None)
+    };
+    if let Err(e) = walk {
+        // A cap abort surfaces from libgit2 as a generic "callback returned an error"; report the
+        // recorded typed error instead. Any other walk failure propagates unchanged.
+        return Err(cap_err.into_inner().unwrap_or_else(|| e.into()));
     }
     Ok(acc.into_inner())
 }
@@ -1109,6 +1154,152 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&external);
+    }
+
+    #[test]
+    fn hunks_attribute_to_their_own_files_with_exact_ranges() {
+        // Pin per-file hunk attribution exactly (the hunk callback maps each hunk to its file via a
+        // path index): two modified files with changes at different known lines must each carry only
+        // their own range — a mis-attributed hunk would land on the wrong file or be duplicated.
+        let dir = temp_dir("attrib");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("one.txt"), "a\nb\nc\n").unwrap();
+        std::fs::write(dir.join("two.txt"), "x\ny\nz\n").unwrap();
+        let base = commit_all(&repo, &dir, "c1", None);
+        std::fs::write(dir.join("one.txt"), "a\nB\nc\n").unwrap();
+        std::fs::write(dir.join("two.txt"), "x\ny\nZ\n").unwrap();
+        let head = commit_all(&repo, &dir, "c2", Some(base));
+
+        let cs = diff_revisions(&repo, &base.to_string(), &head.to_string()).unwrap();
+        let one = cs.files.iter().find(|f| f.path == "one.txt").unwrap();
+        assert_eq!(one.hunks, vec![LineRange::new(2, 2).unwrap()]);
+        let two = cs.files.iter().find(|f| f.path == "two.txt").unwrap();
+        assert_eq!(two.hunks, vec![LineRange::new(3, 3).unwrap()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_file_hunk_cap_fails_loud() {
+        // With context_lines(0), alternating changed/unchanged lines materialize one hunk per
+        // changed line. One more changed line than MAX_HUNKS_PER_FILE must fail closed — if the cap
+        // is removed, the diff succeeds and this test fails (non-vacuous DoS test).
+        let dir = temp_dir("hunkcap");
+        let repo = Repository::init(&dir).unwrap();
+        let n = MAX_HUNKS_PER_FILE + 1;
+        let mut base = String::new();
+        let mut head = String::new();
+        for i in 0..n {
+            base.push_str(&format!("keep{i}\nold{i}\n"));
+            head.push_str(&format!("keep{i}\nnew{i}\n"));
+        }
+        std::fs::write(dir.join("big.txt"), &base).unwrap();
+        let base_oid = commit_all(&repo, &dir, "c1", None);
+        std::fs::write(dir.join("big.txt"), &head).unwrap();
+        let head_oid = commit_all(&repo, &dir, "c2", Some(base_oid));
+
+        let err = diff_revisions(&repo, &base_oid.to_string(), &head_oid.to_string()).unwrap_err();
+        assert!(matches!(err, GitError::TooManyHunks(_)), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_file_hunk_cap_names_only_the_offending_file() {
+        // One file under the cap plus one over it: the walk must fail closed naming the file that
+        // tripped the cap (repo-relative, per the GitError contract). A mis-attributed index
+        // lookup would either suppress the error or blame the innocent file.
+        let dir = temp_dir("hunkcap-multi");
+        let repo = Repository::init(&dir).unwrap();
+        let alternating = |n: usize, tag: &str| -> String {
+            (0..n).map(|i| format!("keep{i}\n{tag}{i}\n")).collect()
+        };
+        std::fs::write(
+            dir.join("file_a.txt"),
+            alternating(MAX_HUNKS_PER_FILE - 1, "old"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("file_b.txt"),
+            alternating(MAX_HUNKS_PER_FILE + 1, "old"),
+        )
+        .unwrap();
+        let base_oid = commit_all(&repo, &dir, "c1", None);
+        std::fs::write(
+            dir.join("file_a.txt"),
+            alternating(MAX_HUNKS_PER_FILE - 1, "new"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("file_b.txt"),
+            alternating(MAX_HUNKS_PER_FILE + 1, "new"),
+        )
+        .unwrap();
+        let head_oid = commit_all(&repo, &dir, "c2", Some(base_oid));
+
+        let err = diff_revisions(&repo, &base_oid.to_string(), &head_oid.to_string()).unwrap_err();
+        assert!(matches!(err, GitError::TooManyHunks(_)), "got: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("file_b.txt"),
+            "must name the offending file, got: {msg}"
+        );
+        assert!(
+            !msg.contains("file_a.txt"),
+            "must not blame the under-cap file, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aggregate_hunk_budget_counts_every_hunk_callback() {
+        // Pure-deletion hunks materialize NOTHING (new_lines == 0), so the per-file cap alone never
+        // trips — yet each one still costs a Myers-diff hunk callback (the pure-CPU DoS vector). The
+        // aggregate budget must count EVERY callback: a deletion-heavy multi-file diff exceeding
+        // MAX_TOTAL_HUNKS fails closed — if the budget is removed (or counted only after the
+        // pure-deletion early-return), the diff succeeds and this test fails.
+        let dir = temp_dir("hunkbudget");
+        let repo = Repository::init(&dir).unwrap();
+        const PAIRS_PER_FILE: usize = 20_000;
+        let files = MAX_TOTAL_HUNKS / PAIRS_PER_FILE + 1; // exceed the budget by one file
+        let base_content = "k\nd\n".repeat(PAIRS_PER_FILE); // ~80 KB, under MAX_DIFF_BLOB_SIZE
+        let head_content = "k\n".repeat(PAIRS_PER_FILE); // every `d` line: isolated deletion hunk
+        for i in 0..files {
+            std::fs::write(dir.join(format!("f{i}.txt")), &base_content).unwrap();
+        }
+        let base_oid = commit_all(&repo, &dir, "c1", None);
+        for i in 0..files {
+            std::fs::write(dir.join(format!("f{i}.txt")), &head_content).unwrap();
+        }
+        let head_oid = commit_all(&repo, &dir, "c2", Some(base_oid));
+
+        let err = diff_revisions(&repo, &base_oid.to_string(), &head_oid.to_string()).unwrap_err();
+        assert!(matches!(err, GitError::TooManyHunks(_)), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn aggregate_hunk_budget_accepts_exactly_at_cap() {
+        // The aggregate boundary is exclusive (`>`): a diff producing exactly MAX_TOTAL_HUNKS hunk
+        // callbacks must succeed. Pins the fence-post — flipping the budget check to `>=` would
+        // reject this legitimate diff and fail this test.
+        let dir = temp_dir("hunkbudget-ok");
+        let repo = Repository::init(&dir).unwrap();
+        const PAIRS_PER_FILE: usize = 20_000;
+        let files = MAX_TOTAL_HUNKS / PAIRS_PER_FILE; // exactly the budget
+        let base_content = "k\nd\n".repeat(PAIRS_PER_FILE);
+        let head_content = "k\n".repeat(PAIRS_PER_FILE); // every `d` line: isolated deletion hunk
+        for i in 0..files {
+            std::fs::write(dir.join(format!("f{i}.txt")), &base_content).unwrap();
+        }
+        let base_oid = commit_all(&repo, &dir, "c1", None);
+        for i in 0..files {
+            std::fs::write(dir.join(format!("f{i}.txt")), &head_content).unwrap();
+        }
+        let head_oid = commit_all(&repo, &dir, "c2", Some(base_oid));
+
+        let cs = diff_revisions(&repo, &base_oid.to_string(), &head_oid.to_string())
+            .expect("exactly MAX_TOTAL_HUNKS hunk callbacks must not trip the aggregate budget");
+        assert_eq!(cs.files.len(), files);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

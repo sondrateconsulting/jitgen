@@ -29,6 +29,10 @@ pub enum GitError {
     /// A diff produced more changed files than the intake cap allows (pre-sandbox DoS bound).
     #[error("diff too large ({0} changed files)")]
     DiffTooLarge(usize),
+    /// A diff produced more hunks than an intake cap allows — per file or in aggregate
+    /// (pre-sandbox DoS bound). The detail names the offending file or the aggregate cap.
+    #[error("diff too large: {0}")]
+    TooManyHunks(String),
     /// The opened repository's gitdir resolves outside the requested root (e.g. a `.git`-file
     /// indirection to an external repo).
     #[error("repository boundary escape: {0}")]

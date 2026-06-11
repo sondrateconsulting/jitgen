@@ -38,7 +38,7 @@ jobs:
       actions: read # zizmor's online audits resolve actions via the GitHub API
       security-events: write # upload the zizmor SARIF to code scanning (advanced-security: true)
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
@@ -56,7 +56,7 @@ jobs:
     name: history hygiene (docs/reviews purged + secret scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - name: docs/reviews must stay purged (GP1b)

@@ -58,9 +58,25 @@ fetches the RustSec advisory database:
 ./scripts/audit.sh    # cargo audit + cargo deny (advisories, licenses, bans, sources)
 ```
 
+CI runs the same script weekly and on every `Cargo.lock`/`Cargo.toml`/`deny.toml` change
+([supply-chain.yml](.github/workflows/supply-chain.yml)), so a PR that bumps a dependency gets
+audited automatically.
+
 If your change adds or bumps a crate, you must also **repin the Bazel lockfile** so
 `--lockfile_mode=error` keeps passing — see
 [troubleshooting.md](docs/troubleshooting.md#bazel-environment-variables-the-extension-depends-on-have-changed-after-adding-a-crate).
+
+This applies to **Dependabot cargo PRs** too ([dependabot.yml](.github/dependabot.yml)): Dependabot
+edits only `Cargo.toml`/`Cargo.lock` and does NOT repin the Bazel lockfile, and there is no Bazel
+lane in CI — so a green Dependabot PR still fails `scripts/check.sh` until someone runs the repin
+recipe above on the Dependabot branch before merge.
+
+Reviewing a **Dependabot github-actions PR**:
+- Confirm the bumped SHA actually corresponds to the release tag in the updated `# vX.Y.Z` comment —
+  Dependabot can occasionally pin an unreleased latest commit with a stale version comment
+  ([dependabot-core#13466](https://github.com/dependabot/dependabot-core/issues/13466)).
+- Check with `gh api repos/<owner>/<action-repo>/git/ref/tags/<tag>` and compare `object.sha`
+  (deref annotated tags via `git/tags/<sha>` if needed) to the pinned SHA in the workflow.
 
 ## Invariants you must preserve
 
