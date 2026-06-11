@@ -517,8 +517,19 @@ fn file_change_from_delta(delta: &DiffDelta<'_>) -> Option<FileChange> {
         return None;
     }
     let old_path = match (status, old_path) {
-        (Delta::Renamed, Some(op)) if reject_unsafe_rel(&op).is_ok() => Some(op),
-        (Delta::Renamed, Some(_)) => return None, // unsafe rename source → drop
+        (Delta::Renamed, Some(op)) => {
+            if reject_unsafe_rel(&op).is_err() {
+                return None; // unsafe rename source → drop the whole change
+            }
+            // A secret-like/vendored rename source must never be NAMED in context: `old_path`
+            // flows into the diff summary as "(was …)" (jitgen-orchestrator/src/context.rs). The
+            // destination is a legitimate target, so keep the change and suppress the annotation.
+            if is_ignored(&op) {
+                None
+            } else {
+                Some(op)
+            }
+        }
         _ => None,
     };
     Some(FileChange {
@@ -875,6 +886,47 @@ mod tests {
             .expect("new.rs present");
         assert_eq!(renamed.kind, ChangeKind::Renamed);
         assert_eq!(renamed.old_path.as_deref(), Some("old.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_from_secret_source_suppresses_old_path() {
+        let dir = temp_dir("rename-secret");
+        let repo = Repository::init(&dir).unwrap();
+        let content = "https://user:token@git.example.com\n";
+        std::fs::write(dir.join(".git-credentials"), content).unwrap();
+        let base = commit_all(&repo, &dir, "c1", None);
+
+        // Rename .git-credentials -> main.rs with identical content so similarity detection fires.
+        std::fs::remove_file(dir.join(".git-credentials")).unwrap();
+        std::fs::write(dir.join("main.rs"), content).unwrap();
+        let head = {
+            let mut index = repo.index().unwrap();
+            index.remove_path(Path::new(".git-credentials")).unwrap();
+            index.add_path(Path::new("main.rs")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = Signature::now("Test", "test@example.invalid").unwrap();
+            let parent = repo.find_commit(base).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "c2", &tree, &[&parent])
+                .unwrap()
+        };
+
+        let cs = diff_revisions(&repo, &base.to_string(), &head.to_string()).unwrap();
+        // The destination is a legitimate target and stays in the changeset...
+        let renamed = cs
+            .files
+            .iter()
+            .find(|f| f.path == "main.rs")
+            .expect("main.rs present");
+        assert_eq!(renamed.kind, ChangeKind::Renamed);
+        // ...but the secret rename source is not named anywhere in it (its filename would
+        // otherwise reach the LLM prompt via the "(was …)" diff-summary annotation).
+        assert_eq!(renamed.old_path, None);
+        assert!(
+            !format!("{cs:?}").contains(".git-credentials"),
+            "secret filename leaked into the changeset: {cs:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
