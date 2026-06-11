@@ -94,12 +94,19 @@ Test commands and build scripts are attacker-controlled.
   all silently dropped). A `firejail --version` succeeds there, so jitgen defends in **three layers**:
   (1) **detect-time, behavioral** — `detect()` marks a degradation-capable backend available only on
   **positive, observed proof of the network cut**: jitgen binds a live loopback listener in its own
-  namespace, proves it reachable, then runs a trusted sentinel script *inside* `firejail --net=none`
-  (no `--quiet`) that must FAIL to reach that listener (`NET_DENIED`). A degraded passthrough runs in
-  the parent namespace, reaches the listener (`NET_OK`), and is excluded **however firejail words its
-  warning** — and "could not verify" (no connect tool in the sandbox, listener setup failure) is also
-  unavailable, fail-closed. The stderr warning match is kept as defense-in-depth. So AUTO never
-  selects a degrading firejail and falls through to the next tier or refuses. (2) **pre-execution** —
+  namespace, proves it reachable, then runs the **identical** trusted sentinel script twice — once
+  **unconfined** (the *control*) and once *inside* `firejail --net=none` (no `--quiet`). firejail is
+  available only if the control reached the listener (`NET_OK`) **and** the sandboxed run could not
+  (`NET_DENIED`). The control is what makes the `NET_DENIED` trustworthy: a `NET_DENIED` proves a
+  network cut only if the *same connect tool* could reach the listener with full network — otherwise
+  the denial may just be a broken or option-erroring `nc` (the sentinel uses `nc -z`, connect-only,
+  for the same reason the egress probe does: a plain `nc -w N` can exit nonzero *after* a successful
+  connect on some variants, a false denial that would otherwise read as isolation). A degraded
+  passthrough runs in the parent namespace, reaches the listener (`NET_OK`) inside the "cut", and is
+  excluded **however firejail words its warning** — and "could not verify" (no connect tool, a control
+  that did not reach the listener, listener setup failure) is also unavailable, fail-closed. The
+  stderr warning match is kept as defense-in-depth. So AUTO never selects a degrading firejail and
+  falls through to the next tier or refuses. (2) **pre-execution** —
   immediately before running the untrusted command, `Sandbox::run` re-runs the same behavioral probe
   and **refuses (`SandboxError::SandboxDegraded`) without ever spawning the command** on positive
   evidence of a passthrough (an observed `NET_OK`, or the warning marker), closing the detect→run
@@ -324,11 +331,15 @@ These MUST exist and pass before the relevant phase is complete (built security-
 - **firejail silent-degradation detection: behavioral at layers 1–2, a stderr heuristic at layer 3.**
   firejail 0.9.x runs a command **unsandboxed and exits 0** when it detects an existing
   sandbox/container, announcing it only via a stderr warning. jitgen defends in three layers
-  (threat #1): the detect-time probe requires the trusted sentinel script inside `firejail
-  --net=none` to **positively observe** that a live parent-namespace loopback listener is unreachable
-  (`NET_DENIED`) — a passthrough reaches it (`NET_OK`) and is excluded **independent of the warning's
-  wording**, and an unverifiable probe (no connect tool in the sandbox, listener setup failure) is
-  also unavailable, fail-closed; a **pre-execution** behavioral re-probe in `Sandbox::run` refuses
+  (threat #1): the detect-time probe runs the trusted sentinel script both unconfined (a *control*)
+  and inside `firejail --net=none`, and requires the control to reach a live parent-namespace
+  loopback listener (`NET_OK`) while the sandboxed run cannot (`NET_DENIED`) — a passthrough reaches
+  it (`NET_OK`) and is excluded **independent of the warning's wording**, and an unverifiable probe
+  (no connect tool, a control that did not reach the listener, listener setup failure) is also
+  unavailable, fail-closed. The control is what attributes a `NET_DENIED` to the namespace rather
+  than to a broken connect tool (the sentinel uses `nc -z` connect-only to avoid a false denial from
+  variants that exit nonzero after a successful connect). A **pre-execution** behavioral re-probe in
+  `Sandbox::run` refuses
   **before the untrusted command is ever spawned** on an observed `NET_OK` or the warning marker; and
   a post-execution backstop refuses any run whose captured launcher stderr carries the warning
   anywhere (the capture is floored so a small `output_cap_bytes` cannot truncate the marker; the scan
@@ -355,7 +366,8 @@ These MUST exist and pass before the relevant phase is complete (built security-
   no untrusted output. Mitigations for (b): two independent substrings of the message are matched
   (case-insensitive), and the text has been stable across firejail 0.9.x. A side effect of demanding
   positive proof at layer 1: on a host whose firejail sandbox offers **no connect tool** (`nc` or
-  `bash`), firejail is reported unavailable — an availability downgrade, never a security loss. All
+  `bash`), or whose `nc` cannot demonstrate a connect-only success unconfined (the control fails),
+  firejail is reported unavailable — an availability downgrade, never a security loss. All
   residuals are narrow because the realistic deployment is the **container tier** (the jitgen image
   ships no firejail) and bwrap is preferred above firejail in AUTO order; firejail is the fallback
   OS-sandbox on bare-metal Linux hosts that lack bwrap, where it does **not** degrade. If you must

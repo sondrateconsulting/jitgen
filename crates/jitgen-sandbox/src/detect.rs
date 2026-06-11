@@ -85,9 +85,8 @@ fn available(backend: Backend) -> bool {
     // isolation cannot be verified → unavailable (fail-closed). Every other backend fails loudly,
     // so its exit status (plus the daemon check for containers) is sufficient.
     if backend.has_silent_degradation_mode() {
-        return probe_behavioral(backend).is_some_and(|(outcome, verdict)| {
-            behavioral_probe_confirms_isolation(backend, &outcome, verdict)
-        });
+        return probe_behavioral(backend)
+            .is_some_and(|p| behavioral_probe_confirms_isolation(backend, &p));
     }
     match probe_backend(backend) {
         Some(outcome) => probe_is_available(backend, &outcome),
@@ -128,7 +127,7 @@ fn probe_backend(backend: Backend) -> Option<ProbeOutcome> {
 pub(crate) fn backend_silently_degrades(backend: Backend) -> bool {
     backend.has_silent_degradation_mode()
         && probe_behavioral(backend)
-            .is_some_and(|(o, v)| behavioral_probe_shows_degradation(backend, &o, v))
+            .is_some_and(|p| behavioral_probe_shows_degradation(backend, &p))
 }
 
 /// Pure: does this probe outcome show the backend silently degraded — i.e. it **ran** (exit 0) yet its
@@ -186,13 +185,21 @@ enum NetVerdict {
 /// runs in the parent namespace and reaches it ([`SENTINEL_NET_OK`]). Single-sourced here so the
 /// live `firejail_denies_loopback` conformance gate runs the **identical** connect logic the
 /// production probe does (it supplies its own PATH via the run plan's env, so it uses this body
-/// without the preamble that [`net_probe_script`] adds). `nc -w 1` bounds the connect and the
-/// post-connect idle: on a passthrough the connect to the unaccepted listener completes via the
-/// backlog and nc exits (→ `NET_OK`); on a real cut the connect is refused at once (→ `NET_DENIED`).
+/// without the preamble that [`net_probe_script`] adds).
+///
+/// `nc -z` is **connect-only** (connect, report, close — no data phase), the same hardening the
+/// crate's egress conformance probe applies for the same reason: a plain `nc -w N` lingers for the
+/// idle timeout after a successful connect and, on some netcat variants, exits **nonzero** once
+/// stdin hits EOF — which would print `NET_DENIED` *after the connect actually succeeded*. For this
+/// degradation probe that false `NET_DENIED` is the dangerous direction (a passthrough firejail
+/// misread as having isolated), so `-z` makes a successful connect exit 0 immediately (→ `NET_OK`).
+/// `-z` is not universal, so a variant lacking it errors out → `NET_DENIED`; that residual is caught
+/// by the parent-namespace **control** in [`probe_behavioral`], which refuses to trust any sandboxed
+/// `NET_DENIED` unless the same tool first proved it can reach the listener unconfined.
 pub fn loopback_probe_body(port: u16) -> String {
     format!(
         "if command -v nc >/dev/null 2>&1; then \
-            nc -w 1 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo {SENTINEL_NET_OK} || echo {SENTINEL_NET_DENIED}; \
+            nc -z -w 1 127.0.0.1 {port} >/dev/null 2>&1 && echo {SENTINEL_NET_OK} || echo {SENTINEL_NET_DENIED}; \
          elif command -v bash >/dev/null 2>&1; then \
             bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' >/dev/null 2>&1 && echo {SENTINEL_NET_OK} || echo {SENTINEL_NET_DENIED}; \
          else echo {SENTINEL_NO_PROBE_TOOL}; fi"
@@ -224,15 +231,34 @@ fn net_probe_verdict(stdout: &str) -> NetVerdict {
     }
 }
 
-/// Run the behavioral isolation probe for a degradation-capable backend: bind a **live** TCP
-/// listener in the parent namespace, prove it reachable from here (so a `NET_DENIED` below
-/// demonstrates the namespace boundary, not a dead listener — the netns conformance gate's
-/// pattern; an unaccepted connection completes the TCP handshake via the backlog, no accept loop
-/// needed), then run the trusted sentinel script under the backend's network-cut sandboxing and
-/// judge its stdout. `None` when the backend has no behavioral probe, its launcher can't be
-/// trusted-resolved, or the listener could not be set up — callers fail closed at detect time and
-/// treat it as "no positive evidence" at run time.
-fn probe_behavioral(backend: Backend) -> Option<(ProbeOutcome, NetVerdict)> {
+/// The result of a behavioral isolation probe: the sandboxed run plus the two net verdicts whose
+/// relationship decides availability. The **control** runs the identical script UNCONFINED, the
+/// **isolated** run runs it inside the backend's network cut.
+#[derive(Debug)]
+struct BehavioralProbe {
+    /// Exit/stderr of the SANDBOXED run — feeds the defense-in-depth marker check and `success`.
+    outcome: ProbeOutcome,
+    /// Verdict of the same script run UNCONFINED in the parent namespace. Only [`NetVerdict::Open`]
+    /// proves the connect tool can actually demonstrate reachability on this host; anything else
+    /// (a broken/option-erroring `nc`, no tool, an idle-timeout-nonzero variant) means a sandboxed
+    /// `NET_DENIED` is **not attributable to the namespace** and must not be read as isolation.
+    control_verdict: NetVerdict,
+    /// Verdict observed INSIDE the backend's `--net=none` sandbox.
+    isolated_verdict: NetVerdict,
+}
+
+/// Run the behavioral isolation probe for a degradation-capable backend. Binds a **live** TCP
+/// listener in the parent namespace and proves it reachable from here (so a later `NET_DENIED`
+/// reflects the namespace boundary, not a dead listener — an unaccepted connection still completes
+/// the TCP handshake via the backlog, no accept loop needed), then runs the trusted sentinel script
+/// twice: once **unconfined** (the *control*) and once under the backend's network cut (the
+/// *isolated* run). The control is the crux of the fail-closed guarantee: a sandboxed `NET_DENIED`
+/// only proves isolation if the *same tool* could reach the listener unconfined — otherwise the
+/// `NET_DENIED` may just be a broken/option-erroring `nc` (the exact false-denial the egress probe's
+/// `-z` guards against), which must NOT be read as a network cut. `None` when the backend has no
+/// behavioral probe, its launcher can't be trusted-resolved, or the listener could not be set up —
+/// callers fail closed at detect time and treat it as "no positive evidence" at run time.
+fn probe_behavioral(backend: Backend) -> Option<BehavioralProbe> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).ok()?;
     let addr = listener.local_addr().ok()?;
     std::net::TcpStream::connect_timeout(&addr, SANITY_CONNECT_TIMEOUT).ok()?;
@@ -240,43 +266,51 @@ fn probe_behavioral(backend: Backend) -> Option<(ProbeOutcome, NetVerdict)> {
     let (program, args) = backend.behavioral_net_probe(&script)?;
     let abs = crate::which::resolve_trusted(program)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    // The listener stays bound across the spawn (a dropped listener would fake NET_DENIED in the
-    // degraded case); env-cleared like every non-container probe.
+    // Control: the SAME script run unconfined. If the connect tool can't reach the live listener
+    // from the parent namespace (NET_OK), it can't prove a cut from inside the sandbox either, so a
+    // sandboxed NET_DENIED below is untrustworthy. The listener stays bound across BOTH spawns (a
+    // dropped listener would fake NET_DENIED in the degraded case); env-cleared like every
+    // non-container probe.
+    let control = probe("/bin/sh", &["-c", &script], false, PROBE_TIMEOUT);
+    let control_verdict = net_probe_verdict(&control.stdout);
     let outcome = probe(&abs.to_string_lossy(), &arg_refs, false, PROBE_TIMEOUT);
-    let verdict = net_probe_verdict(&outcome.stdout);
+    let isolated_verdict = net_probe_verdict(&outcome.stdout);
     drop(listener);
-    Some((outcome, verdict))
+    Some(BehavioralProbe {
+        outcome,
+        control_verdict,
+        isolated_verdict,
+    })
 }
 
 /// Decide availability for a degradation-capable backend from its behavioral probe. **Pure** —
 /// unit-tested with injected outcomes, no live containerized firejail needed.
 ///
-/// Available iff the probe ran clean (exit 0, no degradation marker on stderr — defense-in-depth)
-/// AND the sentinel script **positively observed** the network cut (`NET_DENIED`). An inconclusive
-/// verdict is unavailable — fail-closed: "could not verify isolation" must never read as
-/// "isolates" for a backend that is known to fail open while exiting 0. Requiring the positive
-/// observation is what makes detection wording-independent: a firejail that degrades with a future
-/// rewording of its warning is excluded by the `NET_OK` it produces, marker or no marker.
-fn behavioral_probe_confirms_isolation(
-    backend: Backend,
-    outcome: &ProbeOutcome,
-    verdict: NetVerdict,
-) -> bool {
-    probe_is_available(backend, outcome) && verdict == NetVerdict::Denied
+/// Available iff: the **control** proved the connect tool can reach the listener unconfined
+/// (`control == Open`) — so a sandboxed `NET_DENIED` is attributable to the namespace, not a broken
+/// tool — AND the sandboxed run was clean (exit 0, no degradation marker on stderr — defense-in-depth)
+/// AND the sentinel script **positively observed** the network cut from inside (`isolated == Denied`).
+/// An inconclusive isolated verdict, or a control that did not reach the listener, is unavailable —
+/// fail-closed: "could not verify isolation" must never read as "isolates" for a backend known to
+/// fail open while exiting 0. Requiring the positive observation is what makes detection
+/// wording-independent: a firejail that degrades under a reworded warning is excluded by the `NET_OK`
+/// it produces inside the cut, marker or no marker.
+fn behavioral_probe_confirms_isolation(backend: Backend, p: &BehavioralProbe) -> bool {
+    p.control_verdict == NetVerdict::Open
+        && probe_is_available(backend, &p.outcome)
+        && p.isolated_verdict == NetVerdict::Denied
 }
 
 /// Decide the PRE-execution refusal from a behavioral probe (**pure** — unit-tested with injected
 /// outcomes): positive evidence of a degraded passthrough is the legacy stderr marker OR the
-/// sentinel script reaching the parent listener (`NET_OK`), regardless of wording — and `NET_OK`
-/// counts even on a nonzero exit (the connect was observed; the exit status adds nothing).
+/// sentinel script reaching the parent listener from inside the cut (`isolated == Open`), regardless
+/// of wording — and `NET_OK` counts even on a nonzero exit (the connect was observed; the exit status
+/// adds nothing). The control does not gate this: a positive `isolated == Open` (or marker) stands on
+/// its own — if the tool reached the listener from *inside* the cut, the network plainly was not cut.
 /// `Inconclusive` alone never refuses: there is no evidence, detection already required positive
 /// proof of isolation, and the post-execution stderr backstop still stands behind this guard.
-fn behavioral_probe_shows_degradation(
-    backend: Backend,
-    outcome: &ProbeOutcome,
-    verdict: NetVerdict,
-) -> bool {
-    outcome_shows_silent_degradation(backend, outcome) || verdict == NetVerdict::Open
+fn behavioral_probe_shows_degradation(backend: Backend, p: &BehavioralProbe) -> bool {
+    outcome_shows_silent_degradation(backend, &p.outcome) || p.isolated_verdict == NetVerdict::Open
 }
 
 /// Spawn `program args` with stdout and stderr captured (each bounded) and a wall-clock bound;
@@ -468,6 +502,21 @@ mod tests {
         }
     }
 
+    /// Build a [`BehavioralProbe`] from injected parts: the sandboxed run's (success, stderr), the
+    /// unconfined **control** verdict, and the **isolated** verdict observed inside the cut.
+    fn behavioral(
+        success: bool,
+        stderr: &str,
+        control: NetVerdict,
+        isolated: NetVerdict,
+    ) -> BehavioralProbe {
+        BehavioralProbe {
+            outcome: outcome(success, stderr),
+            control_verdict: control,
+            isolated_verdict: isolated,
+        }
+    }
+
     #[test]
     fn outcome_shows_silent_degradation_decides_the_pre_execution_refusal() {
         // The PRE-execution guard (`Sandbox::run` → `backend_silently_degrades`) refuses iff the probe
@@ -595,48 +644,64 @@ mod tests {
     fn behavioral_availability_requires_a_positive_net_denied() {
         // THE wording-independence fix: detection must demand positive, observed proof of the
         // network cut — never infer isolation from exit status + absence of a known warning string.
+        // Every case here has a passing control (`NetVerdict::Open`: the tool reached the listener
+        // unconfined) UNLESS noted, so the cases isolate the isolated-verdict requirement; the
+        // control gate itself is pinned by the two control-failure cases at the end.
         let clean = "Parent pid 2, child pid 3";
 
-        // Exit 0, clean stderr, observed NET_DENIED → available.
+        // Control reached the listener, exit 0, clean stderr, observed NET_DENIED inside → available.
         assert!(behavioral_probe_confirms_isolation(
             Backend::Firejail,
-            &outcome(true, clean),
-            NetVerdict::Denied
+            &behavioral(true, clean, NetVerdict::Open, NetVerdict::Denied)
         ));
         // A firejail that REWORDED its warning while degrading: exit 0, NO known marker on stderr —
-        // the old string-only detection judged this available. The sentinel script observed NET_OK,
-        // so it is excluded regardless of wording. (Remove the behavioral requirement and this
-        // regresses to the silent fail-open.)
+        // the old string-only detection judged this available. The sentinel script observed NET_OK
+        // inside, so it is excluded regardless of wording. (Remove the behavioral requirement and
+        // this regresses to the silent fail-open.)
         assert!(!behavioral_probe_confirms_isolation(
             Backend::Firejail,
-            &outcome(
+            &behavioral(
                 true,
-                "note: sandbox nesting detected, continuing without confinement"
-            ),
-            NetVerdict::Open
+                "note: sandbox nesting detected, continuing without confinement",
+                NetVerdict::Open,
+                NetVerdict::Open
+            )
         ));
-        // Inconclusive (no probe tool inside the sandbox / empty output) → cannot verify →
-        // unavailable, fail-closed.
+        // Inconclusive isolated verdict (no probe tool inside the sandbox / empty output) → cannot
+        // verify → unavailable, fail-closed.
         assert!(!behavioral_probe_confirms_isolation(
             Backend::Firejail,
-            &outcome(true, clean),
-            NetVerdict::Inconclusive
+            &behavioral(true, clean, NetVerdict::Open, NetVerdict::Inconclusive)
         ));
         // The stock warning is still recognized as defense-in-depth even if the connect was somehow
         // denied (distrust a launcher that SAYS it degraded).
         assert!(!behavioral_probe_confirms_isolation(
             Backend::Firejail,
-            &outcome(
+            &behavioral(
                 true,
-                "an existing sandbox was detected ... without any additional sandboxing"
-            ),
-            NetVerdict::Denied
+                "an existing sandbox was detected ... without any additional sandboxing",
+                NetVerdict::Open,
+                NetVerdict::Denied
+            )
         ));
         // A loud failure stays unavailable whatever the sentinel says.
         assert!(!behavioral_probe_confirms_isolation(
             Backend::Firejail,
-            &outcome(false, ""),
-            NetVerdict::Denied
+            &behavioral(false, "", NetVerdict::Open, NetVerdict::Denied)
+        ));
+        // THE CONTROL GATE: a sandboxed NET_DENIED is trusted ONLY if the same tool first reached the
+        // listener unconfined. A broken/option-erroring `nc` (the `-z`-absent idle-timeout-nonzero
+        // variant the egress probe guards against) prints NET_DENIED even unconfined — control is
+        // Denied, not Open — so its sandboxed NET_DENIED proves nothing and firejail stays
+        // unavailable. Drop the `control == Open` requirement and this flips to available (fail-open).
+        assert!(!behavioral_probe_confirms_isolation(
+            Backend::Firejail,
+            &behavioral(true, clean, NetVerdict::Denied, NetVerdict::Denied)
+        ));
+        // Control inconclusive (no tool unconfined) is likewise not positive proof → unavailable.
+        assert!(!behavioral_probe_confirms_isolation(
+            Backend::Firejail,
+            &behavioral(true, clean, NetVerdict::Inconclusive, NetVerdict::Denied)
         ));
     }
 
@@ -644,53 +709,68 @@ mod tests {
     fn behavioral_degradation_refusal_fires_on_net_ok_regardless_of_wording() {
         let reworded = "note: sandbox nesting detected, continuing without confinement";
 
-        // The pre-execution guard refuses on observed NET_OK even when the warning was reworded
-        // past both marker substrings — the case the string-only guard missed.
+        // The pre-execution guard refuses on a NET_OK observed INSIDE the cut even when the warning
+        // was reworded past both marker substrings — the case the string-only guard missed.
         assert!(behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(true, reworded),
-            NetVerdict::Open
+            &behavioral(true, reworded, NetVerdict::Open, NetVerdict::Open)
         ));
         // NET_OK counts even on a nonzero exit: the connect was observed, the exit status adds
         // nothing.
         assert!(behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(false, reworded),
-            NetVerdict::Open
+            &behavioral(false, reworded, NetVerdict::Open, NetVerdict::Open)
+        ));
+        // The control does NOT gate degradation: a positive isolated NET_OK stands on its own — if
+        // the tool reached the listener from INSIDE the cut, the network plainly was not cut, however
+        // the control behaved.
+        assert!(behavioral_probe_shows_degradation(
+            Backend::Firejail,
+            &behavioral(true, reworded, NetVerdict::Denied, NetVerdict::Open)
         ));
         // The legacy marker alone still refuses (defense-in-depth keeps working when the sentinel
         // is unavailable, e.g. a toolless sandbox).
         assert!(behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(
+            &behavioral(
                 true,
-                "an existing sandbox was detected ... without any additional sandboxing"
-            ),
-            NetVerdict::Inconclusive
+                "an existing sandbox was detected ... without any additional sandboxing",
+                NetVerdict::Inconclusive,
+                NetVerdict::Inconclusive
+            )
         ));
         // The marker arm refuses even when the sentinel observed NET_DENIED: distrust a launcher
         // that SAYS it degraded over a conflicting probe. Pins the marker arm independently — drop it
-        // and only `verdict == Open` would remain, leaving this case to the post-exec backstop alone.
+        // and only `isolated == Open` would remain, leaving this case to the post-exec backstop alone.
         assert!(behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(
+            &behavioral(
                 true,
-                "an existing sandbox was detected ... without any additional sandboxing"
-            ),
-            NetVerdict::Denied
+                "an existing sandbox was detected ... without any additional sandboxing",
+                NetVerdict::Open,
+                NetVerdict::Denied
+            )
         ));
         // A genuinely isolating firejail (clean stderr, observed NET_DENIED) is not refused.
         assert!(!behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(true, "Child process initialized in 7.21 ms"),
-            NetVerdict::Denied
+            &behavioral(
+                true,
+                "Child process initialized in 7.21 ms",
+                NetVerdict::Open,
+                NetVerdict::Denied
+            )
         ));
-        // Inconclusive alone never refuses: no positive evidence (detection already demanded
-        // positive proof; the post-execution backstop still stands).
+        // Inconclusive isolated verdict alone never refuses: no positive evidence (detection already
+        // demanded positive proof; the post-execution backstop still stands).
         assert!(!behavioral_probe_shows_degradation(
             Backend::Firejail,
-            &outcome(true, "Child process initialized in 7.21 ms"),
-            NetVerdict::Inconclusive
+            &behavioral(
+                true,
+                "Child process initialized in 7.21 ms",
+                NetVerdict::Open,
+                NetVerdict::Inconclusive
+            )
         ));
     }
 
