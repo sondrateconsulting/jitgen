@@ -1119,7 +1119,18 @@ fn netns_runtime_unshare_failure_is_not_a_test_failure() {
     struct Restore<'a>(&'a str, String);
     impl Drop for Restore<'_> {
         fn drop(&mut self) {
-            let _ = std::fs::write(self.0, &self.1);
+            // A failed restore leaves user namespaces disabled HOST-WIDE, silently breaking
+            // every later netns test in the run — warn loudly. (No panic: a panic-in-drop
+            // aborts the process if we are already unwinding.)
+            if let Err(err) = std::fs::write(self.0, &self.1) {
+                eprintln!(
+                    "WARNING: failed to restore sysctl {} to {:?}: {err}; user namespaces \
+                     remain disabled host-wide — restore it manually before trusting any \
+                     later netns test in this run",
+                    self.0,
+                    self.1.trim()
+                );
+            }
         }
     }
 
@@ -1164,7 +1175,11 @@ fn netns_runtime_unshare_failure_is_not_a_test_failure() {
     // a dead sandbox). Drop the guard explicitly so the sysctl is back before we re-run.
     drop(_restore);
     if !jitgen_sandbox::netns_helper_available() {
-        eprintln!("SKIP netns recovery check: namespaces still unavailable after restore");
+        eprintln!(
+            "SKIP netns recovery check: namespaces still unavailable after restore — the \
+             sysctl restore itself may have FAILED (a WARNING above would say so); verify \
+             {SYSCTL} manually before trusting any later netns test in this run"
+        );
         return;
     }
     let fx2 = Fixture::new("netns-runtime-recovered");
