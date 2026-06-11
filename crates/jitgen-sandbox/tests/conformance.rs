@@ -1160,34 +1160,61 @@ fn netns_helper_denies_loopback() {
 fn netns_runtime_unshare_failure_is_not_a_test_failure() {
     const SYSCTL: &str = "/proc/sys/user/max_user_namespaces";
 
+    // Every diagnostic in this gate signals a possibly broken host (failed restore, skipped
+    // invariant) and must reach the operator even when the test PASSES — but libtest captures
+    // `eprintln!` and discards a passing test's output unless `--nocapture` is given. The capture
+    // hooks only the print macros, so a direct write to the process stderr is always visible.
+    fn eprintln_raw(msg: &str) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{msg}");
+    }
+
     // Build the sandbox FIRST (selection-time probe must pass), so the failure we induce is strictly
     // a post-selection, run-time one — the exact race the fix targets.
     let Some(sb) = netns_sandbox() else {
         // The helper already printed its generic skip; name THIS gate too, so a conformance log
         // shows the signal-integrity invariant specifically was not exercised (never a silent pass).
-        eprintln!("SKIP netns runtime-failure gate: netns helper unavailable at selection time");
+        eprintln_raw("SKIP netns runtime-failure gate: netns helper unavailable at selection time");
         return;
     };
 
     // Snapshot + restore guard so we never leave the host with namespaces disabled, even on panic.
-    let Ok(original) = std::fs::read_to_string(SYSCTL) else {
-        eprintln!("SKIP {SYSCTL} unreadable");
-        return;
+    let original = match std::fs::read_to_string(SYSCTL) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln_raw(&format!(
+                "SKIP netns runtime-failure gate: {SYSCTL} unreadable ({err})"
+            ));
+            return;
+        }
     };
     struct Restore<'a>(&'a str, String);
     impl Drop for Restore<'_> {
         fn drop(&mut self) {
-            let _ = std::fs::write(self.0, &self.1);
+            // A failed restore leaves user namespaces disabled HOST-WIDE, silently breaking
+            // every later netns test in the run — warn loudly. Raw stderr, not `eprintln!`:
+            // a failed restore at the explicit drop below still ends in a PASSING test
+            // (recovery check skips), and libtest discards a passing test's captured output.
+            // (No panic: a panic-in-drop aborts the process if we are already unwinding.)
+            if let Err(err) = std::fs::write(self.0, &self.1) {
+                eprintln_raw(&format!(
+                    "WARNING: failed to restore sysctl {} to {}: {err}; user namespaces \
+                     remain disabled host-wide — restore it manually before trusting any \
+                     later netns test in this run",
+                    self.0,
+                    self.1.trim()
+                ));
+            }
         }
     }
 
     // Disable unprivileged user namespaces host-wide. Requires privilege; SKIP loudly if we can't
     // write it (unprivileged container) — never silently pass without inducing the failure.
-    if std::fs::write(SYSCTL, "0").is_err() {
-        eprintln!(
-            "SKIP netns runtime-failure gate: cannot write {SYSCTL} \
-             (run the container --privileged)"
-        );
+    if let Err(err) = std::fs::write(SYSCTL, "0") {
+        eprintln_raw(&format!(
+            "SKIP netns runtime-failure gate: cannot write {SYSCTL} ({err}) — run the \
+             container --privileged"
+        ));
         return;
     }
     let _restore = Restore(SYSCTL, original);
@@ -1222,7 +1249,11 @@ fn netns_runtime_unshare_failure_is_not_a_test_failure() {
     // a dead sandbox). Drop the guard explicitly so the sysctl is back before we re-run.
     drop(_restore);
     if !jitgen_sandbox::netns_helper_available() {
-        eprintln!("SKIP netns recovery check: namespaces still unavailable after restore");
+        eprintln_raw(&format!(
+            "SKIP netns recovery check: namespaces still unavailable after restore — the \
+             sysctl restore itself may have FAILED (a WARNING above would say so); verify \
+             {SYSCTL} manually before trusting any later netns test in this run"
+        ));
         return;
     }
     let fx2 = Fixture::new("netns-runtime-recovered");
