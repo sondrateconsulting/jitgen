@@ -1,7 +1,8 @@
 # Architecture Decision Records
 
-Lightweight MADR-style ADRs. Each records a decision, its context, and consequences. ADRs are
-immutable once `Accepted`; supersede rather than edit.
+Lightweight MADR-style ADRs. Each records a decision, its context, and consequences. Reversing or
+replacing an `Accepted` decision requires a superseding ADR; an ADR may be edited in place for
+factual errata or to keep it in sync with merged code changes.
 
 | ADR | Title | Status |
 |-----|-------|--------|
