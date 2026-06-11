@@ -34,6 +34,33 @@ treats that as a fail-open and refuses it:
   unsandboxed run as a clean pass. `bubblewrap` does not have this failure mode (it errors loudly
   instead of degrading). See [security.md → Residual risks](security.md#residual-risks).
 
+## netns-helper: "became unavailable mid-run" (`SandboxError::BackendUnavailableMidRun`)
+
+The netns-helper tier (the `unshare` user+net-namespace wrapper, auto-selected under
+`--unsafe-local-execution` on capable Linux hosts when no stronger isolating backend wins) failed to
+create its namespaces **part-way through a run**, *after* it had passed the selection-time probe —
+and a fresh probe confirms it can no longer isolate. jitgen aborts the run rather than continue.
+
+- **Cause:** unprivileged user-namespace creation became unavailable mid-run. Common triggers:
+  `user.max_user_namespaces` exhausted (too many concurrent namespaces — often a leaked/backgrounded
+  process from a prior test), AppArmor `apparmor_restrict_unprivileged_userns` toggled, or a seccomp
+  policy applied to the job after it started.
+- **Why abort instead of report:** when `unshare` fails it exits *before* the test command runs, so the
+  test never executed. jitgen refuses to report that wrapper failure as a test result (which, in catch
+  mode, could otherwise look like a regression and mint a false catch). A one-off blip is recorded as a
+  per-candidate `Broken`; only *persistent* breakage (the re-probe also fails) aborts the whole run.
+- **Fix (preferred):** run inside the published digest-pinned image (the container is the boundary;
+  `unshare` is not needed there), or on a host/container that reliably permits unprivileged user
+  namespaces — check `sysctl user.max_user_namespaces` (must be > 0) and that
+  `kernel.apparmor_restrict_unprivileged_userns` is not restricting you. `jitgen doctor` reports
+  whether the helper is usable.
+- **Fix (alternative):** pass `--sandbox local` to use the constrained-local tier explicitly (never
+  upgraded to netns), if you accept that it does not cut the network itself and rely on a surrounding
+  ephemeral container for isolation. See [ci.md](ci.md) and
+  [ADR-0013](decisions/0013-netns-helper-backend.md).
+- **Not a bug:** this is signal integrity working as designed — jitgen will **not** misreport a sandbox
+  wrapper failure as a test outcome. See [security.md → Residual risks](security.md#residual-risks).
+
 ## Windows / other platforms: "no OS sandbox" (container-only)
 
 Only **Linux** (`bubblewrap`/`firejail`) and **macOS** (`sandbox-exec`) have a native OS sandbox tier.

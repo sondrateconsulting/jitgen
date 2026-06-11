@@ -1022,3 +1022,98 @@ fn netns_helper_denies_loopback() {
         "netns helper must deny loopback (lo is DOWN in the fresh namespace); got {res:?}"
     );
 }
+
+/// Gate 1c (netns-helper) — **signal integrity**: a `unshare` failure that appears *after* selection
+/// must NOT be misread as a test failure (which would mint a false catch), and persistent breakage
+/// must abort loudly. We break unprivileged user-namespace creation host-wide by setting
+/// `user.max_user_namespaces=0` *after* the sandbox is built (so selection already succeeded), then:
+///   1. the run must NOT classify `Failed` — the wrapper failed before the test started, so the only
+///      acceptable outcomes are a hard `BackendUnavailableMidRun` (persistent breakage, the expected
+///      result here) or, in the unlikely transient case, `Errored`/`Broken`;
+///   2. restoring the sysctl makes an ordinary command pass again.
+/// Needs a **privileged** container to write the sysctl; SKIPs loudly otherwise (e.g. the default
+/// `docker run` recipe is unprivileged). Recipe:
+/// ```text
+/// docker run --rm --privileged -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/tmp/target rust:1.95.0 \
+///   bash -c "cargo test -q -p jitgen-sandbox --test conformance -- --ignored netns"
+/// ```
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "live netns; needs --privileged to toggle user.max_user_namespaces"]
+fn netns_runtime_unshare_failure_is_not_a_test_failure() {
+    const SYSCTL: &str = "/proc/sys/user/max_user_namespaces";
+
+    // Build the sandbox FIRST (selection-time probe must pass), so the failure we induce is strictly
+    // a post-selection, run-time one — the exact race the fix targets.
+    let Some(sb) = netns_sandbox() else {
+        // The helper already printed its generic skip; name THIS gate too, so a conformance log
+        // shows the signal-integrity invariant specifically was not exercised (never a silent pass).
+        eprintln!("SKIP netns runtime-failure gate: netns helper unavailable at selection time");
+        return;
+    };
+
+    // Snapshot + restore guard so we never leave the host with namespaces disabled, even on panic.
+    let Ok(original) = std::fs::read_to_string(SYSCTL) else {
+        eprintln!("SKIP {SYSCTL} unreadable");
+        return;
+    };
+    struct Restore<'a>(&'a str, String);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0, &self.1);
+        }
+    }
+
+    // Disable unprivileged user namespaces host-wide. Requires privilege; SKIP loudly if we can't
+    // write it (unprivileged container) — never silently pass without inducing the failure.
+    if std::fs::write(SYSCTL, "0").is_err() {
+        eprintln!(
+            "SKIP netns runtime-failure gate: cannot write {SYSCTL} \
+             (run the container --privileged)"
+        );
+        return;
+    }
+    let _restore = Restore(SYSCTL, original);
+
+    // The wrapper (`unshare`) now fails before the inner command starts. The run must NOT be a test
+    // Failed. With breakage this persistent, the capstone's re-probe also fails → hard abort.
+    let fx = Fixture::new("netns-runtime-fail");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "printf hi".into()]);
+    let result = sb.run(&RunRequest {
+        command: &cmd,
+        overlay_root: &fx.overlay,
+        state_root: &fx.state,
+        instance: &fx.instance,
+        run_as: None,
+    });
+    match result {
+        Err(jitgen_sandbox::SandboxError::BackendUnavailableMidRun(id)) => {
+            assert_eq!(id, "netns-helper");
+        }
+        // A transient flip would leave an Errored result (or Timeout for a hung wrapper) — also
+        // acceptable (never a catch). Pin the exact unusable set rather than merely != Failed, so a
+        // future outcome variant can't slip through this gate as a vacuous pass.
+        Ok(res) => assert!(
+            matches!(res.outcome, ExecOutcome::Errored | ExecOutcome::Timeout),
+            "a run-time unshare failure must classify unusable (Errored/Timeout), never a test \
+             result: {res:?}"
+        ),
+        Err(other) => panic!("unexpected error for a run-time wrapper failure: {other:?}"),
+    }
+
+    // Restore and confirm a healthy run passes again (proves the abort was the induced breakage, not
+    // a dead sandbox). Drop the guard explicitly so the sysctl is back before we re-run.
+    drop(_restore);
+    if !jitgen_sandbox::netns_helper_available() {
+        eprintln!("SKIP netns recovery check: namespaces still unavailable after restore");
+        return;
+    }
+    let fx2 = Fixture::new("netns-runtime-recovered");
+    let res = exec(&sb, &cmd, &fx2);
+    assert_eq!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "an ordinary command must pass again once namespaces are restored: {res:?}"
+    );
+    assert_eq!(res.stdout, "hi");
+}

@@ -137,6 +137,51 @@ mod tests {
     }
 
     #[test]
+    fn head_wrapper_failure_is_broken_or_flaky_never_a_weak_catch() {
+        // A run-time sandbox WRAPPER failure (e.g. netns `unshare` failing after selection) surfaces as
+        // ExecOutcome::Errored on the head side, which CatchClass::from_catch maps to Broken ("could
+        // not run"). Across the flake filter that yields a stable Broken (every trial errored) or Flaky
+        // (mixed with a genuine WeakCatch) — NEVER WeakCatch, so a wrapper failure can never be
+        // confirmed as a catch. This is the downstream half of the sandbox-layer signal-integrity fix:
+        // even if a wrapper failure slipped through as a one-off, the flake filter cannot promote it.
+
+        // (a) Head errors on every trial → stable Broken (not a catch).
+        let exec = ScriptedExecutor::candidates(Box::new(|_c, v| {
+            Ok(result(match v {
+                Variant::Base => ExecOutcome::Passed,
+                _ => ExecOutcome::Errored,
+            }))
+        }));
+        let rep = flake_filter_catch(&exec, &candidate(), &FlakeConfig::default()).unwrap();
+        assert!(rep.stable, "all-errored head is stable: {rep:?}");
+        assert_eq!(rep.class(), CatchClass::Broken);
+
+        // (b) Head alternates a wrapper blip (Errored) with a real weak catch (Failed) → unstable →
+        // Flaky, never elevated to a strong catch.
+        let toggle = Cell::new(false);
+        let exec = ScriptedExecutor::candidates(Box::new(move |_c, v| {
+            Ok(result(match v {
+                Variant::Base => ExecOutcome::Passed,
+                _ => {
+                    let now = toggle.get();
+                    toggle.set(!now);
+                    if now {
+                        ExecOutcome::Failed
+                    } else {
+                        ExecOutcome::Errored
+                    }
+                }
+            }))
+        }));
+        let rep = flake_filter_catch(&exec, &candidate(), &FlakeConfig::default()).unwrap();
+        assert!(
+            !rep.stable,
+            "mixed errored/failed head is unstable: {rep:?}"
+        );
+        assert_eq!(rep.class(), CatchClass::Flaky);
+    }
+
+    #[test]
     fn single_mode_stability() {
         let exec = ScriptedExecutor::candidates(Box::new(|_c, _v| Ok(result(ExecOutcome::Passed))));
         let rep = flake_filter_single(
