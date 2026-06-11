@@ -123,7 +123,7 @@ fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
 const PROBE_CONNECT_TIMEOUT_SECS: u32 = 3;
 
 /// Egress probe target shared by every egress-denial gate (a public resolver's TCP/53 — the probe
-/// only needs the connect to complete, no DNS payload). The loopback gates substitute their own
+/// only needs the connect to complete, no DNS payload). The loopback gate substitutes its own
 /// runtime listener target. [`assert_network_denied`] builds ONE script per call and hands it to
 /// both the control and the sandboxed run, so the two can never drift to different targets.
 const PROBE_EGRESS_HOST: &str = "1.1.1.1";
@@ -137,8 +137,9 @@ const PROBE_EGRESS_PORT: u16 = 53;
 ///
 /// `host`/`port` are interpolated verbatim into both connect branches (the `nc` argv and the
 /// `/dev/tcp/{host}/{port}` path) — the parameterization exists because the netns loopback gate
-/// probes a runtime listener port. Callers pass a literal IP and a numeric port, which need no
-/// shell quoting; the egress gates pass [`PROBE_EGRESS_HOST`]:[`PROBE_EGRESS_PORT`].
+/// probes a runtime listener port. `port` is a `u16` (digits only) and `host` is asserted down to
+/// bare IP/hostname characters, so neither can carry shell syntax into the unquoted interpolation
+/// sites; the egress gates pass [`PROBE_EGRESS_HOST`]:[`PROBE_EGRESS_PORT`].
 ///
 /// `nc -z` (connect, report, close — no data phase) is the exact semantic wanted: without it, some
 /// netcat variants exit nonzero AFTER a successful connect (e.g. `-w` idle-timeout once stdin hits
@@ -159,6 +160,17 @@ const PROBE_EGRESS_PORT: u16 = 53;
 /// packet-DROPPING (not rejecting) host a control run would otherwise block the test process
 /// indefinitely. bash-without-timeout reads as `NO_PROBE_TOOL` (fail loud, not hang).
 fn net_probe_script(host: &str, port: u16) -> String {
+    // `{host}` lands unquoted in shell source (twice), so a bare IP/hostname is the entire safe
+    // alphabet. Anything else aborts generation here, loudly — a metacharacter that survived
+    // into the script could read as a false sentinel downstream (e.g. a word-split nc argv
+    // exiting nonzero prints NET_DENIED with no connect ever attempted).
+    assert!(
+        !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-')),
+        "net_probe_script: host must be a bare IP/hostname literal (got {host:?})"
+    );
     let dirs = TRUSTED_BIN_DIRS.join(" ");
     let t = PROBE_CONNECT_TIMEOUT_SECS;
     format!(
@@ -210,6 +222,17 @@ fn net_probe_script_is_structurally_sound() {
         lo.contains("127.0.0.1 40123") && lo.contains("/dev/tcp/127.0.0.1/40123"),
         "the connect target must land verbatim in both the nc and /dev/tcp branches: {lo}"
     );
+}
+
+/// The host whitelist is load-bearing (see the generation-time assert in [`net_probe_script`]):
+/// every current caller passes a literal IP, but the signature accepts any `&str`, and an
+/// unquoted metacharacter would corrupt the script rather than fail it. This also catches a
+/// positional `what`/`host` swap at a future call site — gate names carry `_`, which the
+/// whitelist rejects.
+#[test]
+#[should_panic(expected = "bare IP/hostname")]
+fn net_probe_script_rejects_non_literal_host() {
+    let _ = net_probe_script("1.1.1.1;x", 53);
 }
 
 /// `sh -n` parses without executing: a quoting/syntax regression in the `format!`-built script
