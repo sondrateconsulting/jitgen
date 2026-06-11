@@ -870,9 +870,10 @@ fn bwrap_denies_network() {
 /// (e.g. macOS).
 ///
 /// Run this on a real Linux host, not inside a container: when firejail detects an existing
-/// sandbox it warns and runs the command **without any sandboxing** (observed with 0.9.74) — in
-/// that environment this gate fails with `NET_OK`, which is the truthful answer ("firejail is not
-/// an isolating backend here"), not a test bug.
+/// sandbox it warns and runs the command **without any sandboxing** (observed with 0.9.74). In
+/// that environment the behavioral detect probe observes the passthrough (`NET_OK` against a live
+/// parent listener) and excludes firejail, so this gate **skips as "not available"** — the
+/// truthful answer ("firejail is not an isolating backend here"), not a test bug.
 #[test]
 #[ignore = "live firejail; needs a Linux host with firejail installed"]
 fn firejail_denies_network() {
@@ -887,6 +888,63 @@ fn firejail_denies_network() {
         &ControlProbe::Host,
         PROBE_EGRESS_HOST,
         PROBE_EGRESS_PORT,
+    );
+}
+
+/// Gate 1b (firejail) — loopback denial against a **live parent-namespace listener**: the exact
+/// property the detect-time behavioral probe now requires, end to end through the production run
+/// plan. The parent binds a real listener on 127.0.0.1 and proves it reachable; the same connect
+/// from inside `firejail --net=none` must fail (`NET_DENIED`) — while a degraded passthrough
+/// firejail would connect (`NET_OK`) and fail the gate. (A bare closed-port probe proves nothing:
+/// it prints `NET_DENIED` via ECONNREFUSED even with no sandbox at all.) This is the live
+/// counterpart of `detect()`'s loopback-listener sentinel probe, run through the SAME hardened
+/// [`net_probe_script`] + control as every other network-denial gate: the Host control runs the
+/// probe SCRIPT against the live listener from the parent namespace, validating the resolved tool's
+/// connect/exit semantics (an nc without `-z` exits nonzero even on a successful connect — a false
+/// NET_DENIED the Rust sanity connect below cannot catch), so a sandboxed NET_DENIED can only mean
+/// the namespace boundary.
+#[test]
+#[ignore = "live firejail; needs a Linux host with firejail installed"]
+fn firejail_denies_loopback() {
+    let Some(sb) = linux_os_sandbox(Backend::Firejail) else {
+        return;
+    };
+
+    // Execution half first (same sandbox), so a wrapper that executes nothing fails here with a
+    // clear diagnosis instead of a confusing "must deny loopback" message on empty output.
+    let fx = Fixture::new("firejail-lo-exec");
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), "printf hi".into()]);
+    let res = exec(&sb, &cmd, &fx);
+    assert_eq!(
+        res.outcome,
+        ExecOutcome::Passed,
+        "a plain command must still execute under firejail: {res:?}"
+    );
+    assert_eq!(res.stdout, "hi");
+
+    // A live parent-namespace listener; an unaccepted connection still completes the TCP
+    // handshake via the backlog, so no accept loop is needed — just keep the listener alive
+    // across the probe.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+    let port = listener.local_addr().expect("listener addr").port();
+    // Sanity half: the parent namespace CAN reach it, so a NET_DENIED below proves the namespace
+    // boundary, not a dead listener. Bounded so a pathological host fails loud instead of hanging.
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("parent namespace must reach its own loopback listener");
+
+    // The same hardened probe + control as every other network-denial gate, pointed at the runtime
+    // listener port (the reason [`net_probe_script`] is parameterized over host/port).
+    assert_network_denied(
+        &sb,
+        &Fixture::new("firejail-lo"),
+        None,
+        "firejail_denies_loopback",
+        &ControlProbe::Host,
+        "127.0.0.1",
+        port,
     );
 }
 
@@ -1102,34 +1160,61 @@ fn netns_helper_denies_loopback() {
 fn netns_runtime_unshare_failure_is_not_a_test_failure() {
     const SYSCTL: &str = "/proc/sys/user/max_user_namespaces";
 
+    // Every diagnostic in this gate signals a possibly broken host (failed restore, skipped
+    // invariant) and must reach the operator even when the test PASSES — but libtest captures
+    // `eprintln!` and discards a passing test's output unless `--nocapture` is given. The capture
+    // hooks only the print macros, so a direct write to the process stderr is always visible.
+    fn eprintln_raw(msg: &str) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{msg}");
+    }
+
     // Build the sandbox FIRST (selection-time probe must pass), so the failure we induce is strictly
     // a post-selection, run-time one — the exact race the fix targets.
     let Some(sb) = netns_sandbox() else {
         // The helper already printed its generic skip; name THIS gate too, so a conformance log
         // shows the signal-integrity invariant specifically was not exercised (never a silent pass).
-        eprintln!("SKIP netns runtime-failure gate: netns helper unavailable at selection time");
+        eprintln_raw("SKIP netns runtime-failure gate: netns helper unavailable at selection time");
         return;
     };
 
     // Snapshot + restore guard so we never leave the host with namespaces disabled, even on panic.
-    let Ok(original) = std::fs::read_to_string(SYSCTL) else {
-        eprintln!("SKIP {SYSCTL} unreadable");
-        return;
+    let original = match std::fs::read_to_string(SYSCTL) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln_raw(&format!(
+                "SKIP netns runtime-failure gate: {SYSCTL} unreadable ({err})"
+            ));
+            return;
+        }
     };
     struct Restore<'a>(&'a str, String);
     impl Drop for Restore<'_> {
         fn drop(&mut self) {
-            let _ = std::fs::write(self.0, &self.1);
+            // A failed restore leaves user namespaces disabled HOST-WIDE, silently breaking
+            // every later netns test in the run — warn loudly. Raw stderr, not `eprintln!`:
+            // a failed restore at the explicit drop below still ends in a PASSING test
+            // (recovery check skips), and libtest discards a passing test's captured output.
+            // (No panic: a panic-in-drop aborts the process if we are already unwinding.)
+            if let Err(err) = std::fs::write(self.0, &self.1) {
+                eprintln_raw(&format!(
+                    "WARNING: failed to restore sysctl {} to {}: {err}; user namespaces \
+                     remain disabled host-wide — restore it manually before trusting any \
+                     later netns test in this run",
+                    self.0,
+                    self.1.trim()
+                ));
+            }
         }
     }
 
     // Disable unprivileged user namespaces host-wide. Requires privilege; SKIP loudly if we can't
     // write it (unprivileged container) — never silently pass without inducing the failure.
-    if std::fs::write(SYSCTL, "0").is_err() {
-        eprintln!(
-            "SKIP netns runtime-failure gate: cannot write {SYSCTL} \
-             (run the container --privileged)"
-        );
+    if let Err(err) = std::fs::write(SYSCTL, "0") {
+        eprintln_raw(&format!(
+            "SKIP netns runtime-failure gate: cannot write {SYSCTL} ({err}) — run the \
+             container --privileged"
+        ));
         return;
     }
     let _restore = Restore(SYSCTL, original);
@@ -1164,7 +1249,11 @@ fn netns_runtime_unshare_failure_is_not_a_test_failure() {
     // a dead sandbox). Drop the guard explicitly so the sysctl is back before we re-run.
     drop(_restore);
     if !jitgen_sandbox::netns_helper_available() {
-        eprintln!("SKIP netns recovery check: namespaces still unavailable after restore");
+        eprintln_raw(&format!(
+            "SKIP netns recovery check: namespaces still unavailable after restore — the \
+             sysctl restore itself may have FAILED (a WARNING above would say so); verify \
+             {SYSCTL} manually before trusting any later netns test in this run"
+        ));
         return;
     }
     let fx2 = Fixture::new("netns-runtime-recovered");
