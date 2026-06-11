@@ -636,11 +636,17 @@ pub fn read_blob_at(repo: &Repository, oid: Oid, rel_path: &str) -> Result<Optio
     read_blob_at_capped(repo, oid, rel_path, MAX_BLOB_BYTES)
 }
 
-/// Reject a repo-relative path that is empty, absolute, contains `..`, a backslash, a Windows
-/// drive-prefix, root/prefix components, or contains no real path segments (only `.` components, e.g.
-/// `"."` or `"./."`) (F3/S1 review #1). Lexical; safe for cross-platform input.
+/// Reject a repo-relative path that is empty, absolute, ends with `/`, contains `..`, a backslash,
+/// a Windows drive-prefix, root/prefix components, or contains no real path segments (only `.`
+/// components, e.g. `"."` or `"./."`) (F3/S1 review #1). Lexical; safe for cross-platform input.
 pub fn reject_unsafe_rel(rel: &str) -> Result<()> {
     if rel.is_empty() || rel.contains('\\') {
+        return Err(GitError::UnsafePath(rel.to_string()));
+    }
+    // A trailing slash names a directory, not a file — and `Path::components` strips it, so a
+    // last-segment check downstream (e.g. `is_secret_like("a/.netrc/")`) would see an empty
+    // segment and miss. Every caller passes file paths; fail closed.
+    if rel.ends_with('/') {
         return Err(GitError::UnsafePath(rel.to_string()));
     }
     // Reject Windows drive-style prefixes such as "C:..." (no separator needed).
@@ -815,6 +821,17 @@ mod tests {
         ));
         assert!(matches!(
             reject_unsafe_rel("./"),
+            Err(GitError::UnsafePath(_))
+        ));
+        // Trailing slashes name a directory, not a file — rejected even with real segments
+        // (`Path::components` strips them, so without the explicit check "a/.netrc/" would pass
+        // here yet present an empty last segment to `is_secret_like`).
+        assert!(matches!(
+            reject_unsafe_rel("foo/"),
+            Err(GitError::UnsafePath(_))
+        ));
+        assert!(matches!(
+            reject_unsafe_rel("home/.netrc/"),
             Err(GitError::UnsafePath(_))
         ));
         // A `.` segment alongside a real segment is harmless (normalized away) and still accepted.

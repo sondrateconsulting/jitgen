@@ -71,7 +71,10 @@ pub fn is_secret_like(path: &str) -> bool {
     if lower.contains(".cargo/credentials") || lower.contains(".aws/credentials") {
         return true;
     }
-    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    // Last NON-empty segment: a trailing slash ("home/.netrc/") must not yield an empty file
+    // name and slip past every check below (defense in depth; `reject_unsafe_rel` also rejects
+    // trailing slashes at the read boundary).
+    let name = lower.rsplit('/').find(|seg| !seg.is_empty()).unwrap_or("");
     if SECRET_NAMES.contains(&name) {
         return true;
     }
@@ -126,6 +129,16 @@ mod tests {
         assert!(!is_ignored("src/environment.ts"));
         assert!(!is_ignored("src/credential_helper.rs")); // not a credential store
         assert!(!is_ignored("docs/git-credentials.md")); // name, not the store itself
+    }
+
+    #[test]
+    fn trailing_slash_does_not_bypass_secret_match() {
+        // A trailing slash used to yield an empty last segment and slip past every name check.
+        assert!(is_secret_like("home/.netrc/"));
+        assert!(is_secret_like(".env/"));
+        assert!(is_secret_like("keys/server.pem//"));
+        // Non-secret names stay non-secret with a trailing slash.
+        assert!(!is_secret_like("src/lib.rs/"));
     }
 
     #[test]
