@@ -32,7 +32,7 @@ pub fn detect() -> Vec<Backend> {
 /// part of [`detect`]: the helper is not an isolating sandbox (no filesystem confinement) and must
 /// never satisfy the fail-closed gate, so it is probed separately and only consulted behind the
 /// unsafe-local opt-in. The probe is **functional** — it creates a real user+net namespace pair
-/// (`Backend::version_probe`) — because the `unshare` binary being present says nothing about
+/// (`Backend::availability_probe`) — because the `unshare` binary being present says nothing about
 /// whether the kernel/runtime permits unprivileged user namespaces (container seccomp profiles and
 /// hardened kernels commonly block them).
 pub fn netns_helper_available() -> bool {

@@ -375,7 +375,9 @@ pub(crate) struct Capture {
 /// - `chunk[..take]` is always in bounds: the [`Read`] contract guarantees `n <= chunk.len()` and
 ///   `take <= n`, so the slice never exceeds `chunk`.
 /// - `extend_from_slice` only allocates; on OOM it aborts via `handle_alloc_error` under the standard
-///   allocator rather than unwinding (and `take <= cap <= REDACT_WINDOW`, so no capacity overflow).
+///   allocator rather than unwinding (and `take <= cap`, where `cap` is at most `REDACT_WINDOW` plus
+///   the fixed sentinel addend `START_SENTINEL.len() + 1` for a sentinel plan's stderr — a few hundred
+///   KiB, so no capacity overflow).
 /// - the length read, arithmetic, branch, and atomic `store` cannot panic.
 ///
 /// [`collect`] still recovers from a poisoned guard via `into_inner()` as forward-looking hardening.
