@@ -1,10 +1,11 @@
 # Dependabot VERSION updates — freshness automation, NOT the supply-chain policy gate.
 #
 # The policy gate is `scripts/audit.sh` (cargo-audit + cargo-deny per deny.toml), run in CI by
-# .github/workflows/supply-chain.yml on a weekly cron and on every Cargo.lock/Cargo.toml/deny.toml
-# change — including the PRs this file generates (docs/security.md threat #8). Dependabot ALERTS and
-# automated SECURITY fixes are repo settings, already enabled, and are not configured here; this file
-# only adds scheduled version bumps so dependencies don't silently age.
+# .github/workflows/supply-chain.yml on a weekly cron and on every change to its trigger paths —
+# Cargo.lock, any Cargo.toml, deny.toml, the audit script, and the workflow itself — so the PRs this
+# file generates always re-run the audit (docs/security.md threat #8). Dependabot ALERTS and automated
+# SECURITY fixes are repo settings, already enabled, and are not configured here; this file only adds
+# scheduled version bumps so dependencies don't silently age.
 #
 # Cooldown: a release must be `default-days` old before Dependabot proposes it. Most malicious-release
 # windows (compromised maintainer account, worm-style fresh publish) are open for LESS than a week
@@ -38,7 +39,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-      day: "tuesday"        # staggered after the Monday 06:17 UTC supply-chain cron
+      day: "tuesday"        # staggered after the Monday supply-chain cron (see supply-chain.yml)
     cooldown:
       default-days: 7       # actions ecosystem supports default-days only (no per-semver)
     open-pull-requests-limit: 5

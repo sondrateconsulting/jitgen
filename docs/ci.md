@@ -575,7 +575,10 @@ maintainer sets it (the example above runs the real job on every same-repo PR). 
 PRs until that variable is set — run the **offline mock** (deterministic, keyless, `0 catches`). The
 **real provider** runs only on same-repo PRs and only once a maintainer flips it on: the `JITGEN_REAL_LLM`
 variable set to `true`, with an `ANTHROPIC_API_KEY` secret in a protected `jitgen-llm` Environment as
-defense-in-depth. A hostile PR can neither reach the key nor enable a real provider.
+defense-in-depth. A hostile PR can neither reach the key nor enable a real provider. One activation
+caveat: Dependabot version-bump PRs are same-repo, but Dependabot-triggered runs read only *Dependabot
+secrets* — mirror `ANTHROPIC_API_KEY` into Settings → Secrets and variables → Dependabot as well, or
+those PRs fail the advisory loudly once the variable is on.
 
 The run is **advisory and non-blocking**: the mock job omits `--fail-on-catch` and the real job arms it
 with `--warn-only`, so jitgen never fails its own PR on its own *findings* — the exit-3 findings gate
