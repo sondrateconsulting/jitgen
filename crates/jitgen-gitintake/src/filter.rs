@@ -26,7 +26,9 @@ const VENDOR_SEGMENTS: &[&str] = &[
     "bazel-testlogs",
 ];
 
-/// Exact file names that may carry secrets (`_netrc` is git-for-Windows' `.netrc`).
+/// File names that may carry secrets (`_netrc` is git-for-Windows' `.netrc`) — matched exactly
+/// or with a dotted suffix (`.netrc.bak`, `.npmrc.swp`, …), mirroring the `.env` / `.env.*`
+/// handling.
 const SECRET_NAMES: &[&str] = &[
     ".npmrc",
     ".pypirc",
@@ -75,7 +77,12 @@ pub fn is_secret_like(path: &str) -> bool {
     // name and slip past every check below (defense in depth; `reject_unsafe_rel` also rejects
     // trailing slashes at the read boundary).
     let name = lower.rsplit('/').find(|seg| !seg.is_empty()).unwrap_or("");
-    if SECRET_NAMES.contains(&name) {
+    // Exact name, or a dotted backup/editor variant (`.netrc.bak`, `.npmrc.swp`) — the copy
+    // carries the same credentials as the original. Dot-gated so `.netrcfoo` does not match.
+    if SECRET_NAMES.iter().any(|entry| {
+        name.strip_prefix(entry)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    }) {
         return true;
     }
     // `.env`, `.env.local`, `.env.production`, …
@@ -129,6 +136,19 @@ mod tests {
         assert!(!is_ignored("src/environment.ts"));
         assert!(!is_ignored("src/credential_helper.rs")); // not a credential store
         assert!(!is_ignored("docs/git-credentials.md")); // name, not the store itself
+    }
+
+    #[test]
+    fn backup_variants_of_secret_names_are_ignored() {
+        // Editor/backup copies carry the same credentials as the original.
+        assert!(is_ignored(".netrc.bak"));
+        assert!(is_ignored("home/.npmrc.swp"));
+        assert!(is_ignored(".pypirc.orig"));
+        assert!(is_ignored("home/.git-credentials.bak"));
+        assert!(is_ignored(".pgpass.old"));
+        // Dot-gated: a longer unrelated name is NOT a variant.
+        assert!(!is_ignored(".netrcfoo"));
+        assert!(!is_ignored("src/netrc.rs"));
     }
 
     #[test]
