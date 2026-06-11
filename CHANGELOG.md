@@ -29,6 +29,22 @@ run state and report formats.
   real isolation boundary that gates the named GitHub Action (GP12).
 
 ### Fixed
+- **firejail degradation detection is now behavioral — a reworded warning can no longer defeat it.**
+  All three firejail fail-open defenses previously funneled through two hardcoded English warning
+  substrings, so a future firejail that reworded its "existing sandbox was detected" message while
+  still silently degrading (running the command unsandboxed, exit 0) would have been judged
+  available, selected under `--sandbox auto`, and could have reported an **unsandboxed run as a
+  clean pass**. Detection and the pre-execution re-probe now demand positive, observed proof of the
+  network cut: a trusted sentinel script inside `firejail --net=none` must fail to reach a live
+  loopback listener jitgen binds in its own namespace (`NET_DENIED`) — a degraded passthrough
+  reaches it (`NET_OK`) and is excluded/refused **independent of the warning's wording**, and
+  "cannot verify" (no `nc`/`bash` inside the sandbox) is unavailable, fail-closed. The
+  post-execution backstop now scans the **whole bounded stderr capture** instead of only the first
+  non-empty line, so launcher banner lines printed before the warning can no longer bypass it (a
+  repo forging the marker in its own output can force a visible `SandboxDegraded` refusal of its
+  own run — accepted, fail-closed). The warning-string match is retained as defense-in-depth, and a
+  new live conformance gate (`firejail_denies_loopback`) pins the listener-unreachability property
+  end to end. (`docs/security.md` threat #1 + Residual risks updated.)
 - **The documented SBOM verify command now actually verifies after the signing certificate expires.**
   `cosign verify-attestation` only consults RFC3161 timestamps when the verifier passes
   `--use-signed-timestamps`; without it the command in `docs/ci.md` failed with *"expected a signed
