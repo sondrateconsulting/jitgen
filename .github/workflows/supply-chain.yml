@@ -1,0 +1,92 @@
+# Scheduled supply-chain audit: run scripts/audit.sh (cargo-audit RustSec CVE scan + cargo-deny
+# advisories/licenses/bans/sources, config in deny.toml) in CI — docs/security.md threat #8.
+#
+# scripts/check.sh is the always-offline gate and deliberately excludes these tools (they fetch the
+# RustSec advisory DB over the network), so before this workflow the audit ran only when a maintainer
+# remembered to run it by hand — a new advisory against the pinned Cargo.lock (libgit2-sys/zlib,
+# tree-sitter grammars, ...) would sit unnoticed. Triggers close that gap:
+#   - weekly cron: catches advisories published against an UNCHANGED Cargo.lock — the case no code
+#     change ever triggers on. Failure is deliberately loud-by-default: a red scheduled run plus
+#     GitHub's failure notification to the maintainer (there is no issue-bot). Caveat: GitHub
+#     suspends cron workflows after ~60 days without repo activity; re-enable from the Actions tab
+#     if the repo idles.
+#   - pull_request / push to main on dependency-relevant paths: audits lockfile/policy changes at the
+#     PR and at merge.
+#   - workflow_dispatch: on-demand (e.g. while triaging a fresh advisory).
+#
+# cargo-audit and cargo-deny are dev/CI tools, NOT crate dependencies (no Cargo.toml/BUILD.bazel
+# entry, no Bazel crate_universe repin — see the scripts/audit.sh header). They are installed as
+# version-pinned + checksum-verified release binaries — no third-party action, same pattern as the
+# gitleaks step in security.yml. To bump: take the new version + tarball SHA256 from the upstream
+# release page (rustsec/rustsec, EmbarkStudios/cargo-deny) and update the vars in the install step.
+#
+# Conventions (see docs/ci.md / .github/zizmor.yml): every `uses:` action is pinned to a full commit
+# SHA, permissions are least-privilege, per-job timeout-minutes, no secrets anywhere in this workflow.
+name: supply chain
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC (off the top-of-hour scheduler load spike)
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - "deny.toml"
+      - "scripts/audit.sh"
+      - ".github/workflows/supply-chain.yml"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - "deny.toml"
+      - "scripts/audit.sh"
+      - ".github/workflows/supply-chain.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: supply-chain audit (cargo-audit + cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # bound an advisory-DB/index fetch stall; a clean run takes a few minutes
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit + cargo-deny (pinned, checksum-verified release binaries)
+        run: |
+          set -euo pipefail
+          audit_ver=0.22.2
+          audit_sha=7fb9497f8594b389e5fce5ef9b92db08432996895b2e0c5a0167a69ed445c428
+          deny_ver=0.19.8
+          deny_sha=70e769ae3872e34d45132b17040859175e11401dc12dddb0303e0b8c7d088f3f
+          bin="$RUNNER_TEMP/audit-bin"
+          tmp="$(mktemp -d)"
+          mkdir -p "$bin"
+          curl -fsSL -o "$tmp/cargo-audit.tgz" \
+            "https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv${audit_ver}/cargo-audit-x86_64-unknown-linux-musl-v${audit_ver}.tgz"
+          echo "${audit_sha}  $tmp/cargo-audit.tgz" | sha256sum -c -
+          tar -xzf "$tmp/cargo-audit.tgz" -C "$tmp" "cargo-audit-x86_64-unknown-linux-musl-v${audit_ver}/cargo-audit"
+          mv "$tmp/cargo-audit-x86_64-unknown-linux-musl-v${audit_ver}/cargo-audit" "$bin/cargo-audit"
+          curl -fsSL -o "$tmp/cargo-deny.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${deny_ver}/cargo-deny-${deny_ver}-x86_64-unknown-linux-musl.tar.gz"
+          echo "${deny_sha}  $tmp/cargo-deny.tar.gz" | sha256sum -c -
+          tar -xzf "$tmp/cargo-deny.tar.gz" -C "$tmp" "cargo-deny-${deny_ver}-x86_64-unknown-linux-musl/cargo-deny"
+          mv "$tmp/cargo-deny-${deny_ver}-x86_64-unknown-linux-musl/cargo-deny" "$bin/cargo-deny"
+          "$bin/cargo-audit" --version
+          "$bin/cargo-deny" --version
+          echo "$bin" >> "$GITHUB_PATH"
+      - name: Run the supply-chain audit (scripts/audit.sh)
+        # `cargo audit` / `cargo deny` resolve the just-installed binaries via PATH. The first cargo
+        # invocation has rustup install the rust-toolchain.toml-pinned toolchain (as in release.yml);
+        # cargo-deny's `cargo metadata` fetches the sparse registry index for the pinned Cargo.lock.
+        run: ./scripts/audit.sh
