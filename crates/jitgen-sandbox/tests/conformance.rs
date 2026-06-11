@@ -122,12 +122,24 @@ fn linux_os_sandbox(backend: Backend) -> Option<Sandbox> {
 /// Outbound connect timeout (seconds) bounding both probe branches (`nc -w` and `timeout bash`).
 const PROBE_CONNECT_TIMEOUT_SECS: u32 = 3;
 
-/// Gate-1 probe shared by the sandbox-exec, bwrap, firejail, and Docker network-denial gates (the
-/// netns-helper gates use their own inline probes, which predate this script's `-z` hardening —
-/// see "Gate 1 (netns-helper)" below). Picks a connect tool that actually EXISTS in the probed
-/// environment, then attempts an outbound TCP connect. Distinguishes "denied" from "no probe tool"
-/// so a toolless environment can't masquerade as a passing network-denial test (T1/F7 P3). Emits a
-/// sentinel word; callers assert on it (not on exit).
+/// Egress probe target shared by every egress-denial gate (a public resolver's TCP/53 — the probe
+/// only needs the connect to complete, no DNS payload). The loopback gate substitutes its own
+/// runtime listener target. [`assert_network_denied`] builds ONE script per call and hands it to
+/// both the control and the sandboxed run, so the two can never drift to different targets.
+const PROBE_EGRESS_HOST: &str = "1.1.1.1";
+const PROBE_EGRESS_PORT: u16 = 53;
+
+/// Gate-1 probe shared by EVERY network-denial gate — sandbox-exec, bwrap, firejail, Docker, and
+/// the netns-helper pair, all via [`assert_network_denied`]. Picks a connect tool that actually
+/// EXISTS in the probed environment, then attempts an outbound TCP connect. Distinguishes
+/// "denied" from "no probe tool" so a toolless environment can't masquerade as a passing
+/// network-denial test (T1/F7 P3). Emits a sentinel word; callers assert on it (not on exit).
+///
+/// `host`/`port` are interpolated verbatim into both connect branches (the `nc` argv and the
+/// `/dev/tcp/{host}/{port}` path) — the parameterization exists because the netns loopback gate
+/// probes a runtime listener port. `port` is a `u16` (digits only) and `host` is asserted down to
+/// bare IP/hostname characters, so neither can carry shell syntax into the unquoted interpolation
+/// sites; the egress gates pass [`PROBE_EGRESS_HOST`]:[`PROBE_EGRESS_PORT`].
 ///
 /// `nc -z` (connect, report, close — no data phase) is the exact semantic wanted: without it, some
 /// netcat variants exit nonzero AFTER a successful connect (e.g. `-w` idle-timeout once stdin hits
@@ -147,7 +159,18 @@ const PROBE_CONNECT_TIMEOUT_SECS: u32 = 3;
 /// The bash fallback needs `timeout`: `/dev/tcp` has no connect timeout of its own, so on a
 /// packet-DROPPING (not rejecting) host a control run would otherwise block the test process
 /// indefinitely. bash-without-timeout reads as `NO_PROBE_TOOL` (fail loud, not hang).
-fn net_probe_script() -> String {
+fn net_probe_script(host: &str, port: u16) -> String {
+    // `{host}` lands unquoted in shell source (twice), so a bare IP/hostname is the entire safe
+    // alphabet. Anything else aborts generation here, loudly — a metacharacter that survived
+    // into the script could read as a false sentinel downstream (e.g. a word-split nc argv
+    // exiting nonzero prints NET_DENIED with no connect ever attempted).
+    assert!(
+        !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '-')),
+        "net_probe_script: host must be a bare IP/hostname literal (got {host:?})"
+    );
     let dirs = TRUSTED_BIN_DIRS.join(" ");
     let t = PROBE_CONNECT_TIMEOUT_SECS;
     format!(
@@ -158,9 +181,9 @@ fn net_probe_script() -> String {
              [ -n \"$to\" ] || [ ! -x \"$d/timeout\" ] || to=\"$d/timeout\"; \
          done; \
          if [ -n \"$nc\" ]; then \
-             \"$nc\" -z -w {t} 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+             \"$nc\" -z -w {t} {host} {port} </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
          elif [ -n \"$bash\" ] && [ -n \"$to\" ]; then \
-             \"$to\" {t} \"$bash\" -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 \
+             \"$to\" {t} \"$bash\" -c 'exec 3<>/dev/tcp/{host}/{port}' >/dev/null 2>&1 \
                  && echo NET_OK || echo NET_DENIED; \
          else echo NO_PROBE_TOOL; fi"
     )
@@ -173,11 +196,12 @@ fn net_probe_script() -> String {
 
 /// The script's load-bearing pieces are present: all three sentinels, the `-z` connect-report-
 /// close flag with the interpolated timeout (losing `-z` reintroduces the idle-timeout false
-/// `NET_DENIED` this probe exists to prevent), the `timeout`-wrapped bash fallback, and every
-/// production trusted dir in the self-resolution scan.
+/// `NET_DENIED` this probe exists to prevent), the `timeout`-wrapped bash fallback, every
+/// production trusted dir in the self-resolution scan, and the caller's target verbatim in BOTH
+/// connect branches (the netns loopback gate depends on the latter for its runtime port).
 #[test]
 fn net_probe_script_is_structurally_sound() {
-    let s = net_probe_script();
+    let s = net_probe_script(PROBE_EGRESS_HOST, PROBE_EGRESS_PORT);
     for sentinel in ["echo NET_OK", "echo NET_DENIED", "echo NO_PROBE_TOOL"] {
         assert!(s.contains(sentinel), "missing {sentinel:?} in: {s}");
     }
@@ -193,6 +217,22 @@ fn net_probe_script_is_structurally_sound() {
     for d in TRUSTED_BIN_DIRS {
         assert!(s.contains(d), "probe script must scan trusted dir {d}: {s}");
     }
+    let lo = net_probe_script("127.0.0.1", 40123);
+    assert!(
+        lo.contains("127.0.0.1 40123") && lo.contains("/dev/tcp/127.0.0.1/40123"),
+        "the connect target must land verbatim in both the nc and /dev/tcp branches: {lo}"
+    );
+}
+
+/// The host whitelist is load-bearing (see the generation-time assert in [`net_probe_script`]):
+/// every current caller passes a literal IP, but the signature accepts any `&str`, and an
+/// unquoted metacharacter would corrupt the script rather than fail it. This also catches a
+/// positional `what`/`host` swap at a future call site — gate names carry `_`, which the
+/// whitelist rejects.
+#[test]
+#[should_panic(expected = "bare IP/hostname")]
+fn net_probe_script_rejects_non_literal_host() {
+    let _ = net_probe_script("1.1.1.1;x", 53);
 }
 
 /// `sh -n` parses without executing: a quoting/syntax regression in the `format!`-built script
@@ -202,7 +242,11 @@ fn net_probe_script_is_structurally_sound() {
 #[test]
 fn net_probe_script_parses_under_posix_sh() {
     let out = std::process::Command::new("/bin/sh")
-        .args(["-n", "-c", &net_probe_script()])
+        .args([
+            "-n",
+            "-c",
+            &net_probe_script(PROBE_EGRESS_HOST, PROBE_EGRESS_PORT),
+        ])
         .output()
         .expect("spawn /bin/sh -n");
     assert!(
@@ -221,7 +265,10 @@ fn net_probe_script_parses_under_posix_sh() {
 #[test]
 fn net_probe_script_emits_exactly_one_sentinel_line() {
     let out = std::process::Command::new("/bin/sh")
-        .args(["-c", &net_probe_script()])
+        .args([
+            "-c",
+            &net_probe_script(PROBE_EGRESS_HOST, PROBE_EGRESS_PORT),
+        ])
         .output()
         .expect("spawn /bin/sh -c");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -242,8 +289,9 @@ fn net_probe_script_emits_exactly_one_sentinel_line() {
 /// its own tools by absolute path, so both runs use the identical binaries).
 enum ControlProbe<'a> {
     /// Directly on the host: bwrap and firejail expose the host's own filesystem read-only inside
-    /// the sandbox (`--ro-bind / /` / `--read-only=/`), and sandbox-exec runs in place on the host
-    /// filesystem with reads broadly allowed (SBPL `(allow file-read*)`), so for all three a host
+    /// the sandbox (`--ro-bind / /` / `--read-only=/`), sandbox-exec runs in place on the host
+    /// filesystem with reads broadly allowed (SBPL `(allow file-read*)`), and the netns helper
+    /// isolates only the network namespace (the filesystem IS the host's), so for all four a host
     /// control probes the very same tool binaries the sandboxed run will resolve.
     Host,
     /// Inside the same digest-pinned image with Docker's default (unrestricted) networking,
@@ -398,20 +446,20 @@ fn output_with_deadline(cmd: &mut std::process::Command, what: &str) -> std::pro
     }
 }
 
-/// Run [`net_probe_script`] outside the sandbox per `control` and return its raw output.
+/// Run `script` (a [`net_probe_script`] instance) outside the sandbox per `control` and return
+/// its raw output.
 ///
 /// Env discipline mirrors production `run()` (which spawns every launcher with
 /// `env_clear().envs(&plan.env)`): the control process gets a cleared env with `PATH` pinned to
 /// the production `TRUSTED_BIN_DIRS`, so the launcher itself cannot be influenced by an inherited
 /// hostile env. The probe script does not consult `PATH` at all (it self-resolves its tools).
-fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output {
-    let script = net_probe_script();
+fn run_control_probe(control: &ControlProbe, script: &str, what: &str) -> std::process::Output {
     let mut cmd = match control {
         ControlProbe::Host => {
             // `/bin/sh` is a literal absolute path inside a trusted dir (the same form
             // `resolve_trusted` accepts) — the launcher itself cannot come from `PATH`.
             let mut c = std::process::Command::new("/bin/sh");
-            c.args(["-c", &script]);
+            c.args(["-c", script]);
             c
         }
         ControlProbe::Docker { image, user } => {
@@ -432,7 +480,7 @@ fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output
                 "/bin/sh",
                 image,
                 "-c",
-                &script,
+                script,
             ]);
             c
         }
@@ -442,38 +490,47 @@ fn run_control_probe(control: &ControlProbe, what: &str) -> std::process::Output
     output_with_deadline(&mut cmd, what)
 }
 
-/// Run [`net_probe_script`] under `sb` and assert egress is denied; fail loudly when the sandboxed
-/// environment offers no probe tool — an unverifiable gate must not read as a passing one.
+/// Run [`net_probe_script`] against `host:port` under `sb` and assert the connect is denied; fail
+/// loudly when the sandboxed environment offers no probe tool — an unverifiable gate must not
+/// read as a passing one. The egress gates pass [`PROBE_EGRESS_HOST`]:[`PROBE_EGRESS_PORT`]; the
+/// netns loopback gate passes its runtime parent-namespace listener target.
 ///
 /// A control run of the same probe OUTSIDE the sandbox must report `NET_OK` first: the pass
 /// signal below is "the probe printed `NET_DENIED`", which a broken probe tool (an nc without
-/// `-z`, a bash without `/dev/tcp`) or an egress-less host would also print, silently passing the
-/// gate while isolation is unverified — or broken. The control validates the connect/exit
-/// semantics of whatever tool variant is actually present, so a control failure means THIS
-/// environment cannot run the gate truthfully; it is NOT a sandbox-isolation failure.
+/// `-z`, a bash without `/dev/tcp`) or an unreachable target (egress-less host, dead listener)
+/// would also print, silently passing the gate while isolation is unverified — or broken. The
+/// control validates the connect/exit semantics of whatever tool variant is actually present, so
+/// a control failure means THIS environment cannot run the gate truthfully; it is NOT a
+/// sandbox-isolation failure.
 fn assert_network_denied(
     sb: &Sandbox,
     fx: &Fixture,
     run_as: Option<&str>,
     what: &str,
     control: &ControlProbe,
+    host: &str,
+    port: u16,
 ) {
-    let out = run_control_probe(control, what);
+    // ONE script instance feeds both the control and the sandboxed run — same target, same tool
+    // resolution, by construction.
+    let script = net_probe_script(host, port);
+    let out = run_control_probe(control, &script, what);
     let control_stdout = String::from_utf8_lossy(&out.stdout);
     // Exact-line match: the control's stdout is raw `Command::output()` bytes (docker noise, image
     // entrypoints), so a substring `contains` could coincide; the probe emits the sentinel alone
     // on its own line.
     assert!(
         control_stdout.lines().any(|l| l.trim() == "NET_OK"),
-        "{what}: CONTROL probe outside the sandbox did not report NET_OK (stdout {control_stdout:?}, \
-         stderr {:?}). The host/image has no egress, offers no nc/bash probe tool, or its nc lacks \
-         -z support (openbsd nc, ncat, and busybox nc all have it); without a passing control an \
-         in-sandbox NET_DENIED is meaningless. This is a control failure, NOT a sandbox-isolation \
-         failure — fix egress/tooling and rerun",
+        "{what}: CONTROL probe outside the sandbox did not report NET_OK for {host}:{port} \
+         (stdout {control_stdout:?}, stderr {:?}). The target is unreachable from outside the \
+         sandbox (no egress / dead listener), the host/image offers no nc/bash probe tool, or its \
+         nc lacks -z support (openbsd nc, ncat, and busybox nc all have it); without a passing \
+         control an in-sandbox NET_DENIED is meaningless. This is a control failure, NOT a \
+         sandbox-isolation failure — fix the target/tooling and rerun",
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), net_probe_script()]);
+    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script]);
     let res = exec_as(sb, &cmd, fx, run_as);
     // Every branch of the probe script ends in `echo <sentinel>` (exit 0), so anything but
     // `Passed` means the probe never ran to completion (launcher/preamble/spawn failure — exactly
@@ -497,7 +554,8 @@ fn assert_network_denied(
     // more counts as failing).
     assert!(
         res.stdout.lines().any(|l| l.trim() == "NET_DENIED") && !res.stdout.contains("NET_OK"),
-        "{what}: network must be denied (expected NET_DENIED); got {res:?}"
+        "{what}: the sandboxed connect to {host}:{port} must be denied (expected NET_DENIED); \
+         got {res:?}"
     );
 }
 
@@ -687,6 +745,8 @@ fn sandbox_exec_denies_network() {
         None,
         "sandbox_exec_denies_network",
         &ControlProbe::Host,
+        PROBE_EGRESS_HOST,
+        PROBE_EGRESS_PORT,
     );
 }
 
@@ -780,6 +840,8 @@ fn docker_denies_network() {
             image: &image,
             user: &uid_gid,
         },
+        PROBE_EGRESS_HOST,
+        PROBE_EGRESS_PORT,
     );
 }
 
@@ -798,6 +860,8 @@ fn bwrap_denies_network() {
         None,
         "bwrap_denies_network",
         &ControlProbe::Host,
+        PROBE_EGRESS_HOST,
+        PROBE_EGRESS_PORT,
     );
 }
 
@@ -821,6 +885,8 @@ fn firejail_denies_network() {
         None,
         "firejail_denies_network",
         &ControlProbe::Host,
+        PROBE_EGRESS_HOST,
+        PROBE_EGRESS_PORT,
     );
 }
 
@@ -922,7 +988,10 @@ fn netns_sandbox() -> Option<Sandbox> {
 /// Gate 1 (netns-helper) — THE tier-defining pair (GP15): a command inside the netns helper cannot
 /// open a network connection, AND an ordinary command still executes successfully. Both halves run
 /// against the same sandbox so a probe that "denies network" by failing to execute anything at all
-/// cannot pass.
+/// cannot pass. The denial half goes through [`assert_network_denied`] with a Host control (the
+/// helper isolates only the network namespace, so the host filesystem — and therefore the host's
+/// tool binaries — is exactly what the sandboxed probe sees), which means an egress-less or
+/// toolless host fails loudly instead of passing vacuously.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "live netns; run with --ignored on a Linux host"]
@@ -942,24 +1011,17 @@ fn netns_helper_denies_network_and_still_executes() {
     );
     assert_eq!(res.stdout, "hi");
 
-    // Half 2: a connect attempt is denied in-kernel. Same robust sentinel probe as the Docker gate
-    // (a toolless host can't masquerade as a passing denial test).
-    let script = "\
-        if command -v nc >/dev/null 2>&1; then \
-            nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-        elif command -v bash >/dev/null 2>&1; then \
-            bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-        else echo NO_PROBE_TOOL; fi";
-    let fx = Fixture::new("netns-net");
-    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script.into()]);
-    let res = exec(&sb, &cmd, &fx);
-    if res.stdout.contains("NO_PROBE_TOOL") {
-        eprintln!("SKIP netns network probe: host has no nc/bash probe tool");
-        return;
-    }
-    assert!(
-        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
-        "netns helper must deny network (expected NET_DENIED); got {res:?}"
+    // Half 2: a connect attempt is denied in-kernel — the same hardened probe + out-of-sandbox
+    // control as every other network-denial gate (self-resolved tools, `nc -z`,
+    // `timeout`-bounded bash fallback, loud failure when unverifiable).
+    assert_network_denied(
+        &sb,
+        &Fixture::new("netns-net"),
+        None,
+        "netns_helper_denies_network_and_still_executes",
+        &ControlProbe::Host,
+        PROBE_EGRESS_HOST,
+        PROBE_EGRESS_PORT,
     );
 }
 
@@ -1003,23 +1065,20 @@ fn netns_helper_denies_loopback() {
     std::net::TcpStream::connect(("127.0.0.1", port))
         .expect("parent namespace must reach its own loopback listener");
 
-    let script = format!(
-        "if command -v nc >/dev/null 2>&1; then \
-            nc -w 3 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-        elif command -v bash >/dev/null 2>&1; then \
-            bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-        else echo NO_PROBE_TOOL; fi"
-    );
-    let fx = Fixture::new("netns-lo");
-    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script]);
-    let res = exec(&sb, &cmd, &fx);
-    if res.stdout.contains("NO_PROBE_TOOL") {
-        eprintln!("SKIP netns loopback probe: host has no nc/bash probe tool");
-        return;
-    }
-    assert!(
-        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
-        "netns helper must deny loopback (lo is DOWN in the fresh namespace); got {res:?}"
+    // The same hardened probe + control as every other network-denial gate, pointed at the
+    // runtime listener port (the reason [`net_probe_script`] is parameterized). The Host control
+    // runs the probe SCRIPT against the live listener from the parent namespace, which also
+    // validates the resolved tool's connect/exit semantics — an nc without `-z` exits nonzero
+    // even on a successful connect, a false NET_DENIED the Rust sanity connect above cannot
+    // catch. A NET_DENIED inside the sandbox can then only mean the namespace boundary.
+    assert_network_denied(
+        &sb,
+        &Fixture::new("netns-lo"),
+        None,
+        "netns_helper_denies_loopback",
+        &ControlProbe::Host,
+        "127.0.0.1",
+        port,
     );
 }
 
