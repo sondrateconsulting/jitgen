@@ -215,10 +215,11 @@ cosign verify ghcr.io/sondrateconsulting/jitgen@sha256:<digest> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 # SPDX SBOM attestation — bound to the MULTI-ARCH (index) digest only (use the digest the release
-# reports; per-arch digests carry signatures but no attestation) and stored in the registry, NOT in the
-# transparency log (the fat image's SBOM is too large for a Rekor entry), so pass --insecure-ignore-tlog. The
-# attestation carries an RFC3161 timestamp from the Sigstore public-good TSA, which anchors the signing
-# time so the (short-lived) Fulcio cert still verifies after it expires. The TSA cert ships in cosign's
+# reports; per-arch digests carry signatures but no attestation) and stored in the registry, NOT in
+# the transparency log (the fat image's SBOM is too large for a Rekor entry), so pass
+# --insecure-ignore-tlog. The attestation carries an RFC3161 timestamp from the Sigstore public-good
+# TSA, which anchors the signing time so the (short-lived) Fulcio cert still verifies after it
+# expires. The TSA cert ships in cosign's
 # default trusted root, but cosign only consults RFC3161 timestamps when asked — pass
 # --use-signed-timestamps, or verification fails with "expected a signed timestamp to verify an
 # expired certificate" once the cert's ~10-minute validity window has passed.

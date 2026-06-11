@@ -61,10 +61,12 @@ run state and report formats.
   attestations"; image *signatures* still verify against index and per-arch digests alike, since
   `cosign sign --recursive` is real). `docs/ci.md` and the workflow comments now scope the claim
   correctly, and the no-op flag is dropped. Alongside the cosign-installer v4 bump, the workflow now
-  pins `cosign-release: v2.6.1` (the final cosign v2 release): the installer's new default, cosign
-  v3, removes `attest --tlog-upload` and changes the default signature storage format, which would
-  have broken the next tag release and the documented verify commands. Migrating to cosign v3 is a
-  deliberate follow-up.
+  pins `cosign-release: v2.6.3` (the latest cosign v2 release) and fail-loud asserts the installed
+  version after install: the installer's new default, cosign v3, removes `attest --tlog-upload` and
+  changes the default signature storage format, which would have broken the next tag release and the
+  documented verify commands. Migrating to cosign v3 is a deliberate follow-up. `docs/security.md`'s
+  "SBOM … not yet shipped" line is also corrected (the SBOM attestation ships since v0.2.2; build
+  provenance remains unshipped).
 
 ## [0.2.2] — 2026-06-09
 
