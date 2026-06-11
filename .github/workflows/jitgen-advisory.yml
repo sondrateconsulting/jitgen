@@ -146,6 +146,12 @@ jobs:
   #      consumes this (and the Environment is defense-in-depth). Set the variable WITHOUT the secret and
   #      the job RUNS but jitgen exits 1 with a clear "ANTHROPIC_API_KEY is not set" message; it does not
   #      silently fall back to the mock. So land the secret with (or before) the variable.
+  #   3. Dependabot version-bump PRs (.github/dependabot.yml) are same-repo, so once the variable is
+  #      `true` they route here too — but Dependabot-triggered runs read ONLY "Dependabot secrets"
+  #      (Settings → Secrets and variables → Dependabot); Actions secrets, including this Environment's,
+  #      don't resolve, so the key is empty and the job fails loudly exactly as in step 2. Mirror
+  #      `ANTHROPIC_API_KEY` into Dependabot secrets at the same time, or expect a red advisory check on
+  #      every Dependabot PR.
   advisory-real:
     name: catch advisory (real provider)
     if: ${{ github.event.pull_request.head.repo.full_name == github.repository && vars.JITGEN_REAL_LLM == 'true' }}
