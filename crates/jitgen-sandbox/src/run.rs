@@ -66,7 +66,9 @@ pub fn run(plan: &SandboxPlan, policy: &ExecPolicy) -> Result<ExecutionResult> {
 /// `run` plus the `inner_never_started` signal: `true` when the plan expected the start sentinel but
 /// none was captured, i.e. the sandbox **wrapper** (launcher + rlimit preamble) failed before `exec`'ing
 /// the inner command (a run-time `unshare`/`bwrap` failure). The result already classifies such a run
-/// [`jitgen_core::ExecOutcome::Errored`] (never a test `Failed`); this extra bool lets the capstone
+/// [`jitgen_core::ExecOutcome::Errored`] — or [`jitgen_core::ExecOutcome::Timeout`] when the watchdog
+/// killed a *hung* (not failed) wrapper, the budget being the diagnosis there — never a test
+/// `Failed`; this extra bool lets the capstone
 /// [`crate::sandbox::Sandbox::run`] escalate a *persistent* **netns-helper** wrapper failure into a
 /// hard error after a trusted re-probe — netns is the only tier that re-probes
 /// (`Backend::reprobes_on_inner_never_started`); on the other preamble tiers the `Errored` result
@@ -194,7 +196,8 @@ pub(crate) fn run_reporting(
     // build-marker scan, redaction, and the returned result), so its presence is invisible and a
     // `BuildSignal` marker can't collide with it. `inner_never_started` = the plan emits a sentinel
     // but none was captured ⟹ the wrapper failed before exec'ing the inner command. Sequencing:
-    // collect → strip → set flag → detect_build_failure(stripped) → classify → re-trim+redact(stripped).
+    // collect → degradation backstop → wait_result? → strip + set flag → re-trim to the user cap →
+    // detect_build_failure(capped) → classify → redact(capped).
     let (stderr_clean, inner_never_started): (Cow<[u8]>, bool) = if plan.expects_start_sentinel {
         let (cleaned, found) = strip_marker_line(&stderr_raw, START_SENTINEL);
         (cleaned, !found)

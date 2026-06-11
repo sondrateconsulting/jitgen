@@ -33,6 +33,7 @@ treats that as a fail-open and refuses it:
 - **Not a bug:** this is the fail-closed invariant working as designed — jitgen will **not** report an
   unsandboxed run as a clean pass. `bubblewrap` does not have this failure mode (it errors loudly
   instead of degrading). See [security.md → Residual risks](security.md#residual-risks).
+
 ## netns-helper: "became unavailable mid-run" (`SandboxError::BackendUnavailableMidRun`)
 
 The netns-helper tier (the `unshare` user+net-namespace wrapper, auto-selected under
