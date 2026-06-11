@@ -26,8 +26,10 @@ const VENDOR_SEGMENTS: &[&str] = &[
     "bazel-testlogs",
 ];
 
-/// Exact file names that may carry secrets (`_netrc` is git-for-Windows' `.netrc`).
+/// File names that may carry secrets (`_netrc` is git-for-Windows' `.netrc`) — matched exactly
+/// or with a dotted suffix (`.env.production`, `.netrc.bak`, `.npmrc.swp`, …).
 const SECRET_NAMES: &[&str] = &[
+    ".env",
     ".npmrc",
     ".pypirc",
     ".netrc",
@@ -71,12 +73,17 @@ pub fn is_secret_like(path: &str) -> bool {
     if lower.contains(".cargo/credentials") || lower.contains(".aws/credentials") {
         return true;
     }
-    let name = lower.rsplit('/').next().unwrap_or(&lower);
-    if SECRET_NAMES.contains(&name) {
-        return true;
-    }
-    // `.env`, `.env.local`, `.env.production`, …
-    if name == ".env" || name.starts_with(".env.") {
+    // Last NON-empty segment: a trailing slash ("home/.netrc/") must not yield an empty file
+    // name and slip past every check below (defense in depth; `reject_unsafe_rel` also rejects
+    // trailing slashes at the read boundary).
+    let name = lower.rsplit('/').find(|seg| !seg.is_empty()).unwrap_or("");
+    // Exact name, or a dotted-suffix variant — flavors (`.env.local`) and backup/editor copies
+    // (`.netrc.bak`, `.npmrc.swp`) carry the same credentials as the original. Dot-gated so
+    // `.netrcfoo` does not match.
+    if SECRET_NAMES.iter().any(|entry| {
+        name.strip_prefix(entry)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    }) {
         return true;
     }
     if SECRET_PREFIXES.iter().any(|p| name.starts_with(p)) {
@@ -126,6 +133,34 @@ mod tests {
         assert!(!is_ignored("src/environment.ts"));
         assert!(!is_ignored("src/credential_helper.rs")); // not a credential store
         assert!(!is_ignored("docs/git-credentials.md")); // name, not the store itself
+    }
+
+    #[test]
+    fn backup_variants_of_secret_names_are_ignored() {
+        // Editor/backup copies carry the same credentials as the original.
+        assert!(is_ignored(".netrc.bak"));
+        assert!(is_ignored("home/.npmrc.swp"));
+        assert!(is_ignored(".pypirc.orig"));
+        assert!(is_ignored("home/.git-credentials.bak"));
+        assert!(is_ignored(".pgpass.old"));
+        assert!(is_ignored("_netrc.bak"));
+        // Case-insensitive like the exact-name match: the lowercasing must stay ahead of the
+        // variant check (`matching_is_case_insensitive` only pins exact names).
+        assert!(is_ignored(".NETRC.BAK"));
+        assert!(is_ignored("home/.NPMRC.SWP"));
+        // Dot-gated: a longer unrelated name is NOT a variant.
+        assert!(!is_ignored(".netrcfoo"));
+        assert!(!is_ignored("src/netrc.rs"));
+    }
+
+    #[test]
+    fn trailing_slash_does_not_bypass_secret_match() {
+        // A trailing slash used to yield an empty last segment and slip past every name check.
+        assert!(is_secret_like("home/.netrc/"));
+        assert!(is_secret_like(".env/"));
+        assert!(is_secret_like("keys/server.pem//"));
+        // Non-secret names stay non-secret with a trailing slash.
+        assert!(!is_secret_like("src/lib.rs/"));
     }
 
     #[test]
