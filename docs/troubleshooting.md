@@ -37,9 +37,9 @@ treats that as a fail-open and refuses it:
 ## netns-helper: "became unavailable mid-run" (`SandboxError::BackendUnavailableMidRun`)
 
 The netns-helper tier (the `unshare` user+net-namespace wrapper, auto-selected under
-`--unsafe-local-execution` on capable Linux hosts) failed to create its namespaces **part-way through a
-run**, *after* it had passed the selection-time probe — and a fresh probe confirms it can no longer
-isolate. jitgen aborts the run rather than continue.
+`--unsafe-local-execution` on capable Linux hosts when no stronger isolating backend wins) failed to
+create its namespaces **part-way through a run**, *after* it had passed the selection-time probe —
+and a fresh probe confirms it can no longer isolate. jitgen aborts the run rather than continue.
 
 - **Cause:** unprivileged user-namespace creation became unavailable mid-run. Common triggers:
   `user.max_user_namespaces` exhausted (too many concurrent namespaces — often a leaked/backgrounded

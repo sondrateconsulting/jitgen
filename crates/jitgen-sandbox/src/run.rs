@@ -1534,7 +1534,7 @@ mod tests {
             // A hostile inner command can re-print the sentinel string after `exec` (its code runs
             // only after the genuine preamble sentinel is already in the pipe). Only the FIRST match —
             // the trusted one — is stripped; later forged copies stay as ordinary stderr. This pins the
-            // `!found &&` first-match-only semantics so a regression to "remove all" can't slip in.
+            // early-return-on-first-match semantics so a regression to "remove all" can't slip in.
             let input = format!("{START_SENTINEL}\n{START_SENTINEL}\nafter\n");
             let (out, found) = strip_marker_line(input.as_bytes(), START_SENTINEL);
             assert!(found);

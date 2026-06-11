@@ -1090,11 +1090,13 @@ fn netns_runtime_unshare_failure_is_not_a_test_failure() {
         Err(jitgen_sandbox::SandboxError::BackendUnavailableMidRun(id)) => {
             assert_eq!(id, "netns-helper");
         }
-        // A transient flip would leave an Errored/Broken result — also acceptable (never a catch).
-        Ok(res) => assert_ne!(
-            res.outcome,
-            ExecOutcome::Failed,
-            "a run-time unshare failure must never classify as a test Failed: {res:?}"
+        // A transient flip would leave an Errored result (or Timeout for a hung wrapper) — also
+        // acceptable (never a catch). Pin the exact unusable set rather than merely != Failed, so a
+        // future outcome variant can't slip through this gate as a vacuous pass.
+        Ok(res) => assert!(
+            matches!(res.outcome, ExecOutcome::Errored | ExecOutcome::Timeout),
+            "a run-time unshare failure must classify unusable (Errored/Timeout), never a test \
+             result: {res:?}"
         ),
         Err(other) => panic!("unexpected error for a run-time wrapper failure: {other:?}"),
     }

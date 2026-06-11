@@ -74,12 +74,16 @@ impl Backend {
     /// detected via the missing start sentinel) should trigger a trusted **re-probe** and, if that
     /// fresh probe also fails, a hard [`crate::error::SandboxError::BackendUnavailableMidRun`] —
     /// rather than only a per-candidate `Errored`/`Broken`. True **only** for the netns helper today:
-    /// it is the one tier with a *functional* probe (creating a user+net namespace) that can pass at
-    /// selection and then fail at run time (`user.max_user_namespaces` exhaustion, AppArmor/seccomp
-    /// toggles) — a re-probe there is meaningful. The OS-sandbox/local tiers either have presence-only
-    /// probes (a re-probe would always pass and be useless) or no probe at all. Enumerated without a
-    /// wildcard so adding a backend forces an explicit decision; generalizing to bwrap/sandbox-exec is
-    /// a follow-up once their probes become functional ([ADR-0013], `docs/security.md` threat #1).
+    /// its availability hinges on a uniquely *volatile* host condition — unprivileged user-namespace
+    /// creation can flip after selection (`user.max_user_namespaces` exhaustion, AppArmor/seccomp
+    /// toggles), the exact probe→run race this signal repairs — so a fresh functional probe (creating
+    /// a real user+net namespace, see [`availability_probe`](Self::availability_probe)) is meaningful
+    /// evidence the breakage is persistent. The other preamble tiers also have functional probes
+    /// (bwrap exercises real namespacing; sandbox-exec compiles a profile), so extending the
+    /// escalation to them is mechanical — but it is a deliberate per-backend decision, not a default:
+    /// no observed mid-run flip motivates it there yet, and the match is enumerated without a
+    /// wildcard so adding a backend forces that decision explicitly ([ADR-0013],
+    /// `docs/security.md` threat #1).
     pub(crate) fn reprobes_on_inner_never_started(self) -> bool {
         match self {
             Backend::NetnsHelper => true,
