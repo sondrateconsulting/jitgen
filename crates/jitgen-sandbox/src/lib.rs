@@ -41,11 +41,34 @@ pub use sandbox::{RunRequest, Sandbox};
 pub use spawn::{BuildSignal, SpawnRequest};
 pub use user::current_uid_gid;
 
-// NOT re-exported (S2/F7 P4): `command::{build_plan, PlanInput, SandboxPlan}`, `run::run`, and
+// NOT re-exported (S2/F7 P4): `command::{build_plan, PlanInput, SandboxPlan}`, `run::run` (which is
+// additionally `#[cfg(test)]`-only; production execution goes through the `pub(crate)`
+// `run::run_reporting`), and
 // `sbpl::render_profile`. Their modules are private, so these `pub`-within-module items are reachable
 // only inside the crate (via `crate::command::…` etc.) — never by an external caller, who would
 // otherwise be able to construct/execute a `ConstrainedLocal` plan and bypass the fail-closed opt-in
-// in [`Sandbox::new`]. External callers go through [`Sandbox`].
+// in [`Sandbox::new`]. External callers go through [`Sandbox`]. The sole, deliberate exception is
+// [`test_support`] below: pure read-only helpers that cannot construct or execute a plan.
+
+/// Hidden test-support re-exports for the live conformance suite (`tests/conformance.rs`), which
+/// runs as a separate integration binary and therefore sees only the crate's public surface.
+///
+/// The suite's out-of-sandbox control probe must apply EXACTLY production's trusted-launcher
+/// discipline (resolve `docker` via [`resolve_trusted`](test_support::resolve_trusted) over
+/// [`TRUSTED_BIN_DIRS`](test_support::TRUSTED_BIN_DIRS), never the inherited `PATH`), EXACTLY
+/// production's non-root `--user` gate ([`is_uid_gid`](test_support::is_uid_gid)), and EXACTLY
+/// production's digest-pin gate ([`is_digest_pinned`](test_support::is_digest_pinned)).
+/// Re-exporting the production items — instead of the test keeping mirror copies — makes drift
+/// impossible by construction.
+///
+/// NOT a stable API (hence `#[doc(hidden)]`). Only pure, read-only helpers belong here: nothing
+/// that can construct or execute a sandbox plan, so the fail-closed boundary above (S2/F7 P4) is
+/// unaffected.
+#[doc(hidden)]
+pub mod test_support {
+    pub use crate::command::{is_digest_pinned, is_uid_gid};
+    pub use crate::which::{resolve_trusted, TRUSTED_BIN_DIRS};
+}
 
 /// Stable identifier for this pipeline layer/crate.
 pub fn layer_id() -> &'static str {
