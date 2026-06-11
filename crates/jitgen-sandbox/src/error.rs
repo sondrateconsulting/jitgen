@@ -127,6 +127,25 @@ pub enum SandboxError {
     /// An I/O error occurred while preparing or running the sandbox (Stage 2).
     #[error("sandbox io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// The sandbox **wrapper** (the `unshare` launcher + preamble) failed *before* the test command
+    /// started — the run produced no start sentinel — **and** a fresh functional probe confirms the
+    /// backend can no longer create its namespaces. Unlike a one-off blip (classified per-candidate
+    /// `Errored`/`Broken`), this is persistent environment breakage that appeared *after* selection
+    /// (e.g. `user.max_user_namespaces` exhausted, AppArmor `apparmor_restrict_unprivileged_userns`
+    /// toggled, or a seccomp policy applied to the job), so jitgen aborts loudly rather than churn
+    /// every candidate to `Broken`. This is the **fail-closed** counterpart of a silent fail-open
+    /// (the netns wrapper *never ran* the command unconfined — it never ran it at all), so the danger
+    /// is misreporting a wrapper failure as a test result, not an isolation breach. Carries only the
+    /// static backend id — never captured output — per the secret-free policy above. ([ADR-0013],
+    /// `docs/security.md` threat #1.)
+    #[error(
+        "sandbox backend {0:?} became unavailable mid-run: the launcher failed before the test \
+         command started and a fresh probe confirms it can no longer create namespaces \
+         (user-namespace limits / AppArmor / seccomp policy may have changed); \
+         refusing to continue rather than misreport wrapper failures as test results"
+    )]
+    BackendUnavailableMidRun(&'static str),
 }
 
 /// Convenience result alias for the sandbox layer.
@@ -169,5 +188,22 @@ mod tests {
         assert!(msg.contains("firejail"));
         assert!(msg.contains("without isolation"));
         assert!(msg.contains("refusing"));
+    }
+
+    #[test]
+    fn backend_unavailable_mid_run_names_backend_cause_and_refusal() {
+        let msg = SandboxError::BackendUnavailableMidRun("netns-helper").to_string();
+        assert!(msg.contains("netns-helper"), "must name the backend: {msg}");
+        assert!(
+            msg.contains("before the test") && msg.contains("probe"),
+            "must state the launcher failed pre-test and a fresh probe confirms it: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to continue"),
+            "must state it refuses rather than misreport: {msg}"
+        );
+        // No captured output ever appears in the message (secret-free policy §3/§10): the only
+        // interpolated value is the static backend id.
+        assert!(!msg.contains("stderr") && !msg.contains("stdout"));
     }
 }

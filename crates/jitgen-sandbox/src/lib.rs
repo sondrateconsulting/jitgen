@@ -41,7 +41,9 @@ pub use sandbox::{RunRequest, Sandbox};
 pub use spawn::{BuildSignal, SpawnRequest};
 pub use user::current_uid_gid;
 
-// NOT re-exported (S2/F7 P4): `command::{build_plan, PlanInput, SandboxPlan}`, `run::run`, and
+// NOT re-exported (S2/F7 P4): `command::{build_plan, PlanInput, SandboxPlan}`, `run::run` (which is
+// additionally `#[cfg(test)]`-only; production execution goes through the `pub(crate)`
+// `run::run_reporting`), and
 // `sbpl::render_profile`. Their modules are private, so these `pub`-within-module items are reachable
 // only inside the crate (via `crate::command::…` etc.) — never by an external caller, who would
 // otherwise be able to construct/execute a `ConstrainedLocal` plan and bypass the fail-closed opt-in

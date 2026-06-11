@@ -1,0 +1,62 @@
+# Dependabot VERSION updates — freshness automation, NOT the supply-chain policy gate.
+#
+# The policy gate is `scripts/audit.sh` (cargo-audit + cargo-deny per deny.toml), run in CI by
+# .github/workflows/supply-chain.yml on a weekly cron and on every change to its trigger paths —
+# Cargo.lock, any Cargo.toml, deny.toml, the audit script, and the workflow itself — so the PRs this
+# file generates always re-run the audit (docs/security.md threat #8). Dependabot ALERTS and automated
+# SECURITY fixes are repo settings, already enabled, and are not configured here; this file only adds
+# scheduled version bumps so dependencies don't silently age.
+#
+# Cooldown: a release must be `default-days` old before Dependabot proposes it. Most malicious-release
+# windows (compromised maintainer account, worm-style fresh publish) are open for LESS than a week
+# before the package is yanked, so a 7-day cooldown blocks that attack class at the freshness layer.
+# Cooldown applies to VERSION updates only — Dependabot SECURITY updates bypass it by design, so a
+# fix for a published advisory still arrives immediately. Cargo majors get a longer 14-day soak
+# (per-semver cooldown is supported for cargo; the github-actions ecosystem supports default-days only).
+#
+# Reviewing a github-actions PR: Dependabot bumps the full commit SHA and the trailing `# vX.Y.Z`
+# comment together (house pinning convention, enforced by the zizmor code-scanning ruleset). Known
+# caveat (dependabot-core#13466): it can occasionally pin an unreleased latest commit while writing a
+# stale version comment — verify the new SHA matches the tag in the comment:
+#   gh api repos/<owner>/<action-repo>/git/ref/tags/<tag>   # compare object.sha to the pinned SHA
+#
+# Reviewing a cargo PR: Dependabot edits Cargo.toml/Cargo.lock only — it does NOT repin the Bazel
+# lockfile, so every cargo PR here is born failing `scripts/check.sh` (`--lockfile_mode=error`).
+# Run the repin recipe from docs/troubleshooting.md on the Dependabot branch before merge
+# (see CONTRIBUTING.md). There is no Bazel lane in CI, so green CI does NOT imply the repin happened.
+#
+# Deliberately NOT set:
+#   - `versioning-strategy: lockfile-only` (cargo): would limit bumps to Cargo.lock-only changes and
+#     skip updates that need a Cargo.toml requirement edit; default (auto) keeps both kinds.
+#   - `allow: dependency-type: indirect` (cargo): direct deps only (the default). The supply-chain
+#     audit already covers transitives for POLICY; freshness-bumping the 100+ locked transitives
+#     would bury a solo maintainer in Bazel repin work.
+#   - `target-branch`: PRs go to the default branch (main), behind its protections.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"        # staggered after the Monday supply-chain cron (see supply-chain.yml)
+    cooldown:
+      default-days: 7       # actions ecosystem supports default-days only (no per-semver)
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+    cooldown:
+      default-days: 7
+      semver-major-days: 14 # majors get a longer soak; cargo supports per-semver cooldown
+    open-pull-requests-limit: 3
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]   # one grouped PR; majors arrive individually
+    commit-message:
+      prefix: "chore(deps)"
