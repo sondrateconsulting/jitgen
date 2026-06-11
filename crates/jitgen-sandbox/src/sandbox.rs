@@ -549,14 +549,18 @@ mod tests {
         assert_eq!(res.outcome, jitgen_core::ExecOutcome::Passed, "{res:?}");
         assert_eq!(res.stdout, "hi");
 
-        // Denies network: the same sentinel probe the conformance suite uses. A toolless host
-        // (no nc/bash) skips LOUDLY below — never silently green without the denial assertion.
-        let script = "\
-            if command -v nc >/dev/null 2>&1; then \
-                nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        // Denies network: a sentinel probe to external egress (not loopback — the netns helper cuts
+        // all network), sharing the single-sourced sentinel words with the behavioral probe so the
+        // emit/match vocabulary cannot drift. A toolless host (no nc/bash) skips LOUDLY below —
+        // never silently green without the denial assertion.
+        use crate::detect::{SENTINEL_NET_DENIED, SENTINEL_NET_OK, SENTINEL_NO_PROBE_TOOL};
+        let script = format!(
+            "if command -v nc >/dev/null 2>&1; then \
+                nc -w 3 1.1.1.1 53 </dev/null >/dev/null 2>&1 && echo {SENTINEL_NET_OK} || echo {SENTINEL_NET_DENIED}; \
             elif command -v bash >/dev/null 2>&1; then \
-                bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-            else echo NO_PROBE_TOOL; fi";
+                bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' >/dev/null 2>&1 && echo {SENTINEL_NET_OK} || echo {SENTINEL_NET_DENIED}; \
+            else echo {SENTINEL_NO_PROBE_TOOL}; fi"
+        );
         let overlay2 = base.join("overlay2");
         std::fs::create_dir_all(&overlay2).unwrap();
         let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script.into()]);
@@ -569,7 +573,7 @@ mod tests {
                 run_as: None,
             })
             .unwrap();
-        if res.stdout.contains("NO_PROBE_TOOL") {
+        if res.stdout.contains(SENTINEL_NO_PROBE_TOOL) {
             eprintln!(
                 "SKIP netns network-denial check: host has neither nc nor bash to probe with \
                  (execution half already verified)"
@@ -578,7 +582,7 @@ mod tests {
             return;
         }
         assert!(
-            res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+            res.stdout.contains(SENTINEL_NET_DENIED) && !res.stdout.contains(SENTINEL_NET_OK),
             "netns helper must deny network; got {res:?}"
         );
 

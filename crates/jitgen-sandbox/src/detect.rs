@@ -28,6 +28,16 @@ const PROBE_STREAM_CAP: usize = 16 * 1024;
 /// is live (loopback: effectively instant; the bound only guards a pathological host).
 const SANITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Sentinel words the trusted behavioral-probe script echoes on stdout, judged by
+/// [`net_probe_verdict`]. These are the **entire** shell→Rust channel of the behavioral probe, so
+/// the word the script emits and the word the verdict matches MUST be the same literal — single-sourced
+/// here so the two cannot drift (a drift would silently collapse every verdict to `Inconclusive`,
+/// fail-closed at detect but never a refusal at pre-exec). The live conformance gate and the netns
+/// unit test reference these same constants (via [`crate::test_support`]) for the same reason.
+pub const SENTINEL_NET_OK: &str = "NET_OK";
+pub const SENTINEL_NET_DENIED: &str = "NET_DENIED";
+pub const SENTINEL_NO_PROBE_TOOL: &str = "NO_PROBE_TOOL";
+
 /// Detect the isolating backends usable on this host, in preference order.
 pub fn detect() -> Vec<Backend> {
     os_candidates()
@@ -75,12 +85,9 @@ fn available(backend: Backend) -> bool {
     // isolation cannot be verified → unavailable (fail-closed). Every other backend fails loudly,
     // so its exit status (plus the daemon check for containers) is sufficient.
     if backend.has_silent_degradation_mode() {
-        return match probe_behavioral(backend) {
-            Some((outcome, verdict)) => {
-                behavioral_probe_confirms_isolation(backend, &outcome, verdict)
-            }
-            None => false,
-        };
+        return probe_behavioral(backend).is_some_and(|(outcome, verdict)| {
+            behavioral_probe_confirms_isolation(backend, &outcome, verdict)
+        });
     }
     match probe_backend(backend) {
         Some(outcome) => probe_is_available(backend, &outcome),
@@ -170,33 +177,47 @@ enum NetVerdict {
     Inconclusive,
 }
 
-/// Build the trusted `/bin/sh` sentinel script for the behavioral net probe: attempt a TCP connect
-/// to the **live** listener the parent (jitgen) bound on `127.0.0.1:{port}` and report the result
-/// via sentinel words on stdout — the same `NET_OK`/`NET_DENIED`/`NO_PROBE_TOOL` machinery as the
-/// conformance gates, including the "no probe tool must not masquerade as a passing denial" arm.
-/// The listener makes the probe self-resolving and wording-independent: under a real network cut
-/// the listener does not exist in the sandbox's namespace (`NET_DENIED`), while a degraded
-/// passthrough runs in the parent namespace and reaches it (`NET_OK`). The probe spawns
-/// env-cleared, so the script sets its own `PATH` (trusted system dirs only) for `command -v`.
-fn net_probe_script(port: u16) -> String {
+/// The connect-and-report body of the behavioral net probe (no `PATH` preamble): attempt a TCP
+/// connect to the **live** listener the parent (jitgen) bound on `127.0.0.1:{port}` and report the
+/// result via the [`SENTINEL_NET_OK`]/[`SENTINEL_NET_DENIED`]/[`SENTINEL_NO_PROBE_TOOL`] words on
+/// stdout, including the "no probe tool must not masquerade as a passing denial" arm. The listener
+/// makes the probe self-resolving and wording-independent: under a real network cut the listener
+/// does not exist in the sandbox's namespace ([`SENTINEL_NET_DENIED`]), while a degraded passthrough
+/// runs in the parent namespace and reaches it ([`SENTINEL_NET_OK`]). Single-sourced here so the
+/// live `firejail_denies_loopback` conformance gate runs the **identical** connect logic the
+/// production probe does (it supplies its own PATH via the run plan's env, so it uses this body
+/// without the preamble that [`net_probe_script`] adds). `nc -w 1` bounds the connect and the
+/// post-connect idle: on a passthrough the connect to the unaccepted listener completes via the
+/// backlog and nc exits (→ `NET_OK`); on a real cut the connect is refused at once (→ `NET_DENIED`).
+pub fn loopback_probe_body(port: u16) -> String {
     format!(
-        "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; \
-         if command -v nc >/dev/null 2>&1; then \
-            nc -w 3 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
+        "if command -v nc >/dev/null 2>&1; then \
+            nc -w 1 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo {SENTINEL_NET_OK} || echo {SENTINEL_NET_DENIED}; \
          elif command -v bash >/dev/null 2>&1; then \
-            bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-         else echo NO_PROBE_TOOL; fi"
+            bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' >/dev/null 2>&1 && echo {SENTINEL_NET_OK} || echo {SENTINEL_NET_DENIED}; \
+         else echo {SENTINEL_NO_PROBE_TOOL}; fi"
     )
 }
 
-/// Judge the behavioral probe's stdout sentinels (**pure**). `NET_OK` anywhere wins (checked
-/// first, so a mixed output fails closed) — any successful connect proves the network was NOT cut,
-/// whatever else was printed; then `NET_DENIED` is positive proof of the cut; anything else
-/// (including `NO_PROBE_TOOL`) is inconclusive.
+/// The full trusted `/bin/sh` sentinel script for the behavioral net probe: [`loopback_probe_body`]
+/// prefixed with a `PATH` of trusted system dirs only. The probe spawns env-cleared, so the script
+/// must set its own `PATH` for the `command -v` lookups; the conformance gate runs the body directly
+/// because its run plan already supplies a `PATH`.
+fn net_probe_script(port: u16) -> String {
+    format!(
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; {}",
+        loopback_probe_body(port)
+    )
+}
+
+/// Judge the behavioral probe's stdout sentinels (**pure**). [`SENTINEL_NET_OK`] anywhere wins
+/// (checked first, so a mixed output fails closed) — any successful connect proves the network was
+/// NOT cut, whatever else was printed; then [`SENTINEL_NET_DENIED`] is positive proof of the cut;
+/// anything else (including [`SENTINEL_NO_PROBE_TOOL`]) is inconclusive.
 fn net_probe_verdict(stdout: &str) -> NetVerdict {
-    if stdout.contains("NET_OK") {
+    if stdout.contains(SENTINEL_NET_OK) {
         NetVerdict::Open
-    } else if stdout.contains("NET_DENIED") {
+    } else if stdout.contains(SENTINEL_NET_DENIED) {
         NetVerdict::Denied
     } else {
         NetVerdict::Inconclusive
@@ -545,8 +566,9 @@ mod tests {
         assert!(script.contains("127.0.0.1 43210"), "{script}");
         assert!(script.contains("/dev/tcp/127.0.0.1/43210"), "{script}");
         // All three sentinels: a connect outcome either way, and the explicit "no probe tool" arm
-        // so a toolless sandbox cannot masquerade as a verified network cut.
-        for sentinel in ["NET_OK", "NET_DENIED", "NO_PROBE_TOOL"] {
+        // so a toolless sandbox cannot masquerade as a verified network cut. Reference the constants
+        // so the emit side tracks a rename in lockstep with `net_probe_verdict`'s match side.
+        for sentinel in [SENTINEL_NET_OK, SENTINEL_NET_DENIED, SENTINEL_NO_PROBE_TOOL] {
             assert!(script.contains(sentinel), "missing {sentinel}: {script}");
         }
         // The probe spawns env-cleared, so the script must provide its own PATH for `command -v`.
@@ -646,6 +668,17 @@ mod tests {
             ),
             NetVerdict::Inconclusive
         ));
+        // The marker arm refuses even when the sentinel observed NET_DENIED: distrust a launcher
+        // that SAYS it degraded over a conflicting probe. Pins the marker arm independently — drop it
+        // and only `verdict == Open` would remain, leaving this case to the post-exec backstop alone.
+        assert!(behavioral_probe_shows_degradation(
+            Backend::Firejail,
+            &outcome(
+                true,
+                "an existing sandbox was detected ... without any additional sandboxing"
+            ),
+            NetVerdict::Denied
+        ));
         // A genuinely isolating firejail (clean stderr, observed NET_DENIED) is not refused.
         assert!(!behavioral_probe_shows_degradation(
             Backend::Firejail,
@@ -682,6 +715,33 @@ mod tests {
             net_probe_verdict(&out.stdout),
             NetVerdict::Open,
             "an unsandboxed run must observe the listener: {out:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_listener_before_the_probe_fakes_a_net_denied() {
+        // Guards the load-bearing invariant documented in `probe_behavioral`: the listener MUST stay
+        // bound across the probe spawn. Here we drop it FIRST and run the same script with no sandbox
+        // — the connect is refused (ECONNREFUSED), so the verdict is NET_DENIED even though nothing
+        // cut the network. That is exactly the false isolation a premature `drop(listener)` regression
+        // would introduce (a degraded passthrough would read as Denied → judged available), so if a
+        // refactor ever moves the drop before the spawn, the live NET_OK test above flips and this
+        // test documents why. (We assert the fail-direction here; the listener-alive case is the
+        // `..._reports_net_ok_against_a_live_listener...` test.)
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let script = net_probe_script(port);
+        drop(listener); // the regression under test: no listener bound when the probe runs
+        let out = probe("/bin/sh", &["-c", &script], false, PROBE_TIMEOUT);
+        if out.stdout.contains(SENTINEL_NO_PROBE_TOOL) {
+            eprintln!("SKIP: host has neither nc nor bash for the sentinel script");
+            return;
+        }
+        assert_eq!(
+            net_probe_verdict(&out.stdout),
+            NetVerdict::Denied,
+            "a refused connect to a dropped listener must read as NET_DENIED: {out:?}"
         );
     }
 }

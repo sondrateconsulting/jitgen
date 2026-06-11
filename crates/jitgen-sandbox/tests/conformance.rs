@@ -922,27 +922,34 @@ fn firejail_denies_loopback() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let port = listener.local_addr().expect("listener addr").port();
     // Sanity half: the parent namespace CAN reach it, so a NET_DENIED below proves the namespace
-    // boundary, not a dead listener.
-    std::net::TcpStream::connect(("127.0.0.1", port))
-        .expect("parent namespace must reach its own loopback listener");
+    // boundary, not a dead listener. Bounded like the production probe's sanity connect so a
+    // pathological host fails loud instead of hanging the gate.
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("parent namespace must reach its own loopback listener");
 
-    let script = format!(
-        "if command -v nc >/dev/null 2>&1; then \
-            nc -w 3 127.0.0.1 {port} </dev/null >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-        elif command -v bash >/dev/null 2>&1; then \
-            bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' >/dev/null 2>&1 && echo NET_OK || echo NET_DENIED; \
-        else echo NO_PROBE_TOOL; fi"
-    );
+    // The IDENTICAL connect logic the production behavioral probe runs (single-sourced) so this
+    // live gate cannot drift from what detect() actually does; the run plan supplies PATH, so the
+    // body is used without the probe's env-cleared PATH preamble.
+    let script = jitgen_sandbox::test_support::loopback_probe_body(port);
     let fx = Fixture::new("firejail-lo");
     let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script]);
     let res = exec(&sb, &cmd, &fx);
     assert!(
-        !res.stdout.contains("NO_PROBE_TOOL"),
+        !res
+            .stdout
+            .contains(jitgen_sandbox::test_support::SENTINEL_NO_PROBE_TOOL),
         "firejail_denies_loopback: no nc/bash probe tool in the sandboxed environment, so loopback \
          denial cannot be verified; rerun with a host that provides nc or bash"
     );
     assert!(
-        res.stdout.contains("NET_DENIED") && !res.stdout.contains("NET_OK"),
+        res.stdout
+            .contains(jitgen_sandbox::test_support::SENTINEL_NET_DENIED)
+            && !res
+                .stdout
+                .contains(jitgen_sandbox::test_support::SENTINEL_NET_OK),
         "firejail must deny loopback to a live parent-namespace listener; got {res:?}"
     );
 }
