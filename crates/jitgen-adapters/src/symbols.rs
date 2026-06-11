@@ -3,7 +3,9 @@
 
 use crate::lang::Lang;
 use jitgen_core::{AdapterId, LineRange, RiskScore, SymbolKind, Target, TargetId};
-use tree_sitter::{Node, Parser};
+use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
+use tree_sitter::{Node, ParseOptions, ParseState, Parser};
 
 fn next_id(seq: &mut u32) -> TargetId {
     let v = *seq;
@@ -15,8 +17,9 @@ fn next_id(seq: &mut u32) -> TargetId {
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 /// Max changed ranges processed per file with the grammar (bounds tree rescans).
 const MAX_HUNKS: usize = 1000;
-/// Tree-sitter parse timeout; on timeout we fall back to hunk targets.
-const PARSE_TIMEOUT_MICROS: u64 = 1_000_000;
+/// Tree-sitter parse deadline, enforced via the progress callback (tree-sitter 0.26 removed
+/// `set_timeout_micros`); on cancellation we fall back to hunk targets.
+const PARSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Hard cap on tree descent depth (defensive; AST depth is normally small).
 const MAX_DESCENT: usize = 10_000;
 
@@ -57,8 +60,19 @@ fn extract_with_grammar(
     }
     let mut parser = Parser::new();
     parser.set_language(&lang.ts_language()).ok()?;
-    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
-    let tree = parser.parse(source, None)?; // `None` on timeout → hunk fallback
+    let deadline = Instant::now() + PARSE_TIMEOUT;
+    let mut on_progress = |_: &ParseState| {
+        if Instant::now() >= deadline {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    let tree = parser.parse_with_options(
+        &mut |i, _| source.get(i..).unwrap_or_default(),
+        None,
+        Some(ParseOptions::new().progress_callback(&mut on_progress)),
+    )?; // `None` = deadline cancellation → hunk fallback (no-language is excluded by the guard above)
     let root = tree.root_node();
     let kinds = lang.symbol_kinds();
 
