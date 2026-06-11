@@ -784,6 +784,21 @@ mod tests {
             .unwrap()
     }
 
+    /// Commit a rename (workdir already updated by the caller): unstage `from`, stage `to`,
+    /// commit on top of `parent`. `add_all` would not record the removal of `from`, so the
+    /// index ops are explicit.
+    fn commit_rename(repo: &Repository, from: &str, to: &str, parent: Oid) -> Oid {
+        let mut index = repo.index().unwrap();
+        index.remove_path(Path::new(from)).unwrap();
+        index.add_path(Path::new(to)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = Signature::now("Test", "test@example.invalid").unwrap();
+        let parent = repo.find_commit(parent).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "rename", &tree, &[&parent])
+            .unwrap()
+    }
+
     /// Build a temp repo with two commits; returns (repo, dir, base_oid, head_oid).
     fn two_commit_repo() -> (Repository, PathBuf, Oid, Oid) {
         let dir = temp_dir("repo");
@@ -928,17 +943,7 @@ mod tests {
         // Rename old.rs -> new.rs with identical content so similarity detection fires.
         std::fs::remove_file(dir.join("old.rs")).unwrap();
         std::fs::write(dir.join("new.rs"), content).unwrap();
-        let head = {
-            let mut index = repo.index().unwrap();
-            index.remove_path(Path::new("old.rs")).unwrap();
-            index.add_path(Path::new("new.rs")).unwrap();
-            index.write().unwrap();
-            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-            let sig = Signature::now("Test", "test@example.invalid").unwrap();
-            let parent = repo.find_commit(base).unwrap();
-            repo.commit(Some("HEAD"), &sig, &sig, "c2", &tree, &[&parent])
-                .unwrap()
-        };
+        let head = commit_rename(&repo, "old.rs", "new.rs", base);
 
         let cs = diff_revisions(&repo, &base.to_string(), &head.to_string()).unwrap();
         let renamed = cs
@@ -962,17 +967,7 @@ mod tests {
         // Rename .git-credentials -> main.rs with identical content so similarity detection fires.
         std::fs::remove_file(dir.join(".git-credentials")).unwrap();
         std::fs::write(dir.join("main.rs"), content).unwrap();
-        let head = {
-            let mut index = repo.index().unwrap();
-            index.remove_path(Path::new(".git-credentials")).unwrap();
-            index.add_path(Path::new("main.rs")).unwrap();
-            index.write().unwrap();
-            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-            let sig = Signature::now("Test", "test@example.invalid").unwrap();
-            let parent = repo.find_commit(base).unwrap();
-            repo.commit(Some("HEAD"), &sig, &sig, "c2", &tree, &[&parent])
-                .unwrap()
-        };
+        let head = commit_rename(&repo, ".git-credentials", "main.rs", base);
 
         let cs = diff_revisions(&repo, &base.to_string(), &head.to_string()).unwrap();
         // The destination is a legitimate target and stays in the changeset...
@@ -988,6 +983,38 @@ mod tests {
         assert!(
             !format!("{cs:?}").contains(".git-credentials"),
             "secret filename leaked into the changeset: {cs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_from_vendored_source_suppresses_old_path() {
+        let dir = temp_dir("rename-vendored");
+        let repo = Repository::init(&dir).unwrap();
+        let content = "export function pad(s) {\n    return s;\n}\n";
+        std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.join("node_modules/pkg/util.js"), content).unwrap();
+        let base = commit_all(&repo, &dir, "c1", None);
+
+        // Rename out of node_modules with identical content so similarity detection fires.
+        std::fs::remove_file(dir.join("node_modules/pkg/util.js")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/util.js"), content).unwrap();
+        let head = commit_rename(&repo, "node_modules/pkg/util.js", "src/util.js", base);
+
+        let cs = diff_revisions(&repo, &base.to_string(), &head.to_string()).unwrap();
+        // The suppression gate is `is_ignored`, which covers VENDORED sources too — narrowing it
+        // to `is_secret_like` would leak vendor paths back into the "(was …)" annotation.
+        let renamed = cs
+            .files
+            .iter()
+            .find(|f| f.path == "src/util.js")
+            .expect("src/util.js present");
+        assert_eq!(renamed.kind, ChangeKind::Renamed);
+        assert_eq!(renamed.old_path, None);
+        assert!(
+            !format!("{cs:?}").contains("node_modules"),
+            "vendored path leaked into the changeset: {cs:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

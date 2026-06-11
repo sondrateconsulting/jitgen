@@ -27,9 +27,9 @@ const VENDOR_SEGMENTS: &[&str] = &[
 ];
 
 /// File names that may carry secrets (`_netrc` is git-for-Windows' `.netrc`) — matched exactly
-/// or with a dotted suffix (`.netrc.bak`, `.npmrc.swp`, …), mirroring the `.env` / `.env.*`
-/// handling.
+/// or with a dotted suffix (`.env.production`, `.netrc.bak`, `.npmrc.swp`, …).
 const SECRET_NAMES: &[&str] = &[
+    ".env",
     ".npmrc",
     ".pypirc",
     ".netrc",
@@ -77,16 +77,13 @@ pub fn is_secret_like(path: &str) -> bool {
     // name and slip past every check below (defense in depth; `reject_unsafe_rel` also rejects
     // trailing slashes at the read boundary).
     let name = lower.rsplit('/').find(|seg| !seg.is_empty()).unwrap_or("");
-    // Exact name, or a dotted backup/editor variant (`.netrc.bak`, `.npmrc.swp`) — the copy
-    // carries the same credentials as the original. Dot-gated so `.netrcfoo` does not match.
+    // Exact name, or a dotted-suffix variant — flavors (`.env.local`) and backup/editor copies
+    // (`.netrc.bak`, `.npmrc.swp`) carry the same credentials as the original. Dot-gated so
+    // `.netrcfoo` does not match.
     if SECRET_NAMES.iter().any(|entry| {
         name.strip_prefix(entry)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
     }) {
-        return true;
-    }
-    // `.env`, `.env.local`, `.env.production`, …
-    if name == ".env" || name.starts_with(".env.") {
         return true;
     }
     if SECRET_PREFIXES.iter().any(|p| name.starts_with(p)) {
@@ -146,6 +143,11 @@ mod tests {
         assert!(is_ignored(".pypirc.orig"));
         assert!(is_ignored("home/.git-credentials.bak"));
         assert!(is_ignored(".pgpass.old"));
+        assert!(is_ignored("_netrc.bak"));
+        // Case-insensitive like the exact-name match: the lowercasing must stay ahead of the
+        // variant check (`matching_is_case_insensitive` only pins exact names).
+        assert!(is_ignored(".NETRC.BAK"));
+        assert!(is_ignored("home/.NPMRC.SWP"));
         // Dot-gated: a longer unrelated name is NOT a variant.
         assert!(!is_ignored(".netrcfoo"));
         assert!(!is_ignored("src/netrc.rs"));
