@@ -114,9 +114,13 @@ impl Backend {
     ///   NO sandboxing, exits 0) when it detects it is already inside a sandbox/container. A
     ///   `firejail --version` succeeds there, so it would be wrongly selected and then run hostile
     ///   tests unconfined (full network + filesystem). The probe therefore **exercises real
-    ///   sandboxing** (`--net=none -- /bin/true`, no `--quiet` so the warning reaches stderr) and the
-    ///   caller treats a [`silent_degradation_markers`](Self::silent_degradation_markers) hit as
-    ///   unavailable.
+    ///   sandboxing** (`--net=none -- /bin/true`, no `--quiet` so the warning reaches stderr) — and
+    ///   because the warning's *wording* cannot be trusted either, detection actually runs the
+    ///   [`behavioral_net_probe`](Self::behavioral_net_probe) variant of this argv (the same wrapper
+    ///   flags, with a trusted sentinel script in place of `/bin/true`) and demands positive,
+    ///   observed proof of the network cut; a
+    ///   [`silent_degradation_markers`](Self::silent_degradation_markers) hit on stderr remains an
+    ///   unavailability signal as defense-in-depth.
     /// - **bwrap** is upgraded for the same reason, though it does **not** fail open: when it cannot
     ///   create a namespace it fails *loudly* (`No permissions to create new namespace`, nonzero
     ///   exit, command not run). A real namespacing probe (`--unshare-all --ro-bind / / /bin/true`)
@@ -135,6 +139,11 @@ impl Backend {
             // Exercise real sandboxing, NOT `--version`: a `--version` succeeds even when firejail
             // will silently degrade to a no-op passthrough inside a container. No `--quiet`, so the
             // "existing sandbox was detected" warning surfaces on stderr for the caller to detect.
+            // NOTE: this static argv documents the basic exercise, but firejail's availability is
+            // decided by [`behavioral_net_probe`](Self::behavioral_net_probe) — the same wrapper
+            // flags with a trusted sentinel script in place of `/bin/true` — because a degrading
+            // firejail's exit status and warning *wording* cannot be trusted to prove isolation
+            // (a parity test pins the two argvs to the same wrapper flags so they cannot drift).
             Backend::Firejail => Some(("firejail", &["--net=none", "--", "/bin/true"])),
             // A permissive no-op profile exercises sandbox-exec without confining `true`.
             Backend::SandboxExec => Some((
@@ -160,6 +169,42 @@ impl Backend {
                 ],
             )),
             Backend::ConstrainedLocal => None,
+        }
+    }
+
+    /// The argv that runs `script` (a trusted, jitgen-built `/bin/sh` sentinel script — no untrusted
+    /// code, so its stdout cannot be forged) under this backend's **network-cut sandboxing**, for the
+    /// behavioral half of degradation detection ([`crate::detect`]). Only a backend with a
+    /// [silent-degradation mode](Self::silent_degradation_markers) needs one: such a backend can exit
+    /// 0 *without having isolated*, and its warning text is version/locale-fragile, so detection must
+    /// additionally require the script to **observe** the network cut from inside (reword-independent).
+    /// `None` = the backend has no silent-degradation mode; its loud-failure contract makes
+    /// [`availability_probe`](Self::availability_probe) sufficient.
+    pub(crate) fn behavioral_net_probe(self, script: &str) -> Option<(&'static str, Vec<String>)> {
+        match self {
+            // The same launcher + wrapper flags as the static probe (a parity test pins this) and
+            // deliberately NO `--quiet` — the stderr marker check stays as defense-in-depth; the
+            // trusted script replaces `/bin/true` so the network cut is verified by observed
+            // behavior, not by firejail's wording.
+            Backend::Firejail => Some((
+                "firejail",
+                vec![
+                    "--net=none".to_string(),
+                    "--".to_string(),
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    script.to_string(),
+                ],
+            )),
+            // Enumerated without a wildcard for the same reason as `silent_degradation_markers`:
+            // `None` is a security claim ("exit status alone is trustworthy here"), so adding a
+            // backend is a compile error until its behavioral-verification need is decided.
+            Backend::Bwrap
+            | Backend::SandboxExec
+            | Backend::Docker
+            | Backend::Podman
+            | Backend::NetnsHelper
+            | Backend::ConstrainedLocal => None,
         }
     }
 
@@ -212,8 +257,10 @@ impl Backend {
 /// it detects an existing sandbox/container. Two substrings from the **same** message give resilience
 /// if firejail rewords one across versions; either match means "degraded". Kept lowercase for the
 /// case-insensitive compare in [`Backend::stderr_shows_silent_degradation`]. Stderr matching is
-/// version/locale-fragile, so this is the run-time *backstop*; the detect-time functional probe is the
-/// primary guard (a degrading firejail is never selected).
+/// version/locale-fragile, so it is **defense-in-depth**, not the primary guard: detection and the
+/// pre-execution re-probe decide via the wording-independent [`Backend::behavioral_net_probe`]
+/// (the sentinel script must observe the network cut), and these markers remain the post-execution
+/// backstop for the residual detect→run race.
 const SILENT_DEGRADATION_MARKERS_FIREJAIL: &[&str] = &[
     "existing sandbox was detected",
     "without any additional sandboxing",
@@ -508,6 +555,55 @@ mod tests {
             "bwrap probe must exercise namespacing: {args:?}"
         );
         assert!(!args.contains(&"--version"));
+    }
+
+    #[test]
+    fn behavioral_net_probe_exists_exactly_for_degradation_capable_backends() {
+        // The behavioral probe is what makes degradation detection wording-independent; a backend
+        // that can silently fail open MUST have one, and a backend that fails loudly must not pay
+        // for one. Lock the parity so a future backend can't get a marker mode without the probe.
+        for b in [
+            Backend::Bwrap,
+            Backend::Firejail,
+            Backend::SandboxExec,
+            Backend::Docker,
+            Backend::Podman,
+            Backend::NetnsHelper,
+            Backend::ConstrainedLocal,
+        ] {
+            assert_eq!(
+                b.behavioral_net_probe("s").is_some(),
+                b.has_silent_degradation_mode(),
+                "{b:?}: behavioral probe must exist iff the backend can silently degrade"
+            );
+        }
+    }
+
+    #[test]
+    fn firejail_behavioral_probe_matches_the_availability_wrapper_and_omits_quiet() {
+        // Single-source guard: the behavioral probe must exercise the SAME wrapper flags as the
+        // reviewable static probe (`--net=none`, `--`), substituting the trusted sentinel script
+        // for `/bin/true` — so the two argvs cannot drift apart — and must never pass `--quiet`
+        // (it would suppress the degradation warning the marker check scans for).
+        let (prog, args) = Backend::Firejail.availability_probe().unwrap();
+        let (bprog, bargs) = Backend::Firejail.behavioral_net_probe("SCRIPT").unwrap();
+        assert_eq!(prog, bprog);
+        let wrapper = &args[..args.len() - 1];
+        assert_eq!(*wrapper.last().unwrap(), "--", "wrapper must end at `--`");
+        assert_eq!(
+            &bargs[..wrapper.len()],
+            wrapper,
+            "behavioral wrapper flags must match the static probe's"
+        );
+        assert_eq!(
+            &bargs[wrapper.len()..],
+            &["/bin/sh", "-c", "SCRIPT"],
+            "the sentinel script must run via /bin/sh -c"
+        );
+        assert!(
+            !bargs.iter().any(|a| a == "--quiet"),
+            "behavioral probe must not suppress the degradation warning: {bargs:?}"
+        );
     }
 
     #[test]

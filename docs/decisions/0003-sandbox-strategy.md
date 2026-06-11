@@ -42,13 +42,18 @@ constrained-local tier is **never auto-selected**; it runs only when the trusted
   before use.** An OS-sandbox backend is "available" only if a probe that *actually sandboxes*
   succeeds — not a bare `--version`. This closes a **firejail** fail-open: firejail runs the command
   **unsandboxed and exits 0** (printing only a stderr warning) when it detects it is already inside a
-  sandbox/container, so `firejail --version` would wrongly mark it available. Three layers: (1) the
-  detect probe runs `firejail --net=none -- /bin/true` and treats the "existing sandbox was detected"
-  warning as unavailable (so AUTO never selects it); (2) `Sandbox::run` **re-probes before spawning the
-  untrusted command** and refuses (`SandboxDegraded`) without running it; (3) the executor refuses any
-  run whose launcher first stderr line carries the warning (the firejail plan omits `--quiet` so it
-  stays visible) — a fail-closed report for the residual post-probe race, which cannot un-run an
-  already-degraded command. bwrap fails *loudly* instead (nonzero exit when it cannot namespace), so it
+  sandbox/container, so `firejail --version` would wrongly mark it available — and the warning's
+  wording is version-fragile, so it cannot be the primary signal either. Three layers: (1) the detect
+  probe is **behavioral**: a trusted sentinel script inside `firejail --net=none` must positively
+  observe (`NET_DENIED`) that a live jitgen-bound parent-namespace loopback listener is unreachable —
+  a degraded passthrough reaches it (`NET_OK`) and is excluded *whatever the warning says*, and
+  "cannot verify" is also unavailable (fail-closed); the warning match is kept as defense-in-depth
+  (so AUTO never selects a degrading firejail); (2) `Sandbox::run` **re-runs the behavioral probe
+  before spawning the untrusted command** and refuses (`SandboxDegraded`) without running it on an
+  observed `NET_OK` or the warning marker; (3) the executor refuses any run whose captured launcher
+  stderr carries the warning anywhere (the firejail plan omits `--quiet` so it stays visible) — a
+  fail-closed report for the residual post-probe race, which cannot un-run an already-degraded
+  command. bwrap fails *loudly* instead (nonzero exit when it cannot namespace), so it
   has no such backstop. See `docs/security.md` threat #1.
 - **Environment is a hardcoded allowlist**, not inherited — synthetic `HOME`; no token/credential/
   socket vars; trusted additions only, still subject to deny-patterns.
