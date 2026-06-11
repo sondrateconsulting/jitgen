@@ -56,9 +56,10 @@ model, with the inner command wrapped by util-linux **`unshare --user --map-root
 
 **Conformance:** the tier-defining test (GP15) asserts the *pair*: a command inside the helper
 cannot open a network connection **and** an ordinary command still executes. Loopback denial is
-asserted separately. Unlike the OS-sandbox/container gates, the netns gates also run probe-gated
-(not `#[ignore]`d) under plain `cargo test`/`bazel test` on Linux hosts that permit user namespaces,
-because the helper nests fine inside build sandboxes there.
+asserted separately. Like the OS-sandbox/container gates, both netns gates are `#[ignore]`d live
+gates, run manually with `--ignored` on a Linux host; they self-skip (early return with a `SKIP`
+note on stderr) when the `netns_helper_available()` functional probe reports unprivileged user
+namespaces unusable on the host.
 
 ## Alternatives considered
 
