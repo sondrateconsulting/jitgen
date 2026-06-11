@@ -67,9 +67,6 @@ pub use user::current_uid_gid;
 #[doc(hidden)]
 pub mod test_support {
     pub use crate::command::{is_digest_pinned, is_uid_gid};
-    pub use crate::detect::{
-        loopback_probe_body, SENTINEL_NET_DENIED, SENTINEL_NET_OK, SENTINEL_NO_PROBE_TOOL,
-    };
     pub use crate::which::{resolve_trusted, TRUSTED_BIN_DIRS};
 }
 

@@ -897,7 +897,12 @@ fn firejail_denies_network() {
 /// from inside `firejail --net=none` must fail (`NET_DENIED`) — while a degraded passthrough
 /// firejail would connect (`NET_OK`) and fail the gate. (A bare closed-port probe proves nothing:
 /// it prints `NET_DENIED` via ECONNREFUSED even with no sandbox at all.) This is the live
-/// counterpart of `detect()`'s loopback-listener sentinel probe.
+/// counterpart of `detect()`'s loopback-listener sentinel probe, run through the SAME hardened
+/// [`net_probe_script`] + control as every other network-denial gate: the Host control runs the
+/// probe SCRIPT against the live listener from the parent namespace, validating the resolved tool's
+/// connect/exit semantics (an nc without `-z` exits nonzero even on a successful connect — a false
+/// NET_DENIED the Rust sanity connect below cannot catch), so a sandboxed NET_DENIED can only mean
+/// the namespace boundary.
 #[test]
 #[ignore = "live firejail; needs a Linux host with firejail installed"]
 fn firejail_denies_loopback() {
@@ -918,39 +923,28 @@ fn firejail_denies_loopback() {
     assert_eq!(res.stdout, "hi");
 
     // A live parent-namespace listener; an unaccepted connection still completes the TCP
-    // handshake via the backlog, so no accept loop is needed.
+    // handshake via the backlog, so no accept loop is needed — just keep the listener alive
+    // across the probe.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
     let port = listener.local_addr().expect("listener addr").port();
     // Sanity half: the parent namespace CAN reach it, so a NET_DENIED below proves the namespace
-    // boundary, not a dead listener. Bounded like the production probe's sanity connect so a
-    // pathological host fails loud instead of hanging the gate.
+    // boundary, not a dead listener. Bounded so a pathological host fails loud instead of hanging.
     std::net::TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         std::time::Duration::from_secs(2),
     )
     .expect("parent namespace must reach its own loopback listener");
 
-    // The IDENTICAL connect logic the production behavioral probe runs (single-sourced) so this
-    // live gate cannot drift from what detect() actually does; the run plan supplies PATH, so the
-    // body is used without the probe's env-cleared PATH preamble.
-    let script = jitgen_sandbox::test_support::loopback_probe_body(port);
-    let fx = Fixture::new("firejail-lo");
-    let cmd = SpawnRequest::argv("/bin/sh", ["-c".into(), script]);
-    let res = exec(&sb, &cmd, &fx);
-    assert!(
-        !res
-            .stdout
-            .contains(jitgen_sandbox::test_support::SENTINEL_NO_PROBE_TOOL),
-        "firejail_denies_loopback: no nc/bash probe tool in the sandboxed environment, so loopback \
-         denial cannot be verified; rerun with a host that provides nc or bash"
-    );
-    assert!(
-        res.stdout
-            .contains(jitgen_sandbox::test_support::SENTINEL_NET_DENIED)
-            && !res
-                .stdout
-                .contains(jitgen_sandbox::test_support::SENTINEL_NET_OK),
-        "firejail must deny loopback to a live parent-namespace listener; got {res:?}"
+    // The same hardened probe + control as every other network-denial gate, pointed at the runtime
+    // listener port (the reason [`net_probe_script`] is parameterized over host/port).
+    assert_network_denied(
+        &sb,
+        &Fixture::new("firejail-lo"),
+        None,
+        "firejail_denies_loopback",
+        &ControlProbe::Host,
+        "127.0.0.1",
+        port,
     );
 }
 

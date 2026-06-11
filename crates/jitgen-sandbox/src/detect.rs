@@ -33,10 +33,10 @@ const SANITY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// the word the script emits and the word the verdict matches MUST be the same literal — single-sourced
 /// here so the two cannot drift (a drift would silently collapse every verdict to `Inconclusive`,
 /// fail-closed at detect but never a refusal at pre-exec). The live conformance gate and the netns
-/// unit test reference these same constants (via [`crate::test_support`]) for the same reason.
-pub const SENTINEL_NET_OK: &str = "NET_OK";
-pub const SENTINEL_NET_DENIED: &str = "NET_DENIED";
-pub const SENTINEL_NO_PROBE_TOOL: &str = "NO_PROBE_TOOL";
+/// unit test reference these same constants for the same reason.
+pub(crate) const SENTINEL_NET_OK: &str = "NET_OK";
+pub(crate) const SENTINEL_NET_DENIED: &str = "NET_DENIED";
+pub(crate) const SENTINEL_NO_PROBE_TOOL: &str = "NO_PROBE_TOOL";
 
 /// Detect the isolating backends usable on this host, in preference order.
 pub fn detect() -> Vec<Backend> {
@@ -182,10 +182,7 @@ enum NetVerdict {
 /// stdout, including the "no probe tool must not masquerade as a passing denial" arm. The listener
 /// makes the probe self-resolving and wording-independent: under a real network cut the listener
 /// does not exist in the sandbox's namespace ([`SENTINEL_NET_DENIED`]), while a degraded passthrough
-/// runs in the parent namespace and reaches it ([`SENTINEL_NET_OK`]). Single-sourced here so the
-/// live `firejail_denies_loopback` conformance gate runs the **identical** connect logic the
-/// production probe does (it supplies its own PATH via the run plan's env, so it uses this body
-/// without the preamble that [`net_probe_script`] adds).
+/// runs in the parent namespace and reaches it ([`SENTINEL_NET_OK`]).
 ///
 /// `nc -z` is **connect-only** (connect, report, close — no data phase), the same hardening the
 /// crate's egress conformance probe applies for the same reason: a plain `nc -w N` lingers for the
@@ -196,7 +193,7 @@ enum NetVerdict {
 /// `-z` is not universal, so a variant lacking it errors out → `NET_DENIED`; that residual is caught
 /// by the parent-namespace **control** in [`probe_behavioral`], which refuses to trust any sandboxed
 /// `NET_DENIED` unless the same tool first proved it can reach the listener unconfined.
-pub fn loopback_probe_body(port: u16) -> String {
+fn loopback_probe_body(port: u16) -> String {
     format!(
         "if command -v nc >/dev/null 2>&1; then \
             nc -z -w 1 127.0.0.1 {port} >/dev/null 2>&1 && echo {SENTINEL_NET_OK} || echo {SENTINEL_NET_DENIED}; \
