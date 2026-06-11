@@ -115,7 +115,9 @@ mod tests {
         assert!(is_ignored(".git-credentials"));
         assert!(is_ignored("home/.git-credentials"));
         // Same-class plaintext stores: Windows .netrc, PostgreSQL password file.
+        assert!(is_ignored("_netrc"));
         assert!(is_ignored("home/_netrc"));
+        assert!(is_ignored(".pgpass"));
         assert!(is_ignored("home/.pgpass"));
         // Key-store/key-file suffixes.
         assert!(is_ignored("ci/release.jks"));
@@ -134,5 +136,9 @@ mod tests {
         assert!(is_ignored("keys/Server.PEM"));
         assert!(is_ignored("deploy/ID_RSA.old"));
         assert!(is_ignored("home/.GIT-CREDENTIALS"));
+        assert!(is_ignored("home/_NETRC"));
+        assert!(is_ignored("ci/release.JKS"));
+        assert!(is_ignored("deploy/server.PPK"));
+        assert!(is_ignored("secrets/api-token.GPG"));
     }
 }
