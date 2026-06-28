@@ -43,7 +43,7 @@ jobs:
           persist-credentials: false
       - uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
         with:
-          version: 1.25.2 # pin the zizmor CLI (the action defaults to "latest")
+          version: 1.26.1 # pin the zizmor CLI (the action defaults to "latest"; 1.26.1 is v0.5.7's default)
           # Upload SARIF to code scanning (which surfaces findings inline on the PR + in the Security
           # tab). `annotations` is mutually exclusive with this, so it is left at its default (off).
           advanced-security: true # public repo: upload SARIF to code scanning (the ruleset is the gate)
