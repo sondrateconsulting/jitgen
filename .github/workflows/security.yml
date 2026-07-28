@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
-      - uses: zizmorcore/zizmor-action@192e21d79ab29983730a13d1382995c2307fbcaa # v0.5.7
+      - uses: zizmorcore/zizmor-action@6599ee8b7a49aef6a770f63d261d214911a7ce02 # v0.6.0
         with:
           version: 1.26.1 # pin the zizmor CLI (the action defaults to "latest"; 1.26.1 is v0.5.7's default)
           # Upload SARIF to code scanning (which surfaces findings inline on the PR + in the Security
