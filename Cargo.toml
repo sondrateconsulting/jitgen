@@ -26,7 +26,7 @@ serde_yaml = "0.9.34"
 thiserror = "2.0.11"
 # rusqlite with bundled libsqlite3 (ADR-0005): no system SQLite dependency; compiles C via cc.
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-sha2 = "0.10.8"
+sha2 = "0.11.0"
 # libgit2 bindings (ADR-0006), vendored + no ssh/https features: local diff/blob reads only,
 # hermetic, no system libgit2/openssl. We never invoke repo hooks/filters. Pinned >=0.20.4 to clear
 # RUSTSEC-2026-0008 (git2 <0.20.4 `Buf` null-deref unsoundness); resolved in F10 via cargo audit/deny.
